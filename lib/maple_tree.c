@@ -98,9 +98,11 @@ static struct kmem_cache *maple_node_cache;
 #ifdef CONFIG_DEBUG_MAPLE_TREE
 static const unsigned long mt_max[] = {
 	[maple_dense]		= MAPLE_NODE_SLOTS,
+	[maple_mleaf_64]	= ULONG_MAX,
 	[maple_leaf_64]		= ULONG_MAX,
 	[maple_range_64]	= ULONG_MAX,
 	[maple_arange_64]	= ULONG_MAX,
+	[maple_mrange_64]	= ULONG_MAX,
 	[maple_copy]		= ULONG_MAX,
 };
 #define mt_node_max(x) mt_max[mte_node_type(x)]
@@ -108,27 +110,33 @@ static const unsigned long mt_max[] = {
 
 static const unsigned char mt_slots[] = {
 	[maple_dense]		= MAPLE_NODE_SLOTS,
+	[maple_mleaf_64]	= MAPLE_MRANGE64_SLOTS,
 	[maple_leaf_64]		= MAPLE_RANGE64_SLOTS,
 	[maple_range_64]	= MAPLE_RANGE64_SLOTS,
 	[maple_arange_64]	= MAPLE_ARANGE64_SLOTS,
+	[maple_mrange_64]	= MAPLE_MRANGE64_SLOTS,
 	[maple_copy]		= 3,
 };
 #define mt_slot_count(x) mt_slots[mte_node_type(x)]
 
 static const unsigned char mt_pivots[] = {
 	[maple_dense]		= 0,
+	[maple_mleaf_64]	= MAPLE_MRANGE64_SLOTS - 1,
 	[maple_leaf_64]		= MAPLE_RANGE64_SLOTS - 1,
 	[maple_range_64]	= MAPLE_RANGE64_SLOTS - 1,
 	[maple_arange_64]	= MAPLE_ARANGE64_SLOTS - 1,
+	[maple_mrange_64]	= MAPLE_MRANGE64_SLOTS - 1,
 	[maple_copy]		= 3,
 };
 #define mt_pivot_count(x) mt_pivots[mte_node_type(x)]
 
 static const unsigned char mt_min_slots[] = {
 	[maple_dense]		= MAPLE_NODE_SLOTS / 2,
+	[maple_mleaf_64]	= (MAPLE_MRANGE64_SLOTS / 2) - 2,
 	[maple_leaf_64]		= (MAPLE_RANGE64_SLOTS / 2) - 2,
 	[maple_range_64]	= (MAPLE_RANGE64_SLOTS / 2) - 2,
 	[maple_arange_64]	= (MAPLE_ARANGE64_SLOTS / 2) - 1,
+	[maple_mrange_64]	= (MAPLE_MRANGE64_SLOTS / 2) - 2,
 	[maple_copy]		= 1, /* Should never be used */
 };
 #define mt_min_slot_count(x) mt_min_slots[mte_node_type(x)]
@@ -175,12 +183,8 @@ static void ma_free_rcu(struct maple_node *node)
 
 static void mt_set_height(struct maple_tree *mt, unsigned char height)
 {
-	unsigned int new_flags = mt->ma_flags;
-
-	new_flags &= ~MT_FLAGS_HEIGHT_MASK;
 	MT_BUG_ON(mt, height > MAPLE_HEIGHT_MAX);
-	new_flags |= height << MT_FLAGS_HEIGHT_OFFSET;
-	mt->ma_flags = new_flags;
+	mt->ma_flags = (mt->ma_flags & ~MT_FLAGS_HEIGHT_MASK) | height;
 }
 
 static unsigned int mas_mt_height(struct ma_state *mas)
@@ -202,7 +206,7 @@ static __always_inline enum maple_type mte_node_type(
 
 static __always_inline bool ma_is_dense(const enum maple_type type)
 {
-	return type < maple_leaf_64;
+	return type == maple_dense;
 }
 
 static __always_inline bool ma_is_leaf(const enum maple_type type)
@@ -213,6 +217,11 @@ static __always_inline bool ma_is_leaf(const enum maple_type type)
 static __always_inline bool mte_is_leaf(const struct maple_enode *entry)
 {
 	return ma_is_leaf(mte_node_type(entry));
+}
+
+static __always_inline bool ma_is_parent(const enum maple_type type)
+{
+	return !ma_is_leaf(type) && (type != maple_copy);
 }
 
 /*
@@ -372,6 +381,17 @@ static __always_inline bool mt_is_alloc(struct maple_tree *mt)
 	return (mt->ma_flags & MT_FLAGS_ALLOC_RANGE);
 }
 
+static inline enum maple_type mt_range_type(struct maple_tree *mt)
+{
+	if (!mt_has_secondary_storage(mt))
+		return maple_range_64;
+
+	if (mt_is_alloc(mt))
+		return maple_arange_64;
+
+	return maple_mrange_64;
+}
+
 /*
  * The Parent Pointer
  * Excluding root, the parent pointer is 256B aligned like all other tree nodes.
@@ -447,18 +467,16 @@ enum maple_type mas_parent_type(struct ma_state *mas, struct maple_enode *enode)
 
 	p_type = (unsigned long)mte_to_node(enode)->parent;
 	if (WARN_ON(p_type & MAPLE_PARENT_ROOT))
-		return 0;
+		return maple_invalid;
 
 	p_type &= MAPLE_NODE_MASK;
 	p_type &= ~mte_parent_slot_mask(p_type);
 	switch (p_type) {
 	case MAPLE_PARENT_RANGE64: /* or MAPLE_PARENT_ARANGE64 */
-		if (mt_is_alloc(mas->tree))
-			return maple_arange_64;
-		return maple_range_64;
+		return mt_range_type(mas->tree);
 	}
 
-	return 0;
+	return maple_invalid;
 }
 
 /*
@@ -538,8 +556,13 @@ static inline unsigned long *ma_pivots(struct maple_node *node,
 					   enum maple_type type)
 {
 	switch (type) {
+	case maple_invalid:
+		return NULL;
 	case maple_arange_64:
 		return node->ma64.pivot;
+	case maple_mleaf_64:
+	case maple_mrange_64:
+		return node->mm64.pivot;
 	case maple_range_64:
 	case maple_leaf_64:
 		return node->mr64.pivot;
@@ -562,16 +585,36 @@ static inline unsigned long *ma_gaps(struct maple_node *node,
 				     enum maple_type type)
 {
 	switch (type) {
+	case maple_invalid:
+		return NULL;
 	case maple_arange_64:
 		return node->ma64.gap;
 	case maple_copy:
 		return node->cp.gap;
+	case maple_mleaf_64:
 	case maple_range_64:
 	case maple_leaf_64:
+	case maple_mrange_64:
 	case maple_dense:
 		return NULL;
 	}
 	return NULL;
+}
+
+/*
+ * ma_mark_test() - Test a given mark is set
+ * @marks: The mark array
+ * @type: The node type
+ * @slot: The slot to test
+ * @mark: The mark
+ */
+static inline bool ma_mark_test(u8 *marks, enum maple_type type,
+				unsigned char slot, uint8_t mark)
+{
+	if (slot >= mt_slots[type])
+		return false;
+
+	return marks[slot] & BIT(mark);
 }
 
 /*
@@ -625,12 +668,20 @@ static inline void mte_set_pivot(struct maple_enode *mn, unsigned char piv,
 
 	BUG_ON(piv >= mt_pivots[type]);
 	switch (type) {
+	case maple_invalid:
+		break;
 	case maple_range_64:
 	case maple_leaf_64:
 		node->mr64.pivot[piv] = val;
 		break;
+	case maple_mleaf_64:
+		node->mm64.pivot[piv] = val;
+		break;
 	case maple_arange_64:
 		node->ma64.pivot[piv] = val;
+		break;
+	case maple_mrange_64:
+		node->mm64.pivot[piv] = val;
 		break;
 	case maple_copy:
 	case maple_dense:
@@ -649,8 +700,13 @@ static inline void mte_set_pivot(struct maple_enode *mn, unsigned char piv,
 static inline void __rcu **ma_slots(struct maple_node *mn, enum maple_type mt)
 {
 	switch (mt) {
+	case maple_invalid:
+		return NULL;
 	case maple_arange_64:
 		return mn->ma64.slot;
+	case maple_mleaf_64:
+	case maple_mrange_64:
+		return mn->mm64.slot;
 	case maple_range_64:
 	case maple_leaf_64:
 		return mn->mr64.slot;
@@ -745,8 +801,13 @@ static inline struct maple_metadata *ma_meta(struct maple_node *mn,
 					     enum maple_type mt)
 {
 	switch (mt) {
+	case maple_invalid:
+		return NULL;
 	case maple_arange_64:
 		return &mn->ma64.meta;
+	case maple_mleaf_64:
+	case maple_mrange_64:
+		return &mn->mm64.meta;
 	default:
 		return &mn->mr64.meta;
 	}
@@ -785,6 +846,8 @@ static inline void mt_clear_meta(struct maple_tree *mt, struct maple_node *mn,
 	void *next;
 
 	switch (type) {
+	case maple_invalid:
+		return;
 	case maple_range_64:
 		pivots = mn->mr64.pivot;
 		if (unlikely(pivots[MAPLE_RANGE64_SLOTS - 2])) {
@@ -797,6 +860,19 @@ static inline void mt_clear_meta(struct maple_tree *mt, struct maple_node *mn,
 		}
 		fallthrough;
 	case maple_arange_64:
+		meta = ma_meta(mn, type);
+		break;
+	case maple_mleaf_64:
+	case maple_mrange_64:
+		pivots = mn->mm64.pivot;
+		if (unlikely(pivots[MAPLE_MRANGE64_SLOTS - 2])) {
+			slots = mn->mm64.slot;
+			next = mt_slot_locked(mt, slots,
+					      MAPLE_MRANGE64_SLOTS - 1);
+			if (unlikely((mte_to_node(next) &&
+				      mte_node_type(next))))
+				return; /* no metadata, could be node */
+		}
 		meta = ma_meta(mn, type);
 		break;
 	default:
@@ -861,9 +937,7 @@ void mas_set_parent_slots(struct ma_state *mas, struct maple_enode *parent,
 	enum maple_type p_type = mte_node_type(parent);
 	unsigned char i;
 
-	MAS_BUG_ON(mas, p_type != maple_range_64 &&
-			p_type != maple_arange_64);
-
+	MAS_BUG_ON(mas, !ma_is_parent(p_type));
 	shift = MAPLE_PARENT_SLOT_SHIFT;
 	type = MAPLE_PARENT_RANGE64;
 
@@ -3711,7 +3785,9 @@ static inline void mas_prealloc_calc(struct ma_wr_state *wr_mas, void *entry)
 		ret = 1;
 		break;
 	case wr_store_root:
-		if (likely((mas->last != 0) || (mas->index != 0)))
+		if (mt_has_marks(mas->tree))
+			ret = 1;
+		else if (likely((mas->last != 0) || (mas->index != 0)))
 			ret = 1;
 		else if (((unsigned long) (entry) & 3) == 2)
 			ret = 1;
@@ -6612,6 +6688,25 @@ static void mt_dump_entry(void *entry, unsigned long min, unsigned long max,
 		pr_cont(PTR_FMT "\n", entry);
 }
 
+static void mt_dump_marked_entry(void *entry, unsigned long min,
+				 unsigned long max, unsigned int depth,
+				 const char *marks,
+				 enum mt_dump_format format)
+{
+	mt_dump_range(min, max, depth, format);
+	pr_cont("%s ", marks);
+
+	if (xa_is_value(entry))
+		pr_cont("value %ld (0x%lx) [" PTR_FMT "]\n", xa_to_value(entry),
+			xa_to_value(entry), entry);
+	else if (xa_is_zero(entry))
+		pr_cont("zero (%ld)\n", xa_to_internal(entry));
+	else if (mt_is_reserved(entry))
+		pr_cont("UNKNOWN ENTRY (" PTR_FMT ")\n", entry);
+	else
+		pr_cont(PTR_FMT "\n", entry);
+}
+
 static void mt_dump_range64(const struct maple_tree *mt, void *entry,
 		unsigned long min, unsigned long max, unsigned int depth,
 		enum mt_dump_format format)
@@ -6646,6 +6741,76 @@ static void mt_dump_range64(const struct maple_tree *mt, void *entry,
 					first, last, depth + 1, format);
 		else if (node->slot[i])
 			mt_dump_node(mt, mt_slot(mt, node->slot, i),
+					first, last, depth + 1, format);
+
+		if (last == max)
+			break;
+		if (last > max) {
+			switch(format) {
+			case mt_dump_hex:
+				pr_err("node " PTR_FMT " last (%lx) > max (%lx) at pivot %d!\n",
+					node, last, max, i);
+				break;
+			case mt_dump_dec:
+				pr_err("node " PTR_FMT " last (%lu) > max (%lu) at pivot %d!\n",
+					node, last, max, i);
+			}
+		}
+		first = last + 1;
+	}
+}
+
+static void mt_dump_mrange64(const struct maple_tree *mt, void *entry,
+		unsigned long min, unsigned long max, unsigned int depth,
+		enum mt_dump_format format)
+{
+	struct maple_mrange_64 *node = &mte_to_node(entry)->mm64;
+	enum maple_type type = mte_node_type(entry);
+	bool leaf = mte_is_leaf(entry);
+	unsigned long first = min;
+	char marks[12];
+	int m;
+	int i;
+
+	pr_cont(" contents: ");
+	for (i = 0; i < MAPLE_MRANGE64_SLOTS - 1; i++) {
+		switch(format) {
+		case mt_dump_hex:
+			pr_cont(PTR_FMT " %lX ", node->slot[i], node->pivot[i]);
+			break;
+		case mt_dump_dec:
+			pr_cont(PTR_FMT " %lu ", node->slot[i], node->pivot[i]);
+		}
+	}
+	pr_cont(PTR_FMT "\n", node->slot[i]);
+	for (i = 0; i < MAPLE_MRANGE64_SLOTS; i++) {
+		unsigned long last = max;
+		void *child;
+
+		if (i < (MAPLE_MRANGE64_SLOTS - 1))
+			last = node->pivot[i];
+		else if (!node->slot[i] && max != mt_node_max(entry))
+			break;
+		if (last == 0 && i > 0)
+			break;
+
+		child = mt_slot(mt, node->slot, i);
+		marks[0] = '[';
+		for (m = 0; m <= MT_MARK_MAX; m++)
+			marks[1 + m + (m >= 4)] = ma_mark_test(node->mark, type, i, m) ?
+				'x' : '.';
+		marks[5] = ' ';
+		marks[10] = ']';
+		marks[11] = '\0';
+
+		if (leaf)
+			if (!child)
+				mt_dump_entry(child, first, last, depth + 1, format);
+			else
+				mt_dump_marked_entry(child, first, last, depth + 1,
+						     marks, format);
+		else if (child)
+			mt_dump_node(mt, child,
 					first, last, depth + 1, format);
 
 		if (last == max)
@@ -6737,6 +6902,9 @@ static void mt_dump_node(const struct maple_tree *mt, void *entry,
 	pr_cont("node " PTR_FMT " depth %d type %d parent " PTR_FMT, node,
 		depth, type, node ? node->parent : NULL);
 	switch (type) {
+	case maple_invalid:
+		pr_cont(" INVALID TYPE\n");
+		break;
 	case maple_dense:
 		pr_cont("\n");
 		for (i = 0; i < MAPLE_NODE_SLOTS; i++) {
@@ -6750,8 +6918,14 @@ static void mt_dump_node(const struct maple_tree *mt, void *entry,
 	case maple_range_64:
 		mt_dump_range64(mt, entry, min, max, depth, format);
 		break;
+	case maple_mleaf_64:
+		mt_dump_mrange64(mt, entry, min, max, depth, format);
+		break;
 	case maple_arange_64:
 		mt_dump_arange64(mt, entry, min, max, depth, format);
+		break;
+	case maple_mrange_64:
+		mt_dump_mrange64(mt, entry, min, max, depth, format);
 		break;
 
 	default:
