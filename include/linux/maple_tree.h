@@ -29,12 +29,20 @@
 #define MAPLE_NODE_SLOTS	31	/* 256 bytes including ->parent */
 #define MAPLE_RANGE64_SLOTS	16	/* 256 bytes */
 #define MAPLE_ARANGE64_SLOTS	10	/* 240 bytes */
+#define MAPLE_MRANGE64_SLOTS	15
+#define MAPLE_MRANGE32_SLOTS	19
+
 #else
 /* 32bit sizes */
 #define MAPLE_NODE_SLOTS	63	/* 256 bytes including ->parent */
 #define MAPLE_RANGE64_SLOTS	32	/* 256 bytes */
 #define MAPLE_ARANGE64_SLOTS	21	/* 240 bytes */
+#define MAPLE_MRANGE64_SLOTS	20
+
+#define MAPLE_MRANGE32_SLOTS	28
 #endif /* defined(CONFIG_64BIT) || defined(BUILD_VDSO32_64) */
+
+#define MAPLE_MARK_TYPES	8
 
 #define MAPLE_NODE_MASK		255UL
 
@@ -127,16 +135,36 @@ struct maple_arange_64 {
 	struct maple_metadata meta;
 };
 
+/*
+ * The maple tree supports recording up to 8 'marks' on each entry.  This is
+ * optimised for searching for entries with a given mark within a range.
+ */
+struct maple_mrange_64 {
+	struct maple_pnode *parent;
+	unsigned long pivot[MAPLE_MRANGE64_SLOTS - 1];
+	union {
+		void __rcu *slot[MAPLE_MRANGE64_SLOTS];
+		struct {
+			void __rcu *pad[MAPLE_MRANGE64_SLOTS - 1];
+			struct maple_metadata meta;
+		};
+	};
+	uint8_t mark[MAPLE_MRANGE64_SLOTS];
+};
+
 struct maple_topiary {
 	struct maple_pnode *parent;
 	struct maple_enode *next; /* Overlaps the pivot */
 };
 
 enum maple_type {
-	maple_dense,
+	maple_invalid,
+	maple_mleaf_64,
 	maple_leaf_64,
+	maple_dense,
 	maple_range_64,
 	maple_arange_64,
+	maple_mrange_64,
 	maple_copy,
 };
 
@@ -196,26 +224,31 @@ struct maple_copy {
 /**
  * DOC: Maple tree flags
  *
- * * MT_FLAGS_ALLOC_RANGE	- Track gaps in this tree
- * * MT_FLAGS_USE_RCU		- Operate in RCU mode
- * * MT_FLAGS_HEIGHT_OFFSET	- The position of the tree height in the flags
  * * MT_FLAGS_HEIGHT_MASK	- The mask for the maple tree height value
  * * MT_FLAGS_LOCK_MASK		- How the mt_lock is used
  * * MT_FLAGS_LOCK_IRQ		- Acquired irq-safe
  * * MT_FLAGS_LOCK_BH		- Acquired bh-safe
  * * MT_FLAGS_LOCK_EXTERN	- mt_lock is not used
+ * * MT_FLAGS_USE_RCU		- Operate in RCU mode
+ * * MT_FLAGS_ALLOC_WRAPPED	- Allocator wrapped around ID space
+ * * MT_FLAGS_ALLOC_RANGE	- Track gaps in this tree
+ * * MT_FLAGS_MARKS		- Track marks on entries
+ * * MT_FLAGS_SECONDARY_STORAGE - Mask to indicate tree has secondary per-slot metadata
  *
  * MAPLE_HEIGHT_MAX	The largest height that can be stored
  */
-#define MT_FLAGS_ALLOC_RANGE	0x01
-#define MT_FLAGS_USE_RCU	0x02
-#define MT_FLAGS_HEIGHT_OFFSET	0x02
-#define MT_FLAGS_HEIGHT_MASK	0x7C
-#define MT_FLAGS_LOCK_MASK	0x300
-#define MT_FLAGS_LOCK_IRQ	0x100
-#define MT_FLAGS_LOCK_BH	0x200
-#define MT_FLAGS_LOCK_EXTERN	0x300
-#define MT_FLAGS_ALLOC_WRAPPED	0x0800
+#define MT_FLAGS_HEIGHT_MASK	0x1F
+#define MT_FLAGS_LOCK_MASK	0x60
+#define MT_FLAGS_LOCK_IRQ	0x20
+#define MT_FLAGS_LOCK_BH	0x40
+#define MT_FLAGS_LOCK_EXTERN	0x60
+#define MT_FLAGS_USE_RCU	0x80
+#define MT_FLAGS_ALLOC_WRAPPED	0x100
+#define MT_FLAGS_ALLOC_RANGE	0x200
+#define MT_FLAGS_MARKS		0x400
+#define MT_FLAGS_SECONDARY_STORAGE	(MT_FLAGS_ALLOC_RANGE | MT_FLAGS_MARKS)
+
+#define MT_MARK_MAX		(MAPLE_MARK_TYPES - 1)
 
 #define MAPLE_HEIGHT_MAX	31
 
@@ -338,6 +371,7 @@ struct maple_node {
 		};
 		struct maple_range_64 mr64;
 		struct maple_arange_64 ma64;
+		struct maple_mrange_64 mm64;
 		struct maple_copy cp;
 	};
 };
@@ -874,6 +908,16 @@ static inline bool mt_in_rcu(struct maple_tree *mt)
 	return mt->ma_flags & MT_FLAGS_USE_RCU;
 }
 
+static inline bool mt_has_marks(struct maple_tree *mt)
+{
+	return mt->ma_flags & MT_FLAGS_MARKS;
+}
+
+static inline bool mt_has_secondary_storage(struct maple_tree *mt)
+{
+	return mt->ma_flags & MT_FLAGS_SECONDARY_STORAGE;
+}
+
 /**
  * mt_clear_in_rcu() - Switch the tree to non-RCU mode.
  * @mt: The Maple Tree
@@ -914,7 +958,7 @@ static inline void mt_set_in_rcu(struct maple_tree *mt)
 
 static inline unsigned int mt_height(const struct maple_tree *mt)
 {
-	return (mt->ma_flags & MT_FLAGS_HEIGHT_MASK) >> MT_FLAGS_HEIGHT_OFFSET;
+	return mt->ma_flags & MT_FLAGS_HEIGHT_MASK;
 }
 
 void *mt_find(struct maple_tree *mt, unsigned long *index, unsigned long max);
