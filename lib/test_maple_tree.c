@@ -3766,7 +3766,6 @@ static int __init maple_tree_seed(void)
 	void *ptr = &set;
 
 	pr_info("\nTEST STARTING\n\n");
-
 #if defined(BENCH_SLOT_STORE)
 #define BENCH
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
