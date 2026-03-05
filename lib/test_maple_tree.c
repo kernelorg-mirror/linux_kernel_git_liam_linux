@@ -3710,6 +3710,47 @@ static noinline void __init alloc_cyclic_testing(struct maple_tree *mt)
 	MT_BUG_ON(mt, ret != 1);
 }
 
+static noinline void __init marks_testing(struct maple_tree *mt)
+{
+	int i, nr_entries = 200;
+
+	for (i = 0; i <= nr_entries; i++) {
+		uint8_t mark;
+		mtree_store_range(mt, i*10, i*10 + 5,
+				  xa_mk_value(i), GFP_KERNEL);
+		mark = i % 8;
+		mtree_set_mark(mt, i * 10, mark);
+	}
+
+	for (i = 0; i <= MT_MARK_MAX; i++) {
+		MA_STATE(mas, mt, 0, 0);
+		int expected = 0;
+		int found = 0;
+		void *entry;
+		int j;
+
+		for (j = 0; j <= nr_entries; j++) {
+			if ((j % 8) == i)
+				expected++;
+		}
+
+		mtree_lock(mt);
+		while ((entry = mas_find_marked(&mas, ULONG_MAX, i)) != NULL) {
+			unsigned long idx = mas.index;
+			unsigned long val = xa_to_value(entry);
+
+			MT_BUG_ON(mt, !mtree_get_mark(mt, idx, i));
+			MT_BUG_ON(mt, idx != val * 10);
+			MT_BUG_ON(mt, (val % 8) != i);
+			found++;
+		}
+		mtree_unlock(mt);
+		MT_BUG_ON(mt, found != expected);
+	}
+
+	mt_dump(mt, mt_dump_dec);
+}
+
 static DEFINE_MTREE(tree);
 static int __init maple_tree_seed(void)
 {
@@ -3719,7 +3760,6 @@ static int __init maple_tree_seed(void)
 	void *ptr = &set;
 
 	pr_info("\nTEST STARTING\n\n");
-
 #if defined(BENCH_SLOT_STORE)
 #define BENCH
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
@@ -3999,6 +4039,9 @@ static int __init maple_tree_seed(void)
 	alloc_cyclic_testing(&tree);
 	mtree_destroy(&tree);
 
+	mt_init_flags(&tree, MT_FLAGS_MARKS | MT_FLAGS_USE_RCU);
+	marks_testing(&tree);
+	mtree_destroy(&tree);
 
 #if defined(BENCH)
 skip:

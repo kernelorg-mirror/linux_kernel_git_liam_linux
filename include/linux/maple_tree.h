@@ -202,7 +202,10 @@ struct maple_copy {
 	} src[4];
 	/* Simulated node */
 	void __rcu *slot[3];
-	unsigned long gap[3];
+	union {
+		unsigned long gap[3];
+		uint8_t mark[3];
+	};
 	unsigned long min;
 	union {
 		unsigned long pivot[3];
@@ -220,6 +223,8 @@ struct maple_copy {
 	unsigned char data;
 	unsigned char height;
 };
+
+static_assert(sizeof(struct maple_copy) <= 256);
 
 /**
  * DOC: Maple tree flags
@@ -410,6 +415,12 @@ int mtree_store_range(struct maple_tree *mt, unsigned long first,
 int mtree_store(struct maple_tree *mt, unsigned long index,
 		void *entry, gfp_t gfp);
 void *mtree_erase(struct maple_tree *mt, unsigned long index);
+bool mtree_get_mark(struct maple_tree *mt, unsigned long index,
+		    uint8_t mark);
+void mtree_set_mark(struct maple_tree *mt, unsigned long index,
+		    uint8_t mark);
+void mtree_clear_mark(struct maple_tree *mt, unsigned long index,
+		      uint8_t mark);
 
 int mtree_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp);
 int __mt_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp);
@@ -595,6 +606,11 @@ void *mas_store(struct ma_state *mas, void *entry);
 void *mas_erase(struct ma_state *mas);
 int mas_store_gfp(struct ma_state *mas, void *entry, gfp_t gfp);
 void mas_store_prealloc(struct ma_state *mas, void *entry);
+bool mas_get_mark(struct ma_state *mas, uint8_t mark);
+void mas_set_mark(struct ma_state *mas, uint8_t mark);
+void mas_clear_mark(struct ma_state *mas, uint8_t mark);
+void *mas_find_marked(struct ma_state *mas, unsigned long max,
+		      uint8_t mark);
 void *mas_find(struct ma_state *mas, unsigned long max);
 void *mas_find_range(struct ma_state *mas, unsigned long max);
 void *mas_find_rev(struct ma_state *mas, unsigned long min);
