@@ -102,6 +102,9 @@ static const unsigned long mt_max[] = {
 	[maple_range_64]	= ULONG_MAX,
 	[maple_arange_64]	= ULONG_MAX,
 	[maple_copy]		= ULONG_MAX,
+	[maple_leaf_32]		= UINT_MAX,
+	[maple_range_32]	= UINT_MAX,
+	[maple_arange_32]	= UINT_MAX,
 };
 #define mt_node_max(x) mt_max[mte_node_type(x)]
 #endif
@@ -112,6 +115,9 @@ static const unsigned char mt_slots[] = {
 	[maple_range_64]	= MAPLE_RANGE64_SLOTS,
 	[maple_arange_64]	= MAPLE_ARANGE64_SLOTS,
 	[maple_copy]		= 3,
+	[maple_leaf_32]		= MAPLE_RANGE32_SLOTS,
+	[maple_range_32]	= MAPLE_RANGE32_SLOTS,
+	[maple_arange_32]	= MAPLE_ARANGE32_SLOTS,
 };
 #define mt_slot_count(x) mt_slots[mte_node_type(x)]
 
@@ -121,6 +127,9 @@ static const unsigned char mt_pivots[] = {
 	[maple_range_64]	= MAPLE_RANGE64_SLOTS - 1,
 	[maple_arange_64]	= MAPLE_ARANGE64_SLOTS - 1,
 	[maple_copy]		= 3,
+	[maple_leaf_32]		= MAPLE_RANGE32_SLOTS - 1,
+	[maple_range_32]	= MAPLE_RANGE32_SLOTS - 1,
+	[maple_arange_32]	= MAPLE_ARANGE32_SLOTS - 1,
 };
 #define mt_pivot_count(x) mt_pivots[mte_node_type(x)]
 
@@ -130,8 +139,16 @@ static const unsigned char mt_min_slots[] = {
 	[maple_range_64]	= (MAPLE_RANGE64_SLOTS / 2) - 2,
 	[maple_arange_64]	= (MAPLE_ARANGE64_SLOTS / 2) - 1,
 	[maple_copy]		= 1, /* Should never be used */
+	[maple_leaf_32]		= (MAPLE_RANGE32_SLOTS / 2) - 2,
+	[maple_range_32]	= (MAPLE_RANGE32_SLOTS / 2) - 2,
+	[maple_arange_32]	= (MAPLE_ARANGE32_SLOTS / 2) - 1,
 };
 #define mt_min_slot_count(x) mt_min_slots[mte_node_type(x)]
+
+#define MAPLE_BIG_NODE_SLOTS	(MAPLE_RANGE64_SLOTS * 2 + 2)
+#define MAPLE_BIG_NODE_GAPS	(MAPLE_ARANGE64_SLOTS * 2 + 1)
+#define MAPLE_BIG_NODE32_SLOTS	(MAPLE_RANGE32_SLOTS * 2 + 2)
+#define MAPLE_BIG_NODE32_GAPS	(MAPLE_ARANGE32_SLOTS * 2 + 1)
 
 /* Functions */
 static inline struct maple_node *mt_alloc_one(gfp_t gfp)
@@ -186,6 +203,31 @@ static void mt_set_height(struct maple_tree *mt, unsigned char height)
 static unsigned int mas_mt_height(struct ma_state *mas)
 {
 	return mt_height(mas->tree);
+}
+
+static inline bool node_is_32b(enum maple_type type)
+{
+	return type == maple_leaf_32 || type == maple_range_32 ||
+	       type == maple_arange_32;
+}
+
+static inline enum maple_type node_transition_type(enum maple_type type)
+{
+	switch (type) {
+	case maple_leaf_32:
+		return maple_leaf_64;
+	case maple_range_32:
+		return maple_range_64;
+	case maple_arange_32:
+		return maple_arange_64;
+	case maple_dense:
+	case maple_leaf_64:
+	case maple_range_64:
+	case maple_arange_64:
+	case maple_copy:
+		return type;
+	}
+	return type;
 }
 
 static inline unsigned int mt_attr(struct maple_tree *mt)
@@ -573,12 +615,17 @@ static inline unsigned long *ma_pivots(struct maple_node *node,
 {
 	switch (type) {
 	case maple_arange_64:
-		return node->ma64.pivot;
+		return (unsigned long *)node->ma64.pivot;
 	case maple_range_64:
 	case maple_leaf_64:
-		return node->mr64.pivot;
+		return (unsigned long *)node->mr64.pivot;
 	case maple_copy:
-		return node->cp.pivot;
+		return (unsigned long *)node->cp.pivot;
+	case maple_arange_32:
+		return (unsigned long *)node->ma32.pivot;
+	case maple_range_32:
+	case maple_leaf_32:
+		return (unsigned long *)node->mr32.pivot;
 	case maple_dense:
 		return NULL;
 	}
@@ -597,11 +644,15 @@ static inline unsigned long *ma_gaps(struct maple_node *node,
 {
 	switch (type) {
 	case maple_arange_64:
-		return node->ma64.gap;
+		return (unsigned long *)node->ma64.gap;
 	case maple_copy:
 		return node->cp.gap;
+	case maple_arange_32:
+		return (unsigned long *)node->ma32.gap;
 	case maple_range_64:
 	case maple_leaf_64:
+	case maple_range_32:
+	case maple_leaf_32:
 	case maple_dense:
 		return NULL;
 	}
@@ -628,6 +679,16 @@ mas_safe_pivot(const struct ma_state *mas, unsigned long *pivots,
 	return pivots[piv];
 }
 
+static __always_inline unsigned long
+mas_safe_pivot_32(const struct ma_state *mas, unsigned int *pivots,
+		  unsigned char piv, enum maple_type type)
+{
+	if (piv >= mt_pivots[type])
+		return mas->max;
+
+	return pivots[piv];
+}
+
 /*
  * mas_safe_min() - Return the minimum for a given offset.
  * @mas: The maple state
@@ -638,6 +699,15 @@ mas_safe_pivot(const struct ma_state *mas, unsigned long *pivots,
  */
 static inline unsigned long
 mas_safe_min(struct ma_state *mas, unsigned long *pivots, unsigned char offset)
+{
+	if (likely(offset))
+		return pivots[offset - 1] + 1;
+
+	return mas->min;
+}
+
+static inline unsigned long
+mas_safe_min_32(struct ma_state *mas, unsigned int *pivots, unsigned char offset)
 {
 	if (likely(offset))
 		return pivots[offset - 1] + 1;
@@ -666,6 +736,13 @@ static inline void mte_set_pivot(struct maple_enode *mn, unsigned char piv,
 	case maple_arange_64:
 		node->ma64.pivot[piv] = val;
 		break;
+	case maple_range_32:
+	case maple_leaf_32:
+		node->mr32.pivot[piv] = val;
+		break;
+	case maple_arange_32:
+		node->ma32.pivot[piv] = val;
+		break;
 	case maple_copy:
 	case maple_dense:
 		break;
@@ -690,6 +767,11 @@ static inline void __rcu **ma_slots(struct maple_node *mn, enum maple_type mt)
 		return mn->mr64.slot;
 	case maple_copy:
 		return mn->cp.slot;
+	case maple_arange_32:
+		return mn->ma32.slot;
+	case maple_range_32:
+	case maple_leaf_32:
+		return mn->mr32.slot;
 	case maple_dense:
 		return mn->slot;
 	}
@@ -856,9 +938,12 @@ static inline unsigned char ma_meta_end(struct maple_node *mn,
  * ma_meta_gap() - Get the largest gap location of a node from the metadata
  * @mn: The maple node
  */
-static inline unsigned char ma_meta_gap(struct maple_node *mn)
+static inline unsigned char ma_meta_gap(struct maple_node *mn,
+					enum maple_type mt)
 {
-	return mn->ma64.meta.gap;
+	struct maple_metadata *meta = ma_meta(mn, mt);
+
+	return meta->gap;
 }
 
 /*
@@ -1440,7 +1525,7 @@ static inline unsigned long mas_max_gap(struct ma_state *mas)
 
 	node = mas_mn(mas);
 	MAS_BUG_ON(mas, mt != maple_arange_64);
-	offset = ma_meta_gap(node);
+	offset = ma_meta_gap(node, mt);
 	gaps = ma_gaps(node, mt);
 	return gaps[offset];
 }
@@ -1471,7 +1556,7 @@ static inline void mas_parent_gap(struct ma_state *mas, unsigned char offset,
 
 ascend:
 	MAS_BUG_ON(mas, pmt != maple_arange_64);
-	meta_offset = ma_meta_gap(pnode);
+	meta_offset = ma_meta_gap(pnode, pmt);
 	meta_gap = pgaps[meta_offset];
 
 	pgaps[offset] = new;
@@ -2574,7 +2659,7 @@ static inline void cp_dst_to_slots(struct maple_copy *cp, unsigned long min,
 				if (gaps) {
 					unsigned char gap_slot;
 
-					gap_slot = ma_meta_gap(mn);
+					gap_slot = ma_meta_gap(mn, mt);
 					cp->gap[d] = gaps[gap_slot];
 				}
 			}
@@ -6488,10 +6573,12 @@ static void mt_dump_range64(const struct maple_tree *mt, void *entry,
 	for (i = 0; i < MAPLE_RANGE64_SLOTS - 1; i++) {
 		switch(format) {
 		case mt_dump_hex:
-			pr_cont(PTR_FMT " %lX ", node->slot[i], node->pivot[i]);
+			pr_cont(PTR_FMT " %llX ", node->slot[i],
+				(unsigned long long)node->pivot[i]);
 			break;
 		case mt_dump_dec:
-			pr_cont(PTR_FMT " %lu ", node->slot[i], node->pivot[i]);
+			pr_cont(PTR_FMT " %llu ", node->slot[i],
+				(unsigned long long)node->pivot[i]);
 		}
 	}
 	pr_cont(PTR_FMT "\n", node->slot[i]);
@@ -6540,20 +6627,22 @@ static void mt_dump_arange64(const struct maple_tree *mt, void *entry,
 	for (i = 0; i < MAPLE_ARANGE64_SLOTS; i++) {
 		switch (format) {
 		case mt_dump_hex:
-			pr_cont("%lx ", node->gap[i]);
+			pr_cont("%llx ", (unsigned long long)node->gap[i]);
 			break;
 		case mt_dump_dec:
-			pr_cont("%lu ", node->gap[i]);
+			pr_cont("%llu ", (unsigned long long)node->gap[i]);
 		}
 	}
 	pr_cont("| %02X %02X| ", node->meta.end, node->meta.gap);
 	for (i = 0; i < MAPLE_ARANGE64_SLOTS - 1; i++) {
 		switch (format) {
 		case mt_dump_hex:
-			pr_cont(PTR_FMT " %lX ", node->slot[i], node->pivot[i]);
+			pr_cont(PTR_FMT " %llX ", node->slot[i],
+				(unsigned long long)node->pivot[i]);
 			break;
 		case mt_dump_dec:
-			pr_cont(PTR_FMT " %lu ", node->slot[i], node->pivot[i]);
+			pr_cont(PTR_FMT " %llu ", node->slot[i],
+				(unsigned long long)node->pivot[i]);
 		}
 	}
 	pr_cont(PTR_FMT "\n", node->slot[i]);
@@ -6698,7 +6787,7 @@ static void mas_validate_gaps(struct ma_state *mas)
 counted:
 	if (mt == maple_arange_64) {
 		MT_BUG_ON(mas->tree, !gaps);
-		offset = ma_meta_gap(node);
+		offset = ma_meta_gap(node, mt);
 		if (offset > i) {
 			pr_err("gap offset " PTR_FMT "[%u] is invalid\n", node, offset);
 			MT_BUG_ON(mas->tree, 1);

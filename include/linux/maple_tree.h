@@ -25,17 +25,23 @@
  * Nodes in the tree point to their parent unless bit 0 is set.
  */
 #if defined(CONFIG_64BIT) || defined(BUILD_VDSO32_64)
-/* 64bit sizes */
 #define MAPLE_NODE_SLOTS	31	/* 256 bytes including ->parent */
+/* 64bit sizes */
 #define MAPLE_RANGE64_SLOTS	16	/* 256 bytes */
 #define MAPLE_ARANGE64_SLOTS	10	/* 240 bytes */
-#define MAPLE_ALLOC_SLOTS	(MAPLE_NODE_SLOTS - 1)
-#else
+#define MAPLE_ALLOC_SLOTS      (MAPLE_NODE_SLOTS - 1)
 /* 32bit sizes */
-#define MAPLE_NODE_SLOTS	63	/* 256 bytes including ->parent */
-#define MAPLE_RANGE64_SLOTS	32	/* 256 bytes */
-#define MAPLE_ARANGE64_SLOTS	21	/* 240 bytes */
-#define MAPLE_ALLOC_SLOTS	(MAPLE_NODE_SLOTS - 2)
+#define MAPLE_RANGE32_SLOTS	21	/* 256 bytes */
+#define MAPLE_ARANGE32_SLOTS	15	/* 240 bytes */
+#else
+/*64 pivots */
+#define MAPLE_RANGE64_SLOTS	21	/* 256 bytes */
+#define MAPLE_ARANGE64_SLOTS	12	/* 240 bytes */
+/* 32b pivots */
+#define MAPLE_NODE_SLOTS	60	/* 256 bytes including ->parent */
+#define MAPLE_RANGE32_SLOTS	32	/* 256 bytes */
+#define MAPLE_ARANGE32_SLOTS	21	/* 240 bytes */
+#define MAPLE_ALLOC_SLOTS      (MAPLE_NODE_SLOTS - 1)
 #endif /* defined(CONFIG_64BIT) || defined(BUILD_VDSO32_64) */
 
 #define MAPLE_NODE_MASK		255UL
@@ -102,11 +108,23 @@ struct maple_metadata {
 
 struct maple_range_64 {
 	struct maple_pnode *parent;
-	unsigned long pivot[MAPLE_RANGE64_SLOTS - 1];
+	u64 pivot[MAPLE_RANGE64_SLOTS - 1];
 	union {
 		void __rcu *slot[MAPLE_RANGE64_SLOTS];
 		struct {
 			void __rcu *pad[MAPLE_RANGE64_SLOTS - 1];
+			struct maple_metadata meta;
+		};
+	};
+};
+
+struct maple_range_32 {
+	struct maple_pnode *parent;
+	u32 pivot[MAPLE_RANGE32_SLOTS - 1];
+	union {
+		void __rcu *slot[MAPLE_RANGE32_SLOTS];
+		struct {
+			void __rcu *pad[MAPLE_RANGE32_SLOTS - 1];
 			struct maple_metadata meta;
 		};
 	};
@@ -123,9 +141,17 @@ struct maple_range_64 {
  */
 struct maple_arange_64 {
 	struct maple_pnode *parent;
-	unsigned long pivot[MAPLE_ARANGE64_SLOTS - 1];
+	u64 pivot[MAPLE_ARANGE64_SLOTS - 1];
 	void __rcu *slot[MAPLE_ARANGE64_SLOTS];
-	unsigned long gap[MAPLE_ARANGE64_SLOTS];
+	u64 gap[MAPLE_ARANGE64_SLOTS];
+	struct maple_metadata meta;
+};
+
+struct maple_arange_32 {
+	struct maple_pnode *parent;
+	u32 pivot[MAPLE_ARANGE32_SLOTS - 1];
+	void __rcu *slot[MAPLE_ARANGE32_SLOTS];
+	u32 gap[MAPLE_ARANGE32_SLOTS];
 	struct maple_metadata meta;
 };
 
@@ -137,7 +163,10 @@ struct maple_topiary {
 enum maple_type {
 	maple_dense,
 	maple_leaf_64,
+	maple_leaf_32,
 	maple_range_64,
+	maple_range_32,
+	maple_arange_32,
 	maple_arange_64,
 	maple_copy,
 };
@@ -153,6 +182,8 @@ enum store_type {
 	wr_append,
 	wr_node_store,
 	wr_slot_store,
+	wr_64b_transition,
+	wr_64b_split
 };
 
 struct maple_copy {
@@ -179,10 +210,10 @@ struct maple_copy {
 	unsigned long gap[3];
 	unsigned long min;
 	union {
-		unsigned long pivot[3];
+		u64 pivot[3];
 		struct {
-			void *_pad[2];
-			unsigned long max;
+			u64 _pad[2];
+			u64 max;
 		};
 	};
 	unsigned char end;
@@ -340,6 +371,8 @@ struct maple_node {
 		};
 		struct maple_range_64 mr64;
 		struct maple_arange_64 ma64;
+		struct maple_range_32 mr32;
+		struct maple_arange_32 ma32;
 		struct maple_copy cp;
 	};
 };
@@ -485,6 +518,7 @@ struct ma_state {
 	unsigned char mas_flags;
 	unsigned char end;		/* The end of the node */
 	enum store_type store_type;	/* The type of store needed for this operation */
+	enum maple_type root_mt; /* The type type of the root node */
 };
 
 struct ma_wr_state {
@@ -494,13 +528,16 @@ struct ma_wr_state {
 	unsigned long r_max;		/* range max */
 	enum maple_type type;		/* mas->node type */
 	unsigned char offset_end;	/* The offset where the write ends */
+	unsigned char vacant_height;	/* Height of lowest node with free space */
+	unsigned char sufficient_height;/* Height of lowest node with min sufficiency + 1 nodes */
+union {
 	unsigned long *pivots;		/* mas->node->pivots pointer */
+	unsigned int  *pivots_32;		/* mas->node->pivots pointer */
+};
 	unsigned long end_piv;		/* The pivot at the offset end */
 	void __rcu **slots;		/* mas->node->slots pointer */
 	void *entry;			/* The entry to write */
 	void *content;			/* The existing entry that is being overwritten */
-	unsigned char vacant_height;	/* Height of lowest node with free space */
-	unsigned char sufficient_height;/* Height of lowest node with min sufficiency + 1 nodes */
 };
 
 #define mas_lock(mas)           spin_lock(&((mas)->tree->ma_lock))
