@@ -55,7 +55,6 @@ void *kmem_cache_alloc_lru(struct kmem_cache *cachep, struct list_lru *lru,
 		int gfp)
 {
 	void *p;
-
 	if (cachep->exec_callback) {
 		if (cachep->callback)
 			cachep->callback(cachep->private);
