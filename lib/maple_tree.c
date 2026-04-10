@@ -7637,7 +7637,7 @@ static void mt_dump_mrange64(const struct maple_tree *mt, void *entry,
 
 	pr_cont(" contents: ");
 	for (i = 0; i < MAPLE_MRANGE64_SLOTS - 1; i++) {
-		switch(format) {
+		switch (format) {
 		case mt_dump_hex:
 			pr_cont(PTR_FMT " %lX ", node->slot[i], node->pivot[i]);
 			break;
@@ -8091,9 +8091,64 @@ static void mt_validate_nulls(struct maple_tree *mt)
 }
 
 /*
+ * mas_validate_marks() - Validate the marks of a node
+ * @mas: The maple state
+ *
+ * Ensure marks aren't set beyond the data end, on NULL entries, and that the
+ * inherited marks are correct.
+ */
+static void mas_validate_marks(struct ma_state *mas)
+{
+	u8 *marks;
+	u8 p_marks, expected;
+	enum maple_type type, p_type;
+	unsigned char i, end, p_slot;
+	struct maple_node *node, *p_mn;
+
+	node = mas_mn(mas);
+	type = mte_node_type(mas->node);
+	marks = ma_marks(node, type);
+	end = mas_data_end(mas);
+	for (i = end + 1; i < mt_slots[type]; i++) {
+		if (marks[i]) {
+			pr_err("marks " PTR_FMT "[%u] beyond end %u != 0 (%x)\n",
+			       node, i, end, marks[i]);
+			MT_BUG_ON(mas->tree, 1);
+		}
+	}
+
+	if (mte_is_leaf(mas->node)) {
+		void __rcu **slots = ma_slots(node, type);
+
+		for (i = 0; i <= end; i++) {
+			if (marks[i] && !mas_slot(mas, slots, i)) {
+				pr_err("NULL " PTR_FMT "[%u] has marks %x\n",
+				       node, i, marks[i]);
+				MT_BUG_ON(mas->tree, 1);
+			}
+		}
+	}
+
+	if (mte_is_root(mas->node))
+		return;
+
+	p_slot = mte_parent_slot(mas->node);
+	p_mn = mte_parent(mas->node);
+	p_type = mas_parent_type(mas, mas->node);
+	p_marks = ma_marks(p_mn, p_type)[p_slot];
+	expected = ma_marks_for_parent(node, type);
+	if (p_marks != expected) {
+		pr_err("marks " PTR_FMT "[%u] %x != %x\n", p_mn, p_slot,
+		       p_marks, expected);
+		MT_BUG_ON(mas->tree, 1);
+	}
+}
+
+/*
  * validate a maple tree by checking:
  * 1. The limits (pivots are within mas->min to mas->max)
  * 2. The gap is correctly set in the parents
+ * 3. The marks are correctly set in the parents
  */
 void mt_validate(struct maple_tree *mt)
 	__must_hold(mas->tree->ma_lock)
@@ -8122,6 +8177,8 @@ void mt_validate(struct maple_tree *mt)
 		mas_validate_child_slot(&mas);
 		if (mt_is_alloc(mt))
 			mas_validate_gaps(&mas);
+		else if (mt_has_marks(mt))
+			mas_validate_marks(&mas);
 		mas_dfs_postorder(&mas, ULONG_MAX);
 	}
 	mt_validate_nulls(mt);

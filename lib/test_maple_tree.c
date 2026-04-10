@@ -2385,6 +2385,118 @@ static noinline void __init check_spanning_relatives(struct maple_tree *mt)
 	mtree_store_range(mt, 9365, 9955, NULL, GFP_KERNEL);
 }
 
+#define SPAN_STRESS_LAST	8191
+#define SPAN_STRESS_ITERS	60000
+
+static inline u32 span_next_rand(u32 *state)
+{
+	*state = (*state * 1664525) + 1013904223;
+	return *state;
+}
+
+static inline void spanning_expected_check(struct maple_tree *mt, u32 *expected,
+					   unsigned long index)
+{
+	void *entry = mtree_load(mt, index);
+
+	if (!expected[index]) {
+		MT_BUG_ON(mt, entry != NULL);
+		return;
+	}
+
+	MT_BUG_ON(mt, !entry);
+	MT_BUG_ON(mt, xa_to_value(entry) != (unsigned long)(expected[index] - 1));
+}
+
+static noinline void __init check_spanning_write_stress(struct maple_tree *mt)
+{
+	static u32 expected[SPAN_STRESS_LAST + 1];
+	u32 state = 0x243f6a88;
+	unsigned long i;
+
+	memset(expected, 0, sizeof(expected));
+
+	for (i = 0; i < 1024; i++) {
+		u32 r = span_next_rand(&state);
+		unsigned long start = (r >> 8) & SPAN_STRESS_LAST;
+		unsigned long last = min(start + (r & 127),
+					 (unsigned long)SPAN_STRESS_LAST);
+		u32 val = ((r >> 9) & 32767) + 1;
+		unsigned long j;
+
+		mtree_store_range(mt, start, last, xa_mk_value(val), GFP_KERNEL);
+		for (j = start; j <= last; j++)
+			expected[j] = val + 1;
+	}
+
+	for (i = 0; i < SPAN_STRESS_ITERS; i++) {
+		u32 r = span_next_rand(&state);
+		unsigned long start = (r >> 7) & SPAN_STRESS_LAST;
+		unsigned long len;
+		unsigned long last;
+		u32 val = ((r >> 11) & 32767) + 1;
+		unsigned long j;
+
+		if ((i & 127) == 0) {
+			start = (r & 1) ? 0 : max_t(unsigned long,
+					SPAN_STRESS_LAST - ((r >> 9) & 1023), 0);
+			len = 2048 + (r & 1023);
+		} else if (r & BIT(31)) {
+			len = 512 + (r & 2047);
+		} else {
+			len = r & 255;
+		}
+
+		last = min(start + len, (unsigned long)SPAN_STRESS_LAST);
+
+		switch (r % 7) {
+		case 0:
+		case 1:
+		case 2:
+			mtree_store_range(mt, start, last, xa_mk_value(val), GFP_KERNEL);
+			for (j = start; j <= last; j++)
+				expected[j] = val + 1;
+			break;
+		case 3:
+			mtree_store_range(mt, start, last, NULL, GFP_KERNEL);
+			for (j = start; j <= last; j++)
+				expected[j] = 0;
+			break;
+		case 4:
+			start = (r & 1) ? 0 : SPAN_STRESS_LAST;
+			mtree_store(mt, start, xa_mk_value(val), GFP_KERNEL);
+			expected[start] = val + 1;
+			break;
+		case 5:
+			mtree_store(mt, start, NULL, GFP_KERNEL);
+			expected[start] = 0;
+			break;
+		default:
+			mtree_store_range(mt, start, last,
+					(r & BIT(16)) ? NULL : xa_mk_value(val), GFP_KERNEL);
+			for (j = start; j <= last; j++)
+				expected[j] = (r & BIT(16)) ? 0 : (val + 1);
+			break;
+		}
+
+		if ((i % 257) == 0) {
+			int k;
+
+			for (k = 0; k < 256; k++)
+				spanning_expected_check(mt, expected,
+						      span_next_rand(&state) & SPAN_STRESS_LAST);
+		}
+
+		if ((i % 2048) == 0)
+			mt_validate(mt);
+	}
+
+	for (i = 0; i <= SPAN_STRESS_LAST; i++)
+		spanning_expected_check(mt, expected, i);
+
+	mt_validate(mt);
+}
+
 static noinline void __init check_fuzzer(struct maple_tree *mt)
 {
 	/*
@@ -3757,6 +3869,346 @@ static noinline void __init check_range64_in_rcu(struct maple_tree *mt)
 	rcu_barrier();
 }
 
+#define MARKS_STRESS_LAST	16383
+
+/*
+ * marks_consistency_check() -  Check that mas_find_marked() finds the same
+ * marts that mtree_get_mark() returns and in the same order.
+ */
+static noinline void __init marks_consistency_check(struct maple_tree *mt)
+{
+	unsigned long expected, found, prev;
+	void *entry;
+	int mark;
+
+	for (mark = 0; mark <= MT_MARK_MAX; mark++) {
+		MA_STATE(mas, mt, 0, 0);
+
+		expected = found = prev = 0;
+		mtree_lock(mt);
+		mas_for_each(&mas, entry, MARKS_STRESS_LAST) {
+			bool marked = mtree_get_mark(mt, mas.index, mark);
+
+			MT_BUG_ON(mt, marked != mtree_get_mark(mt, mas.last, mark));
+			if (marked)
+				expected++;
+		}
+
+		mas_set(&mas, 0);
+		while ((entry = mas_find_marked(&mas, MARKS_STRESS_LAST, mark))) {
+			MT_BUG_ON(mt, found && mas.index <= prev);
+			MT_BUG_ON(mt, !mtree_get_mark(mt, mas.index, mark));
+			prev = mas.index;
+			found++;
+		}
+		mtree_unlock(mt);
+		MT_BUG_ON(mt, found != expected);
+	}
+}
+
+static noinline void __init marks_stress_testing(struct maple_tree *mt)
+{
+	unsigned long index, last, i;
+
+	for (i = 0; i < 2048; i++) {
+		index = i * 8;
+		mtree_store_range(mt, index, index + 5, xa_mk_value(i),
+				  GFP_KERNEL);
+		mtree_set_mark(mt, index, i & MT_MARK_MAX);
+		if (i & BIT(1))
+			mtree_set_mark(mt, index, (i + 5) & MT_MARK_MAX);
+	}
+	marks_consistency_check(mt);
+	mt_validate(mt);
+
+	index = 0;
+	for (i = 0; i < 8192; i++) {
+		/* 4099 is just a large prime for striding */
+		index = (index + 4099) & MARKS_STRESS_LAST;
+		last = min(index + i % 97, (unsigned long)MARKS_STRESS_LAST);
+
+		switch (i % 4) {
+		case 0:
+			mtree_store_range(mt, index, last, xa_mk_value(i),
+					  GFP_KERNEL);
+			break;
+		case 1:
+			mtree_store_range(mt, index, last, NULL, GFP_KERNEL);
+			break;
+		case 2:
+			if (mtree_load(mt, index))
+				mtree_set_mark(mt, index, i & MT_MARK_MAX);
+			break;
+		case 3:
+			if (mtree_load(mt, index))
+				mtree_clear_mark(mt, index, i & MT_MARK_MAX);
+			break;
+		}
+
+		if (!(i % 256)) {
+			marks_consistency_check(mt);
+			mt_validate(mt);
+		}
+	}
+
+	/* Overwrite portions and ensure the marks propagate up */
+	for (i = 0; i < 16; i++) {
+		index = i * 1024 + 100;
+		last = index + 800;
+		if (i & 1) {
+			mtree_store_range(mt, index, last, NULL, GFP_KERNEL);
+		} else {
+			mtree_store_range(mt, index, last, xa_mk_value(i),
+					  GFP_KERNEL);
+			mtree_set_mark(mt, index, i & MT_MARK_MAX);
+		}
+		marks_consistency_check(mt);
+		mt_validate(mt);
+	}
+}
+
+/*
+ * marks_store_testing() -  Make sure marks either remain or a cleared correctly
+ * by the storing paths, and ensure the parent is also updated.
+ *
+ * NULL stores clear the marks, a stored entry gets the union of the marks on
+ * the indexes it covers (like the xarray), partially overwritten entries keep
+ * the marks.
+ *
+ */
+static noinline void __init marks_store_testing(struct maple_tree *mt)
+{
+	unsigned long i, n;
+
+	/* Empty tree: a NULL store must not create a node */
+	mtree_store(mt, 5, NULL, GFP_KERNEL);
+	MT_BUG_ON(mt, !mtree_empty(mt));
+	mtree_store_range(mt, 0, ULONG_MAX, NULL, GFP_KERNEL);
+	MT_BUG_ON(mt, !mtree_empty(mt));
+
+	/* Root: a single entry at 0 needs a node to hold the mark */
+	mtree_store(mt, 0, xa_mk_value(0), GFP_KERNEL);
+	mtree_set_mark(mt, 0, 2);
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 0, 2));
+	mt_validate(mt);
+	mtree_store_range(mt, 0, ULONG_MAX, NULL, GFP_KERNEL);
+	MT_BUG_ON(mt, !mtree_empty(mt));
+
+	/*
+	 * Exact fit: storing a NULL clears the marks, overwriting keeps the
+	 * marks, a new entry over a NULL has no marks
+	 */
+	for (i = 0; i < 10; i++)
+		mtree_store(mt, i, xa_mk_value(i), GFP_KERNEL);
+	mtree_set_mark(mt, 5, 1);
+	mtree_set_mark(mt, 5, 6);
+	mt_validate(mt);
+	mtree_store(mt, 5, xa_mk_value(50), GFP_KERNEL);
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 5, 1));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 5, 6));
+	mt_validate(mt);
+	mtree_store(mt, 5, NULL, GFP_KERNEL);
+	MT_BUG_ON(mt, mt_marked(mt, 1));
+	MT_BUG_ON(mt, mt_marked(mt, 6));
+	mt_validate(mt);
+	mtree_store(mt, 5, xa_mk_value(5), GFP_KERNEL);
+	MT_BUG_ON(mt, mtree_get_mark(mt, 5, 1));
+	MT_BUG_ON(mt, mtree_get_mark(mt, 5, 6));
+	mt_validate(mt);
+	mtree_store_range(mt, 0, ULONG_MAX, NULL, GFP_KERNEL);
+
+	/*
+	 * Partial overwrite in a node with room: remnants keep marks and the
+	 * new entry gets the marks of the ranges it covers
+	 */
+	mtree_store_range(mt, 0, 9, xa_mk_value(0), GFP_KERNEL);
+	mtree_store_range(mt, 10, 19, xa_mk_value(1), GFP_KERNEL);
+	mtree_store_range(mt, 20, 29, xa_mk_value(2), GFP_KERNEL);
+	mtree_set_mark(mt, 10, 3);
+	mt_validate(mt);
+	/* Overwrite the middle of the marked range */
+	mtree_store_range(mt, 13, 16, xa_mk_value(9), GFP_KERNEL);
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 10, 3));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 12, 3));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 13, 3));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 16, 3));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 17, 3));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 19, 3));
+	mt_validate(mt);
+	/* Overwrite an unmarked range and part of a marked one */
+	mtree_store_range(mt, 22, 27, xa_mk_value(3), GFP_KERNEL);
+	mtree_store_range(mt, 25, 29, xa_mk_value(4), GFP_KERNEL);
+	MT_BUG_ON(mt, mtree_get_mark(mt, 25, 3));
+	mtree_store_range(mt, 19, 23, xa_mk_value(5), GFP_KERNEL);
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 19, 3));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 23, 3));
+	MT_BUG_ON(mt, mtree_get_mark(mt, 24, 3));
+	mt_validate(mt);
+	/* Overwrite the start of a range and the end of the previous one */
+	mtree_set_mark(mt, 0, 4);
+	mtree_store_range(mt, 8, 11, xa_mk_value(8), GFP_KERNEL);
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 7, 4));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 8, 4));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 8, 3));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 11, 4));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 11, 3));
+	MT_BUG_ON(mt, mtree_get_mark(mt, 12, 4));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 12, 3));
+	mt_validate(mt);
+	/*
+	 * NULL over the middle of a marked range: remnants keep marks (hole
+	 * punch)
+	 */
+	mtree_store_range(mt, 17, 18, NULL, GFP_KERNEL);
+	MT_BUG_ON(mt, mtree_get_mark(mt, 17, 3));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 19, 3));
+	mt_validate(mt);
+	mtree_store_range(mt, 0, ULONG_MAX, NULL, GFP_KERNEL);
+
+	/*
+	 * Split: fill a leaf so that a store into the middle of a marked range
+	 * must split the node, then check the resulting nodes.
+	 */
+	n = MAPLE_MRANGE64_SLOTS - 3;
+	for (i = 0; i < n; i++)
+		mtree_store(mt, i, xa_mk_value(i), GFP_KERNEL);
+	mtree_store_range(mt, n, n + 100, xa_mk_value(n), GFP_KERNEL);
+	mtree_store(mt, n + 101, xa_mk_value(n + 101), GFP_KERNEL);
+	mtree_set_mark(mt, n, 7);
+	mtree_set_mark(mt, n + 101, 0);
+	mt_validate(mt);
+	mtree_store(mt, n + 50, xa_mk_value(n + 50), GFP_KERNEL);
+	MT_BUG_ON(mt, !mtree_get_mark(mt, n, 7));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, n + 49, 7));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, n + 50, 7));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, n + 51, 7));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, n + 100, 7));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, n + 101, 0));
+	mt_validate(mt);
+	mtree_store_range(mt, 0, ULONG_MAX, NULL, GFP_KERNEL);
+
+	/*
+	 * Multi-level tree: the only entry with a mark is cleared or erased,
+	 * so every ancestor should no longer be marked.
+	 */
+	for (i = 0; i < 2000; i++)
+		mtree_store(mt, i * 3, xa_mk_value(i), GFP_KERNEL);
+	MT_BUG_ON(mt, mt_height(mt) < 3);
+	mtree_set_mark(mt, 900, 5);
+	MT_BUG_ON(mt, !mt_marked(mt, 5));
+	mt_validate(mt);
+	mtree_clear_mark(mt, 900, 5);
+	MT_BUG_ON(mt, mt_marked(mt, 5));
+	mt_validate(mt);
+
+	mtree_set_mark(mt, 903, 5);
+	mt_validate(mt);
+	mtree_erase(mt, 903);
+	MT_BUG_ON(mt, mt_marked(mt, 5));
+	mt_validate(mt);
+
+	/* Two entries in different leaves; clear one and keep one */
+	mtree_set_mark(mt, 300, 5);
+	mtree_set_mark(mt, 4500, 5);
+	mt_validate(mt);
+	mtree_erase(mt, 300);
+	MT_BUG_ON(mt, !mt_marked(mt, 5));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 4500, 5));
+	mt_validate(mt);
+
+	/* Rebalance: erase around a marked entry until nodes coalesce */
+	mtree_set_mark(mt, 1500, 6);
+	for (i = 1200; i < 1800; i += 3) {
+		if (i == 1500)
+			continue;
+		mtree_erase(mt, i);
+		if (!(i % 30))
+			mt_validate(mt);
+	}
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 1500, 6));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 4500, 5));
+	mt_validate(mt);
+
+	/* Spanning store of NULL over the marked entry clears the mark */
+	mtree_store_range(mt, 1000, 2000, NULL, GFP_KERNEL);
+	MT_BUG_ON(mt, mt_marked(mt, 6));
+	MT_BUG_ON(mt, !mt_marked(mt, 5));
+	mt_validate(mt);
+
+	/*
+	 * Spanning store of a value over unmarked entries: the new entry has
+	 * no marks, the neighbours keep theirs
+	 */
+	mtree_set_mark(mt, 3000, 2);
+	mtree_set_mark(mt, 3600, 2);
+	mtree_store_range(mt, 3001, 3599, xa_mk_value(1), GFP_KERNEL);
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 3000, 2));
+	MT_BUG_ON(mt, mtree_get_mark(mt, 3001, 2));
+	MT_BUG_ON(mt, mtree_get_mark(mt, 3599, 2));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 3600, 2));
+	mt_validate(mt);
+
+	/*
+	 * Spanning store over marked entries in the dropped nodes between the
+	 * two ends: the new entry gets their marks
+	 */
+	mtree_set_mark(mt, 4002, 1);
+	mtree_set_mark(mt, 4503, 3);
+	mtree_set_mark(mt, 4998, 4);
+	MT_BUG_ON(mt, mtree_get_mark(mt, 4500, 1));
+	mtree_store_range(mt, 4000, 5000, xa_mk_value(2), GFP_KERNEL);
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 4000, 1));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 4000, 3));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 4000, 4));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 5000, 5));
+	MT_BUG_ON(mt, mtree_get_mark(mt, 4000, 2));
+	MT_BUG_ON(mt, mt_marked(mt, 6));
+	mt_validate(mt);
+}
+
+static noinline void __init marks_dup_testing(void)
+{
+	struct maple_tree src, dst;
+	int i, ret;
+	void *entry;
+	MA_STATE(mas, &src, 0, 0);
+
+	mt_init_flags(&src, MT_FLAGS_MARKS);
+	for (i = 0; i < 600; i++) {
+		unsigned long index = i * 7;
+		uint8_t mark = i & MT_MARK_MAX;
+
+		mtree_store_range(&src, index, index + 3, xa_mk_value(i), GFP_KERNEL);
+		mtree_set_mark(&src, index, mark);
+		if (i & BIT(2))
+			mtree_set_mark(&src, index, (mark + 3) & MT_MARK_MAX);
+		if (i & BIT(3))
+			mtree_clear_mark(&src, index, mark);
+	}
+
+	mt_validate(&src);
+	mt_init_flags(&dst, MT_FLAGS_MARKS);
+	ret = mtree_dup(&src, &dst, GFP_KERNEL);
+	MT_BUG_ON(&src, ret != 0);
+
+	rcu_read_lock();
+	mas_for_each(&mas, entry, ULONG_MAX) {
+		int mark;
+
+		MT_BUG_ON(&src, mtree_load(&dst, mas.index) != entry);
+		for (mark = 0; mark <= MT_MARK_MAX; mark++) {
+			bool src_mark = mtree_get_mark(&src, mas.index, mark);
+			bool dst_mark = mtree_get_mark(&dst, mas.index, mark);
+
+			MT_BUG_ON(&src, src_mark != dst_mark);
+		}
+	}
+	rcu_read_unlock();
+
+	mtree_destroy(&dst);
+	mtree_destroy(&src);
+}
+
 static DEFINE_MTREE(tree);
 static int __init maple_tree_seed(void)
 {
@@ -4018,6 +4470,10 @@ static int __init maple_tree_seed(void)
 	mtree_destroy(&tree);
 
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_spanning_write_stress(&tree);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
 	check_rev_find(&tree);
 	mtree_destroy(&tree);
 
@@ -4047,6 +4503,21 @@ static int __init maple_tree_seed(void)
 
 	check_range64_in_rcu(&tree);
 
+
+	/* Non-RCU mode uses the in-place store paths */
+	mt_init_flags(&tree, MT_FLAGS_MARKS);
+	marks_store_testing(&tree);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, MT_FLAGS_MARKS | MT_FLAGS_USE_RCU);
+	marks_store_testing(&tree);
+	mtree_destroy(&tree);
+
+	marks_dup_testing();
+
+	mt_init_flags(&tree, MT_FLAGS_MARKS | MT_FLAGS_USE_RCU);
+	marks_stress_testing(&tree);
+	mtree_destroy(&tree);
 
 #if defined(BENCH)
 skip:
