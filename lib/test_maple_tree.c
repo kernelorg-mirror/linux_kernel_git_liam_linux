@@ -2385,6 +2385,118 @@ static noinline void __init check_spanning_relatives(struct maple_tree *mt)
 	mtree_store_range(mt, 9365, 9955, NULL, GFP_KERNEL);
 }
 
+#define SPAN_STRESS_LAST	8191
+#define SPAN_STRESS_ITERS	60000
+
+static inline u32 span_next_rand(u32 *state)
+{
+	*state = (*state * 1664525) + 1013904223;
+	return *state;
+}
+
+static inline void spanning_expected_check(struct maple_tree *mt, u32 *expected,
+					   unsigned long index)
+{
+	void *entry = mtree_load(mt, index);
+
+	if (!expected[index]) {
+		MT_BUG_ON(mt, entry != NULL);
+		return;
+	}
+
+	MT_BUG_ON(mt, !entry);
+	MT_BUG_ON(mt, xa_to_value(entry) != (unsigned long)(expected[index] - 1));
+}
+
+static noinline void __init check_spanning_write_stress(struct maple_tree *mt)
+{
+	static u32 expected[SPAN_STRESS_LAST + 1];
+	u32 state = 0x243f6a88;
+	unsigned long i;
+
+	memset(expected, 0, sizeof(expected));
+
+	for (i = 0; i < 1024; i++) {
+		u32 r = span_next_rand(&state);
+		unsigned long start = (r >> 8) & SPAN_STRESS_LAST;
+		unsigned long last = min(start + (r & 127),
+					 (unsigned long)SPAN_STRESS_LAST);
+		u32 val = ((r >> 9) & 32767) + 1;
+		unsigned long j;
+
+		mtree_store_range(mt, start, last, xa_mk_value(val), GFP_KERNEL);
+		for (j = start; j <= last; j++)
+			expected[j] = val + 1;
+	}
+
+	for (i = 0; i < SPAN_STRESS_ITERS; i++) {
+		u32 r = span_next_rand(&state);
+		unsigned long start = (r >> 7) & SPAN_STRESS_LAST;
+		unsigned long len;
+		unsigned long last;
+		u32 val = ((r >> 11) & 32767) + 1;
+		unsigned long j;
+
+		if ((i & 127) == 0) {
+			start = (r & 1) ? 0 : max_t(unsigned long,
+					SPAN_STRESS_LAST - ((r >> 9) & 1023), 0);
+			len = 2048 + (r & 1023);
+		} else if (r & BIT(31)) {
+			len = 512 + (r & 2047);
+		} else {
+			len = r & 255;
+		}
+
+		last = min(start + len, (unsigned long)SPAN_STRESS_LAST);
+
+		switch (r % 7) {
+		case 0:
+		case 1:
+		case 2:
+			mtree_store_range(mt, start, last, xa_mk_value(val), GFP_KERNEL);
+			for (j = start; j <= last; j++)
+				expected[j] = val + 1;
+			break;
+		case 3:
+			mtree_store_range(mt, start, last, NULL, GFP_KERNEL);
+			for (j = start; j <= last; j++)
+				expected[j] = 0;
+			break;
+		case 4:
+			start = (r & 1) ? 0 : SPAN_STRESS_LAST;
+			mtree_store(mt, start, xa_mk_value(val), GFP_KERNEL);
+			expected[start] = val + 1;
+			break;
+		case 5:
+			mtree_store(mt, start, NULL, GFP_KERNEL);
+			expected[start] = 0;
+			break;
+		default:
+			mtree_store_range(mt, start, last,
+					(r & BIT(16)) ? NULL : xa_mk_value(val), GFP_KERNEL);
+			for (j = start; j <= last; j++)
+				expected[j] = (r & BIT(16)) ? 0 : (val + 1);
+			break;
+		}
+
+		if ((i % 257) == 0) {
+			int k;
+
+			for (k = 0; k < 256; k++)
+				spanning_expected_check(mt, expected,
+						      span_next_rand(&state) & SPAN_STRESS_LAST);
+		}
+
+		if ((i % 2048) == 0)
+			mt_validate(mt);
+	}
+
+	for (i = 0; i <= SPAN_STRESS_LAST; i++)
+		spanning_expected_check(mt, expected, i);
+
+	mt_validate(mt);
+}
+
 static noinline void __init check_fuzzer(struct maple_tree *mt)
 {
 	/*
@@ -3748,7 +3860,196 @@ static noinline void __init marks_testing(struct maple_tree *mt)
 		MT_BUG_ON(mt, found != expected);
 	}
 
+	mtree_store(mt, 4242, xa_mk_value(1), GFP_KERNEL);
+	mtree_set_mark(mt, 4242, 3);
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 4242, 3));
+	mtree_store(mt, 4242, NULL, GFP_KERNEL);
+	mtree_store(mt, 4242, xa_mk_value(2), GFP_KERNEL);
+	MT_BUG_ON(mt, mtree_get_mark(mt, 4242, 3));
+
 	mt_dump(mt, mt_dump_dec);
+}
+
+#define MARKS_STRESS_LAST	16383
+#define MARKS_STRESS_ITERS	80000
+#define MARKS_STRESS_CHECK_PERIOD	257
+
+static inline u32 marks_next_rand(u32 *state)
+{
+	*state = (*state * 1664525) + 1013904223;
+	return *state;
+}
+
+static noinline void __init marks_consistency_check(struct maple_tree *mt)
+{
+	DECLARE_BITMAP(expected, MARKS_STRESS_LAST + 1);
+	DECLARE_BITMAP(seen, MARKS_STRESS_LAST + 1);
+	int mark;
+
+	for (mark = 0; mark <= MT_MARK_MAX; mark++) {
+		void *entry;
+		MA_STATE(scan, mt, 0, 0);
+		MA_STATE(find, mt, 0, 0);
+
+		bitmap_zero(expected, MARKS_STRESS_LAST + 1);
+		bitmap_zero(seen, MARKS_STRESS_LAST + 1);
+		mtree_lock(mt);
+		mas_for_each(&scan, entry, MARKS_STRESS_LAST) {
+			bool start_marked = mtree_get_mark(mt, scan.index, mark);
+			bool end_marked = mtree_get_mark(mt, scan.last, mark);
+
+			MT_BUG_ON(mt, start_marked != end_marked);
+			if (start_marked)
+				__set_bit(scan.index, expected);
+		}
+
+		while ((entry = mas_find_marked(&find, MARKS_STRESS_LAST,
+					       mark)) != NULL) {
+			MT_BUG_ON(mt, find.index > MARKS_STRESS_LAST);
+			MT_BUG_ON(mt, test_bit(find.index, seen));
+			__set_bit(find.index, seen);
+			MT_BUG_ON(mt, !test_bit(find.index, expected));
+			MT_BUG_ON(mt, !mtree_get_mark(mt, find.index, mark));
+			__clear_bit(find.index, expected);
+		}
+		mtree_unlock(mt);
+
+		MT_BUG_ON(mt, !bitmap_empty(expected, MARKS_STRESS_LAST + 1));
+	}
+}
+
+static noinline void __init marks_stress_testing(struct maple_tree *mt)
+{
+	u32 state = 0x9e3779b9;
+	int i;
+
+	for (i = 0; i < 2048; i++) {
+		unsigned long index = i * 8;
+		unsigned long last = min(index + 5,
+					 (unsigned long)MARKS_STRESS_LAST);
+
+		mtree_store_range(mt, index, last, xa_mk_value(i), GFP_KERNEL);
+		mtree_set_mark(mt, index, i & MT_MARK_MAX);
+		if (i & BIT(1))
+			mtree_set_mark(mt, index, (i + 5) & MT_MARK_MAX);
+	}
+
+	for (i = 0; i < MARKS_STRESS_ITERS; i++) {
+		u32 r = marks_next_rand(&state);
+		unsigned long index = (r >> 8) & MARKS_STRESS_LAST;
+		unsigned long len;
+		unsigned long last;
+		uint8_t mark = (r >> 24) & MT_MARK_MAX;
+
+		if ((i & 255) == 0) {
+			index = (r & 1) ? 0 : max_t(unsigned long,
+					MARKS_STRESS_LAST - ((r >> 9) & 2047), 0);
+			last = min(index + 4096 + (r & 4095),
+				   (unsigned long)MARKS_STRESS_LAST);
+			mtree_store_range(mt, index, last,
+					(r & BIT(20)) ? NULL : xa_mk_value((r >> 10) & 32767),
+					GFP_KERNEL);
+			if (!(r & BIT(20)) && mtree_load(mt, index))
+				mtree_set_mark(mt, index, mark);
+			if ((i % MARKS_STRESS_CHECK_PERIOD) == 0)
+				marks_consistency_check(mt);
+			continue;
+		}
+
+		if (r & BIT(31))
+			len = r & 1023;
+		else
+			len = r & 63;
+		last = min(index + len, (unsigned long)MARKS_STRESS_LAST);
+
+		switch (r % 8) {
+		case 0:
+			mtree_store_range(mt, index, last,
+					xa_mk_value((r >> 11) & 8191), GFP_KERNEL);
+			break;
+		case 1:
+			mtree_store_range(mt, index, last, NULL, GFP_KERNEL);
+			break;
+		case 2:
+			mtree_erase(mt, index);
+			break;
+		case 3:
+			if (mtree_load(mt, index))
+				mtree_set_mark(mt, index, mark);
+			break;
+		case 4:
+			if (mtree_load(mt, index))
+				mtree_clear_mark(mt, index, mark);
+			break;
+		case 5:
+			mtree_store(mt, index,
+				    (r & BIT(16)) ? NULL : xa_mk_value((r >> 9) & 16383),
+				    GFP_KERNEL);
+			break;
+		case 6:
+			if (mtree_load(mt, last))
+				mtree_set_mark(mt, last, (mark + 1) & MT_MARK_MAX);
+			break;
+		default:
+			if (index > 256)
+				index -= 256;
+			last = min(index + ((r >> 3) & 2047),
+				   (unsigned long)MARKS_STRESS_LAST);
+			mtree_store_range(mt, index, last,
+					(r & BIT(18)) ? NULL : xa_mk_value((r >> 7) & 32767),
+					GFP_KERNEL);
+			break;
+		}
+
+		if ((i % MARKS_STRESS_CHECK_PERIOD) == 0)
+			marks_consistency_check(mt);
+	}
+
+	marks_consistency_check(mt);
+	mt_validate(mt);
+}
+
+static noinline void __init marks_dup_testing(void)
+{
+	struct maple_tree src, dst;
+	int i, ret;
+	void *entry;
+	MA_STATE(mas, &src, 0, 0);
+
+	mt_init_flags(&src, MT_FLAGS_MARKS);
+	for (i = 0; i < 600; i++) {
+		unsigned long index = i * 7;
+		uint8_t mark = i & MT_MARK_MAX;
+
+		mtree_store_range(&src, index, index + 3, xa_mk_value(i), GFP_KERNEL);
+		mtree_set_mark(&src, index, mark);
+		if (i & BIT(2))
+			mtree_set_mark(&src, index, (mark + 3) & MT_MARK_MAX);
+		if (i & BIT(3))
+			mtree_clear_mark(&src, index, mark);
+	}
+
+	mt_validate(&src);
+	mt_init_flags(&dst, MT_FLAGS_MARKS);
+	ret = mtree_dup(&src, &dst, GFP_KERNEL);
+	MT_BUG_ON(&src, ret != 0);
+
+	rcu_read_lock();
+	mas_for_each(&mas, entry, ULONG_MAX) {
+		int mark;
+
+		MT_BUG_ON(&src, mtree_load(&dst, mas.index) != entry);
+		for (mark = 0; mark <= MT_MARK_MAX; mark++) {
+			bool src_mark = mtree_get_mark(&src, mas.index, mark);
+			bool dst_mark = mtree_get_mark(&dst, mas.index, mark);
+
+			MT_BUG_ON(&src, src_mark != dst_mark);
+		}
+	}
+	rcu_read_unlock();
+
+	mtree_destroy(&dst);
+	mtree_destroy(&src);
 }
 
 static DEFINE_MTREE(tree);
@@ -4012,6 +4313,10 @@ static int __init maple_tree_seed(void)
 	mtree_destroy(&tree);
 
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_spanning_write_stress(&tree);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
 	check_rev_find(&tree);
 	mtree_destroy(&tree);
 
@@ -4041,6 +4346,12 @@ static int __init maple_tree_seed(void)
 
 	mt_init_flags(&tree, MT_FLAGS_MARKS | MT_FLAGS_USE_RCU);
 	marks_testing(&tree);
+	mtree_destroy(&tree);
+
+	marks_dup_testing();
+
+	mt_init_flags(&tree, MT_FLAGS_MARKS | MT_FLAGS_USE_RCU);
+	marks_stress_testing(&tree);
 	mtree_destroy(&tree);
 
 #if defined(BENCH)
