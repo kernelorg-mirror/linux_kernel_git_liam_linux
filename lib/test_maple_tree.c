@@ -48,6 +48,7 @@ atomic_t maple_tree_tests_passed;
 /* #define BENCH_FORK */
 /* #define BENCH_MAS_FOR_EACH */
 /* #define BENCH_MAS_PREV */
+/* #define BENCH_MAS_FIND_MARKED */
 
 #ifdef __KERNEL__
 #define mt_set_non_kernel(x)		do {} while (0)
@@ -1997,6 +1998,36 @@ static noinline void __init bench_mas_prev(struct maple_tree *mt)
 
 }
 #endif
+
+#if defined(BENCH_MAS_FIND_MARKED)
+static noinline void __init bench_mas_find_marked(struct maple_tree *mt)
+{
+	const int count = 400000;
+	const unsigned long max = 16383;
+	unsigned long checksum = 0;
+	int i;
+	void *entry;
+	MA_STATE(mas, mt, 0, 0);
+
+	for (i = 0; i <= (int)max; i += 8) {
+		mtree_store_range(mt, i, i + 5, xa_mk_value(i), GFP_KERNEL);
+		mtree_set_mark(mt, i, 3);
+		if (i & 32)
+			mtree_set_mark(mt, i, 5);
+	}
+
+	rcu_read_lock();
+	for (i = 0; i < count; i++) {
+		mas_set(&mas, 0);
+		while ((entry = mas_find_marked(&mas, max, 3)) != NULL)
+			checksum += xa_to_value(entry);
+	}
+	rcu_read_unlock();
+
+	pr_info("bench_mas_find_marked checksum=%lu\n", checksum);
+}
+#endif
+
 /* check_forking - simulate the kernel forking sequence with the tree. */
 static noinline void __init check_forking(void)
 {
@@ -4122,7 +4153,13 @@ static int __init maple_tree_seed(void)
 	mtree_destroy(&tree);
 	goto skip;
 #endif
-
+#if defined(BENCH_MAS_FIND_MARKED)
+#define BENCH
+	mt_init_flags(&tree, MT_FLAGS_MARKS | MT_FLAGS_USE_RCU);
+	bench_mas_find_marked(&tree);
+	mtree_destroy(&tree);
+	goto skip;
+#endif
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
 	check_deficient_node(&tree);
 	mtree_destroy(&tree);
