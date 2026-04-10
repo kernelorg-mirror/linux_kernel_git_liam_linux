@@ -722,10 +722,16 @@ static inline void ma_mark_clear(u8 *marks, enum maple_type type,
 static inline void ma_mark_clear_slots(u8 *marks, enum maple_type type,
 			       unsigned char start, unsigned char count)
 {
-	for (uint8_t mark = 0; mark <= MT_MARK_MAX; mark++) {
-		for (unsigned char i = 0; i < count; i++)
-			ma_mark_clear(marks, type, start + i, mark);
-	}
+	unsigned char slots;
+
+	if (!count || start >= mt_slots[type])
+		return;
+
+	slots = mt_slots[type] - start;
+	if (count > slots)
+		count = slots;
+
+	memset(marks + start, 0, count * sizeof(u8));
 }
 
 static inline bool ma_mark_type_set(u8 *marks, enum maple_type type,
@@ -740,6 +746,22 @@ static inline bool ma_mark_type_set(u8 *marks, enum maple_type type,
 	}
 
 	return false;
+}
+
+static inline unsigned char ma_mark_find_next(u8 *marks,
+				      unsigned char start,
+				      unsigned char end,
+				      uint8_t mark)
+{
+	u8 mask = BIT(mark);
+
+	while (start <= end) {
+		if (marks[start] & mask)
+			return start;
+		start++;
+	}
+
+	return end + 1;
 }
 
 /*
@@ -2176,14 +2198,14 @@ unsigned long node_copy(struct ma_state *mas, struct maple_node *src,
 		s_gaps += start;
 		d_gaps += d_start;
 		memcpy(d_gaps, s_gaps, size * sizeof(unsigned long));
-	}
-
-	d_marks = ma_marks(dst, d_mt);
-	if (d_marks) {
-		s_marks = ma_marks(src, s_mt);
-		d_marks += d_start;
-		s_marks += start;
-		memcpy(d_marks, s_marks, size * sizeof(u8));
+	} else {
+		d_marks = ma_marks(dst, d_mt);
+		if (d_marks) {
+			s_marks = ma_marks(src, s_mt);
+			d_marks += d_start;
+			s_marks += start;
+			memcpy(d_marks, s_marks, size * sizeof(u8));
+		}
 	}
 
 	if (start + size - 1 < mt_pivots[s_mt])
@@ -2223,12 +2245,14 @@ void node_finalise(struct maple_node *node, enum maple_type mt,
 		memset(ma_slots(node, mt) + end, 0, size * sizeof(void *));
 		if (mt == maple_copy)
 			memset(node->cp.mark + end, 0, size * sizeof(u8));
-		marks = ma_marks(node, mt);
-		if (marks)
-			ma_mark_clear_slots(marks, mt, end, size);
 
 		if (gaps)
 			memset(gaps + end, 0, size * sizeof(unsigned long));
+		else {
+			marks = ma_marks(node, mt);
+			if (marks)
+				ma_mark_clear_slots(marks, mt, end, size);
+		}
 
 		if (--size)
 			memset(ma_pivots(node, mt) + end, 0, size * sizeof(unsigned long));
@@ -2825,9 +2849,7 @@ static inline void cp_dst_to_slots(struct maple_copy *cp, unsigned long min,
 					cp->gap[d] = gaps[gap_slot];
 				}
 			}
-		}
-
-		if (mt_has_marks(mas->tree)) {
+		} else if (mt_has_marks(mas->tree)) {
 			u8 mask = 0;
 			u8 *marks = ma_marks(mn, mt);
 
@@ -4690,16 +4712,6 @@ EXPORT_SYMBOL_GPL(mas_walk);
 
 static inline u8 *mas_marks(struct ma_state *mas)
 {
-	if (!mt_has_marks(mas->tree))
-		return NULL;
-
-	if (unlikely(!mas_is_active(mas)))
-		return NULL;
-
-	if (mte_node_type(mas->node) != maple_mrange_64 &&
-	    mte_node_type(mas->node) != maple_mleaf_64)
-		return NULL;
-
 	return ma_marks(mas_mn(mas), mte_node_type(mas->node));
 }
 
@@ -4789,12 +4801,13 @@ static __always_inline bool mas_find_setup(struct ma_state *mas,
 					   unsigned long max,
 					   void **entry);
 
-static void *__mas_find_marked(struct ma_state *mas, unsigned long max,
-			       uint8_t mark)
+static void *mas_find_next_marked(struct ma_state *mas, unsigned long max,
+			      uint8_t mark)
 {
 	void __rcu **slots;
 	unsigned long *pivots;
 	unsigned long save_point = mas->last;
+	unsigned char mark_end;
 	struct maple_node *node;
 	enum maple_type type;
 	u8 *marks;
@@ -4852,14 +4865,29 @@ retry:
 
 	slots = ma_slots(node, type);
 	marks = ma_marks(node, type);
+	mark_end = mas->end;
+	if (mark_end >= mt_slots[type])
+		mark_end = mt_slots[type] - 1;
 
-	if (!marks || !ma_mark_type_set(marks, type, mark)) {
+	if (!marks) {
 		mas->offset = mas->end;
 		mas->last = mas->max;
 		goto retry;
 	}
 
 	while (mas->offset <= mas->end) {
+		unsigned char slot = ma_mark_find_next(marks, mas->offset,
+						      mark_end, mark);
+
+		if (slot > mark_end) {
+			mas->offset = mas->end;
+			mas->last = mas->max;
+			goto retry;
+		}
+
+		mas->offset = slot;
+		mas->index = mas_safe_min(mas, pivots, mas->offset);
+
 		if (likely(mas->offset < mas->end))
 			mas->last = pivots[mas->offset];
 		else
@@ -4868,17 +4896,6 @@ retry:
 		if (mas->last > max) {
 			mas->status = ma_overflow;
 			return NULL;
-		}
-
-		if (!ma_mark_test(marks, type, mas->offset, mark)) {
-			if (mas->last >= max) {
-				mas->status = ma_overflow;
-				return NULL;
-			}
-
-			mas->index = mas->last + 1;
-			mas->offset++;
-			continue;
 		}
 
 		entry = mt_slot(mas->tree, slots, mas->offset);
@@ -4919,7 +4936,7 @@ void *mas_find_marked(struct ma_state *mas, unsigned long max, uint8_t mark)
 			return entry;
 	}
 
-	entry = __mas_find_marked(mas, max, mark);
+	entry = mas_find_next_marked(mas, max, mark);
 	if (!mas_is_err(mas))
 		mas->status = ma_active;
 

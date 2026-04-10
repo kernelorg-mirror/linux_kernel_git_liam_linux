@@ -897,6 +897,9 @@ static inline bool mt_external_lock(const struct maple_tree *mt)
  */
 static inline void mt_init_flags(struct maple_tree *mt, unsigned int flags)
 {
+	WARN_ON_ONCE((flags & MT_FLAGS_SECONDARY_STORAGE) ==
+			 MT_FLAGS_SECONDARY_STORAGE);
+
 	mt->ma_flags = flags;
 	if (!mt_external_lock(mt))
 		spin_lock_init(&mt->ma_lock);
