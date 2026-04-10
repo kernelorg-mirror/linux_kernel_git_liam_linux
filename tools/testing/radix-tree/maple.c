@@ -36317,6 +36317,74 @@ static inline int check_vma_modification(struct maple_tree *mt)
 	return 0;
 }
 
+/* The parent mark byte of the leaf holding @index. */
+static u8 *leaf_parent_marks(struct ma_state *mas, unsigned long index,
+			     unsigned char *pslot)
+{
+	struct maple_node *pnode;
+	enum maple_type ptype;
+
+	mas_set(mas, index);
+	MT_BUG_ON(mas->tree, !mas_walk(mas));
+	pnode = mte_parent(mas->node);
+	ptype = mas_parent_type(mas, mas->node);
+	*pslot = mte_parent_slot(mas->node);
+	return ma_marks(pnode, ptype);
+}
+
+/*
+ * The marked search goes by the parent marks: a leaf whose parent byte lacks
+ * the mark is never entered, so a mark hidden that way is not found from
+ * either direction, and a parent byte set over an unmarked leaf costs a visit
+ * but no result.
+ */
+static void check_marks_prune(struct maple_tree *mt)
+{
+	unsigned long i;
+	unsigned char pslot;
+	u8 *pmarks;
+	MA_STATE(mas, mt, 0, 0);
+
+	for (i = 0; i < 2000; i++)
+		MT_BUG_ON(mt, mtree_store_range(mt, i * 4, i * 4 + 1,
+						xa_mk_value(i), GFP_KERNEL));
+	mtree_set_mark(mt, 400, MT_MARK_2);
+	mtree_set_mark(mt, 4000, MT_MARK_2);
+	mtree_set_mark(mt, 7600, MT_MARK_2);
+	MT_BUG_ON(mt, mt_height(mt) < 2);
+
+	mas_lock(&mas);
+	pmarks = leaf_parent_marks(&mas, 4000, &pslot);
+	MT_BUG_ON(mt, !(pmarks[pslot] & BIT(MT_MARK_2)));
+	pmarks[pslot] &= ~BIT(MT_MARK_2);
+	mas_set(&mas, 0);
+	MT_BUG_ON(mt, mas_find_marked(&mas, ULONG_MAX, MT_MARK_2) != xa_mk_value(100));
+	MT_BUG_ON(mt, mas_find_marked(&mas, ULONG_MAX, MT_MARK_2) != xa_mk_value(1900));
+	MT_BUG_ON(mt, mas_find_marked(&mas, ULONG_MAX, MT_MARK_2) != NULL);
+	mas_set(&mas, ULONG_MAX);
+	MT_BUG_ON(mt, mas_find_marked_rev(&mas, 0, MT_MARK_2) != xa_mk_value(1900));
+	MT_BUG_ON(mt, mas_find_marked_rev(&mas, 0, MT_MARK_2) != xa_mk_value(100));
+	MT_BUG_ON(mt, mas_find_marked_rev(&mas, 0, MT_MARK_2) != NULL);
+	pmarks[pslot] |= BIT(MT_MARK_2);
+	mas_set(&mas, 0);
+	MT_BUG_ON(mt, mas_find_marked(&mas, ULONG_MAX, MT_MARK_2) != xa_mk_value(100));
+	MT_BUG_ON(mt, mas_find_marked(&mas, ULONG_MAX, MT_MARK_2) != xa_mk_value(1000));
+
+	pmarks = leaf_parent_marks(&mas, 2000, &pslot);
+	MT_BUG_ON(mt, !!(pmarks[pslot] & BIT(MT_MARK_2)));
+	pmarks[pslot] |= BIT(MT_MARK_2);
+	mas_set(&mas, 0);
+	MT_BUG_ON(mt, mas_find_marked(&mas, ULONG_MAX, MT_MARK_2) != xa_mk_value(100));
+	MT_BUG_ON(mt, mas_find_marked(&mas, ULONG_MAX, MT_MARK_2) != xa_mk_value(1000));
+	mas_set(&mas, ULONG_MAX);
+	MT_BUG_ON(mt, mas_find_marked_rev(&mas, 0, MT_MARK_2) != xa_mk_value(1900));
+	MT_BUG_ON(mt, mas_find_marked_rev(&mas, 0, MT_MARK_2) != xa_mk_value(1000));
+	MT_BUG_ON(mt, mas_find_marked_rev(&mas, 0, MT_MARK_2) != xa_mk_value(100));
+	pmarks[pslot] &= ~BIT(MT_MARK_2);
+	mas_unlock(&mas);
+	mt_validate(mt);
+}
+
 void farmer_tests(void)
 {
 	struct maple_node *node;
@@ -36382,6 +36450,10 @@ void farmer_tests(void)
 
 	mt_init_flags(&tree, 0);
 	check_mtree_dup(&tree);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, MT_FLAGS_MARKS);
+	check_marks_prune(&tree);
 	mtree_destroy(&tree);
 
 	if (!MAPLE_32BIT) {
