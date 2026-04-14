@@ -60,12 +60,14 @@ Normal API
 Start by initialising a maple tree, either with DEFINE_MTREE() for statically
 allocated maple trees or mt_init() for dynamically allocated ones.  A
 freshly-initialised maple tree contains a ``NULL`` pointer for the range ``0``
-- ``ULONG_MAX``.  There are currently two types of maple trees supported: the
-allocation tree and the regular tree.  The regular tree has a higher branching
-factor for internal nodes.  The allocation tree has a lower branching factor
-but allows the user to search for a gap of a given size or larger from either
-``0`` upwards or ``ULONG_MAX`` down.  An allocation tree can be used by
-passing in the ``MT_FLAGS_ALLOC_RANGE`` flag when initialising the tree.
+- ``ULONG_MAX``.  There are three configurations of maple trees: regular,
+allocation, and marks.  The regular tree has a higher branching factor for
+internal nodes.  The allocation tree has a lower branching factor but allows
+the user to search for a gap of a given size or larger from either ``0``
+upwards or ``ULONG_MAX`` down.  A marks-enabled tree tracks per-entry marks to
+optimize marked searches.  An allocation tree can be used by passing in
+``MT_FLAGS_ALLOC_RANGE`` when initialising the tree.  A marks-enabled tree can
+be used by passing in ``MT_FLAGS_MARKS``.
 
 You can then set entries using mtree_store() or mtree_store_range().
 mtree_store() will overwrite any entry with the new entry and return 0 on
@@ -88,6 +90,41 @@ element of the tree then ``0`` and ``ULONG_MAX`` may be used as the range.  If
 the caller is going to hold the lock for the duration of the walk then it is
 worth looking at the mas_for_each() API in the :ref:`maple-tree-advanced-api`
 section.
+
+Search Marks
+------------
+
+Maple Tree can track per-entry marks if the tree is initialised with
+``MT_FLAGS_MARKS``.
+
+``MT_FLAGS_MARKS`` and ``MT_FLAGS_ALLOC_RANGE`` are mutually exclusive.
+Both features use the tree's secondary per-slot metadata, so a tree may
+track marks or allocation gaps, but not both.  Combining both flags is
+unsupported and triggers a warning during tree initialisation.
+
+Marks are identified by ``mt_mark_t`` and the public mark IDs are
+``MT_MARK_0`` through ``MT_MARK_MAX``.  ``MT_PRESENT`` is a special search
+filter that matches any present entry.
+
+You can query an entry mark with mt_get_mark() or mtree_get_mark(), set it with
+mt_set_mark() or mtree_set_mark(), and clear it with mt_clear_mark() or
+mtree_clear_mark().
+
+For searching, use mt_find_marked() and mt_find_after_marked(), or iterate with
+mt_for_each_marked().  To check whether any entry has a given mark set, use
+mt_marked().
+
+Setting or clearing a mark on any index of a range entry affects the whole
+stored entry range.  Querying the mark on any index covered by that entry
+returns the same result.
+
+There is no dedicated API to iterate only unmarked entries.  If needed,
+iterate with mt_for_each() and filter with mt_get_mark().
+
+There is also no dedicated API to search for logical combinations of marks
+(for example, "mark 1 and mark 2" or "mark 0 or mark 2").
+
+If an entry is erased, marks associated with that entry are cleared.
 
 Sometimes it is necessary to ensure the next call to store to a maple tree does
 not allocate memory, please see :ref:`maple-tree-advanced-api` for this use case.
@@ -115,8 +152,13 @@ The Maple Tree uses RCU and an internal spinlock to synchronise access:
 
 Takes RCU read lock:
  * mtree_load()
+ * mtree_get_mark()
  * mt_find()
+ * mt_find_marked()
+ * mt_find_after_marked()
  * mt_for_each()
+ * mt_for_each_marked()
+ * mt_marked()
  * mt_next()
  * mt_prev()
 
@@ -126,6 +168,8 @@ Takes ma_lock internally:
  * mtree_insert()
  * mtree_insert_range()
  * mtree_erase()
+ * mtree_set_mark()
+ * mtree_clear_mark()
  * mtree_dup()
  * mtree_destroy()
  * mt_set_in_rcu()
@@ -194,6 +238,9 @@ the first call, and the next entry from every subsequent calls.
 
 mas_find_rev() will find the first entry which exists at or below the last on
 the first call, and the previous entry from every subsequent calls.
+
+The advanced mark APIs are mas_get_mark(), mas_set_mark(), mas_clear_mark(),
+and mas_find_marked().
 
 If the user needs to yield the lock during an operation, then the maple state
 must be paused using mas_pause().
