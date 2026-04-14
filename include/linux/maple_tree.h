@@ -253,7 +253,18 @@ static_assert(sizeof(struct maple_copy) <= 256);
 #define MT_FLAGS_MARKS		0x400
 #define MT_FLAGS_SECONDARY_STORAGE	(MT_FLAGS_ALLOC_RANGE | MT_FLAGS_MARKS)
 
-#define MT_MARK_MAX		(MAPLE_MARK_TYPES - 1)
+typedef uint8_t mt_mark_t;
+
+#define MT_MARK_0		((mt_mark_t)0U)
+#define MT_MARK_1		((mt_mark_t)1U)
+#define MT_MARK_2		((mt_mark_t)2U)
+#define MT_MARK_3		((mt_mark_t)3U)
+#define MT_MARK_4		((mt_mark_t)4U)
+#define MT_MARK_5		((mt_mark_t)5U)
+#define MT_MARK_6		((mt_mark_t)6U)
+#define MT_MARK_7		((mt_mark_t)7U)
+#define MT_MARK_MAX		((mt_mark_t)(MAPLE_MARK_TYPES - 1))
+#define MT_PRESENT		((mt_mark_t)MAPLE_MARK_TYPES)
 
 #define MAPLE_HEIGHT_MAX	31
 
@@ -416,11 +427,16 @@ int mtree_store(struct maple_tree *mt, unsigned long index,
 		void *entry, gfp_t gfp);
 void *mtree_erase(struct maple_tree *mt, unsigned long index);
 bool mtree_get_mark(struct maple_tree *mt, unsigned long index,
-		    uint8_t mark);
+		    mt_mark_t mark);
 void mtree_set_mark(struct maple_tree *mt, unsigned long index,
-		    uint8_t mark);
+		    mt_mark_t mark);
 void mtree_clear_mark(struct maple_tree *mt, unsigned long index,
-		      uint8_t mark);
+		      mt_mark_t mark);
+bool mt_marked(struct maple_tree *mt, mt_mark_t mark);
+void *mt_find_marked(struct maple_tree *mt, unsigned long *index,
+		     unsigned long max, mt_mark_t mark);
+void *mt_find_after_marked(struct maple_tree *mt, unsigned long *index,
+			   unsigned long max, mt_mark_t mark);
 
 int mtree_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp);
 int __mt_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp);
@@ -438,6 +454,24 @@ void __mt_destroy(struct maple_tree *mt);
 static inline bool mtree_empty(const struct maple_tree *mt)
 {
 	return mt->ma_root == NULL;
+}
+
+static inline bool mt_get_mark(struct maple_tree *mt, unsigned long index,
+		       mt_mark_t mark)
+{
+	return mtree_get_mark(mt, index, mark);
+}
+
+static inline void mt_set_mark(struct maple_tree *mt, unsigned long index,
+		       mt_mark_t mark)
+{
+	mtree_set_mark(mt, index, mark);
+}
+
+static inline void mt_clear_mark(struct maple_tree *mt, unsigned long index,
+			 mt_mark_t mark)
+{
+	mtree_clear_mark(mt, index, mark);
 }
 
 /* Advanced API */
@@ -606,11 +640,11 @@ void *mas_store(struct ma_state *mas, void *entry);
 void *mas_erase(struct ma_state *mas);
 int mas_store_gfp(struct ma_state *mas, void *entry, gfp_t gfp);
 void mas_store_prealloc(struct ma_state *mas, void *entry);
-bool mas_get_mark(struct ma_state *mas, uint8_t mark);
-void mas_set_mark(struct ma_state *mas, uint8_t mark);
-void mas_clear_mark(struct ma_state *mas, uint8_t mark);
+bool mas_get_mark(struct ma_state *mas, mt_mark_t mark);
+void mas_set_mark(struct ma_state *mas, mt_mark_t mark);
+void mas_clear_mark(struct ma_state *mas, mt_mark_t mark);
 void *mas_find_marked(struct ma_state *mas, unsigned long max,
-		      uint8_t mark);
+		      mt_mark_t mark);
 void *mas_find(struct ma_state *mas, unsigned long max);
 void *mas_find_range(struct ma_state *mas, unsigned long max);
 void *mas_find_rev(struct ma_state *mas, unsigned long min);
@@ -999,5 +1033,10 @@ void *mt_next(struct maple_tree *mt, unsigned long index, unsigned long max);
 #define mt_for_each(__tree, __entry, __index, __max) \
 	for (__entry = mt_find(__tree, &(__index), __max); \
 		__entry; __entry = mt_find_after(__tree, &(__index), __max))
+
+#define mt_for_each_marked(__tree, __entry, __index, __max, __filter) \
+	for (__entry = mt_find_marked(__tree, &(__index), __max, __filter); \
+		__entry; __entry = mt_find_after_marked(__tree, &(__index), \
+					       __max, __filter))
 
 #endif /*_LINUX_MAPLE_TREE_H */

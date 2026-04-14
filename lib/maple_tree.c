@@ -748,10 +748,10 @@ static inline bool ma_mark_type_set(u8 *marks, enum maple_type type,
 	return false;
 }
 
-static inline unsigned char ma_mark_find_next(u8 *marks,
-				      unsigned char start,
-				      unsigned char end,
-				      uint8_t mark)
+static inline unsigned char ma_mark_next(u8 *marks,
+				 unsigned char start,
+				 unsigned char end,
+				 mt_mark_t mark)
 {
 	u8 mask = BIT(mark);
 
@@ -4715,7 +4715,7 @@ static inline u8 *mas_marks(struct ma_state *mas)
 	return ma_marks(mas_mn(mas), mte_node_type(mas->node));
 }
 
-static void mas_propagate_mark(struct ma_state *mas, uint8_t mark)
+static void mas_propagate_mark(struct ma_state *mas, mt_mark_t mark)
 {
 	struct ma_state parent = *mas;
 	u8 *marks;
@@ -4737,7 +4737,7 @@ static void mas_propagate_mark(struct ma_state *mas, uint8_t mark)
 	}
 }
 
-bool mas_get_mark(struct ma_state *mas, uint8_t mark)
+bool mas_get_mark(struct ma_state *mas, mt_mark_t mark)
 {
 	u8 *marks;
 
@@ -4756,7 +4756,7 @@ bool mas_get_mark(struct ma_state *mas, uint8_t mark)
 }
 EXPORT_SYMBOL_GPL(mas_get_mark);
 
-void mas_set_mark(struct ma_state *mas, uint8_t mark)
+void mas_set_mark(struct ma_state *mas, mt_mark_t mark)
 {
 	u8 *marks;
 
@@ -4776,7 +4776,7 @@ void mas_set_mark(struct ma_state *mas, uint8_t mark)
 }
 EXPORT_SYMBOL_GPL(mas_set_mark);
 
-void mas_clear_mark(struct ma_state *mas, uint8_t mark)
+void mas_clear_mark(struct ma_state *mas, mt_mark_t mark)
 {
 	void *entry;
 	u8 *marks;
@@ -4801,8 +4801,8 @@ static __always_inline bool mas_find_setup(struct ma_state *mas,
 					   unsigned long max,
 					   void **entry);
 
-static void *mas_find_next_marked(struct ma_state *mas, unsigned long max,
-			      uint8_t mark)
+static void *mas_next_marked(struct ma_state *mas, unsigned long max,
+			      mt_mark_t mark)
 {
 	void __rcu **slots;
 	unsigned long *pivots;
@@ -4876,8 +4876,8 @@ retry:
 	}
 
 	while (mas->offset <= mas->end) {
-		unsigned char slot = ma_mark_find_next(marks, mas->offset,
-						      mark_end, mark);
+		unsigned char slot = ma_mark_next(marks, mas->offset,
+					 mark_end, mark);
 
 		if (slot > mark_end) {
 			mas->offset = mas->end;
@@ -4917,7 +4917,7 @@ retry:
 	goto retry;
 }
 
-void *mas_find_marked(struct ma_state *mas, unsigned long max, uint8_t mark)
+void *mas_find_marked(struct ma_state *mas, unsigned long max, mt_mark_t mark)
 {
 	void *entry = NULL;
 	u8 *marks;
@@ -4936,7 +4936,7 @@ void *mas_find_marked(struct ma_state *mas, unsigned long max, uint8_t mark)
 			return entry;
 	}
 
-	entry = mas_find_next_marked(mas, max, mark);
+	entry = mas_next_marked(mas, max, mark);
 	if (!mas_is_err(mas))
 		mas->status = ma_active;
 
@@ -6272,7 +6272,7 @@ unlock:
 }
 EXPORT_SYMBOL(mtree_load);
 
-bool mtree_get_mark(struct maple_tree *mt, unsigned long index, uint8_t mark)
+bool mtree_get_mark(struct maple_tree *mt, unsigned long index, mt_mark_t mark)
 {
 	MA_STATE(mas, mt, index, index);
 	bool ret;
@@ -6284,7 +6284,7 @@ bool mtree_get_mark(struct maple_tree *mt, unsigned long index, uint8_t mark)
 }
 EXPORT_SYMBOL(mtree_get_mark);
 
-void mtree_set_mark(struct maple_tree *mt, unsigned long index, uint8_t mark)
+void mtree_set_mark(struct maple_tree *mt, unsigned long index, mt_mark_t mark)
 {
 	MA_STATE(mas, mt, index, index);
 
@@ -6295,7 +6295,7 @@ void mtree_set_mark(struct maple_tree *mt, unsigned long index, uint8_t mark)
 EXPORT_SYMBOL(mtree_set_mark);
 
 void mtree_clear_mark(struct maple_tree *mt, unsigned long index,
-		     uint8_t mark)
+		     mt_mark_t mark)
 {
 	MA_STATE(mas, mt, index, index);
 
@@ -6932,6 +6932,58 @@ unlock:
 	return entry;
 }
 EXPORT_SYMBOL(mt_find);
+
+bool mt_marked(struct maple_tree *mt, mt_mark_t mark)
+{
+	unsigned long index = 0;
+
+	return mt_find_marked(mt, &index, ULONG_MAX, mark) != NULL;
+}
+EXPORT_SYMBOL(mt_marked);
+
+void *mt_find_marked(struct maple_tree *mt, unsigned long *index,
+		     unsigned long max, mt_mark_t mark)
+{
+	MA_STATE(mas, mt, *index, *index);
+	void *entry;
+#ifdef CONFIG_DEBUG_MAPLE_TREE
+	unsigned long copy = *index;
+#endif
+
+	if (mark == MT_PRESENT)
+		return mt_find(mt, index, max);
+
+	if ((mark > MT_MARK_MAX) || ((*index) > max))
+		return NULL;
+
+	trace_ma_read(TP_FCT, &mas);
+	rcu_read_lock();
+	do {
+		entry = mas_find_marked(&mas, max, mark);
+	} while (entry && xa_is_zero(entry));
+	rcu_read_unlock();
+
+	if (likely(entry)) {
+		*index = mas.last + 1;
+#ifdef CONFIG_DEBUG_MAPLE_TREE
+		if (MT_WARN_ON(mt, (*index) && ((*index) <= copy)))
+			pr_err("index not increased! %lx <= %lx\n", *index, copy);
+#endif
+	}
+
+	return entry;
+}
+EXPORT_SYMBOL(mt_find_marked);
+
+void *mt_find_after_marked(struct maple_tree *mt, unsigned long *index,
+			   unsigned long max, mt_mark_t mark)
+{
+	if (!(*index))
+		return NULL;
+
+	return mt_find_marked(mt, index, max, mark);
+}
+EXPORT_SYMBOL(mt_find_after_marked);
 
 /**
  * mt_find_after() - Search from the start up until an entry is found.
