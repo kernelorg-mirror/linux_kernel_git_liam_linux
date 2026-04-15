@@ -97,7 +97,7 @@ static struct kmem_cache *maple_node_cache;
 
 #ifdef CONFIG_DEBUG_MAPLE_TREE
 static const unsigned long mt_max[] = {
-	[maple_dense]		= MAPLE_NODE_SLOTS,
+	[maple_dense]		= MAPLE_NODE_SLOTS - 1,
 	[maple_mleaf_64]	= ULONG_MAX,
 	[maple_leaf_64]		= ULONG_MAX,
 	[maple_range_64]	= ULONG_MAX,
@@ -109,7 +109,7 @@ static const unsigned long mt_max[] = {
 #endif
 
 static const unsigned char mt_slots[] = {
-	[maple_dense]		= MAPLE_NODE_SLOTS,
+	[maple_dense]		= MAPLE_NODE_SLOTS - 1,
 	[maple_mleaf_64]	= MAPLE_MRANGE64_SLOTS,
 	[maple_leaf_64]		= MAPLE_RANGE64_SLOTS,
 	[maple_range_64]	= MAPLE_RANGE64_SLOTS,
@@ -131,7 +131,7 @@ static const unsigned char mt_pivots[] = {
 #define mt_pivot_count(x) mt_pivots[mte_node_type(x)]
 
 static const unsigned char mt_min_slots[] = {
-	[maple_dense]		= MAPLE_NODE_SLOTS / 2,
+	[maple_dense]		= (MAPLE_NODE_SLOTS - 1) / 2,
 	[maple_mleaf_64]	= (MAPLE_MRANGE64_SLOTS / 2) - 2,
 	[maple_leaf_64]		= (MAPLE_RANGE64_SLOTS / 2) - 2,
 	[maple_range_64]	= (MAPLE_RANGE64_SLOTS / 2) - 2,
@@ -878,12 +878,14 @@ static inline void *mas_root_locked(struct ma_state *mas)
 	return mt_root_locked(mas->tree);
 }
 
-static inline struct maple_metadata *ma_meta(struct maple_node *mn,
-					     enum maple_type mt)
+static inline
+struct maple_metadata *ma_meta(struct maple_node *mn, enum maple_type mt)
 {
 	switch (mt) {
 	case maple_invalid:
 		return NULL;
+	case maple_dense:
+		return &mn->dense.meta;
 	case maple_arange_64:
 		return &mn->ma64.meta;
 	case maple_mleaf_64:
@@ -7593,8 +7595,9 @@ static void mt_dump_node(const struct maple_tree *mt, void *entry,
 		pr_cont(" INVALID TYPE\n");
 		break;
 	case maple_dense:
-		pr_cont("\n");
-		for (i = 0; i < MAPLE_NODE_SLOTS; i++) {
+		pr_cont(" | %02X %02X|\n", node->dense.meta.end,
+			node->dense.meta.gap);
+		for (i = 0; i < mt_slots[type]; i++) {
 			if (min + i > max)
 				pr_cont("OUT OF RANGE: ");
 			mt_dump_entry(mt_slot(mt, node->slot, i),

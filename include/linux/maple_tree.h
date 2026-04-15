@@ -376,7 +376,13 @@ struct maple_node {
 	union {
 		struct {
 			struct maple_pnode *parent;
-			void __rcu *slot[MAPLE_NODE_SLOTS];
+			union {
+				void __rcu *slot[MAPLE_NODE_SLOTS];
+				struct {
+					void __rcu *dense_pad[MAPLE_NODE_SLOTS - 1];
+					struct maple_metadata meta;
+				} dense;
+			};
 		};
 		struct {
 			void *pad;
