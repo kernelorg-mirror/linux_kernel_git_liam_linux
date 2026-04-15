@@ -1515,6 +1515,9 @@ static inline unsigned char mas_data_end(struct ma_state *mas)
 
 	type = mte_node_type(mas->node);
 	node = mas_mn(mas);
+	if (unlikely(ma_is_dense(type)))
+		return mt_slots[type] - 1;
+
 	if (type == maple_arange_64)
 		return ma_meta_end(node, type);
 
