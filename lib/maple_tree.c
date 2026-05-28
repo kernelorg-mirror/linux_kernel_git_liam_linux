@@ -1572,11 +1572,11 @@ static inline unsigned long ma_leaf_max_gap(struct maple_node *mn,
 	/* reduce max_piv as the special case is checked before the loop */
 	max_piv = ma_data_end(mn, mt, pivots, max) - 1;
 	/*
-	 * Check end implied pivot which can only be a gap on the right most
-	 * node.
+	 * Check end implied pivot.  A boundary store of %NULL may leave the last
+	 * slot empty even when this is not the rightmost node.
 	 */
-	if (unlikely(max == ULONG_MAX) && !slots[max_piv + 1]) {
-		gap = ULONG_MAX - pivots[max_piv];
+	if (unlikely(!slots[max_piv + 1])) {
+		gap = max - pivots[max_piv];
 		if (gap > max_gap)
 			max_gap = gap;
 
@@ -2354,10 +2354,12 @@ static inline void cp_leaf_init(struct maple_copy *cp,
 	 */
 
 	cp->height = 1;
+	cp->write_off = 0;
 	memset(cp->mark, 0, sizeof(cp->mark));
 	/* Create entries to insert including split entries to left and right */
 	if (l_wr_mas->r_min < mas->index) {
 		end++;
+		cp->write_off = 1;
 		RCU_INIT_POINTER(cp->slot[0], l_wr_mas->content);
 		cp->pivot[0] = mas->index - 1;
 	}
@@ -2424,10 +2426,7 @@ static bool data_fits(struct ma_state *sib, struct ma_state *mas,
 	 *
 	 * Note that it is still possible to get a full node on the left by the
 	 * NULL landing exactly on the split.  The NULL ending of a node happens
-	 * in the dst_setup() function, where we will either increase the split
-	 * by one or decrease it by one, if possible.  In the case of split
-	 * (this case), it is always possible to shift the spilt by one - again
-	 * because there is at least one slot free by the below checking.
+	 * in the dst_setup() function, where we may shift the split inward.
 	 */
 	if (new_data < space)
 		return true;
@@ -2536,56 +2535,66 @@ static inline void spanning_data(struct maple_copy *cp,
 static inline
 void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt)
 {
+	int capacity = mt_slots[mt];
+	int total;
+	int min_count;
+	int left_count;
+	int left_low;
+	int left_high;
+	int shift;
+
 	/* Data is 1 indexed, every src has +1 added.  */
 
-	if (cp->data <= mt_slots[mt]) {
+	if (cp->data <= capacity) {
 		cp->split = cp->data - 1;
 		cp->d_count = 1;
 		goto node_setup;
 	}
 
-	cp->split = (cp->data - 1) / 2;
+	total = cp->data;
+	if (total > capacity * 2)
+		goto split_3way;
+
+	cp->split = (total - 1) / 2;
 	cp->d_count = 2;
-	if (cp->data < mt_slots[mt] * 2)
+	if (!ma_is_leaf(mt))
 		goto node_setup;
 
-	if (cp->data == mt_slots[mt] * 2) {
-		unsigned char off;
-		unsigned char s;
+	if (cp->write_off < cp->split || cp->write_off > cp->split + 1)
+		goto node_setup;
 
-		if (!ma_is_leaf(mt))
-			goto node_setup;
+	min_count = mt_min_slots[mt] + 1;
+	left_count = cp->split + 1;
 
-		/*
-		 * Leaf nodes are a bit tricky because we cannot assume the data
-		 * can fit due to the NULL limitation on node ends.
-		 */
-		off = cp->split;
-		for (s = 0; s < cp->s_count; s++) {
-			unsigned char s_off;
+	left_low = min_count;
+	if (total - capacity > left_low)
+		left_low = total - capacity;
 
-			s_off = cp->src[s].end - cp->src[s].start;
-			if (s_off >= off)
-				break;
+	left_high = capacity;
+	if (total - min_count < left_high)
+		left_high = total - min_count;
 
-			s_off++;
-			off -= s_off;
-		}
+	if (left_count < left_low)
+		left_count = left_low;
+	else if (left_count > left_high)
+		left_count = left_high;
 
-		off += cp->src[s].start;
-		if (ma_slots(cp->src[s].node, cp->src[s].mt)[off])
-			goto node_setup;
+	shift = left_count - left_low;
+	if (shift > 2)
+		shift = 2;
 
-		cp->split++;
-		if (cp->split < mt_slots[mt])
-			goto node_setup;
+	if (shift > 0)
+		left_count -= shift;
 
-		cp->split -= 2;
-		if (cp->data - 2 - cp->split < mt_slots[mt])
-			goto node_setup;
+	if ((left_count < min_count) || (left_count > capacity) ||
+	    (total - left_count < min_count) || (total - left_count > capacity))
+		goto split_3way;
 
-	}
+	cp->split = left_count - 1;
 
+	goto node_setup;
+
+split_3way:
 	/* No other choice but to 3-way split the data */
 	cp->split = (cp->data + 2) / 3;
 	cp->d_count = 3;
@@ -2660,9 +2669,13 @@ static inline
 void multi_src_setup(struct maple_copy *cp, struct ma_wr_state *l_wr_mas,
 		struct ma_wr_state *r_wr_mas, struct ma_state *sib)
 {
+	unsigned char offset = 0;
+
 	cp->s_count = 0;
-	if (sib->end && sib->max < l_wr_mas->mas->min)
+	if (sib->end && sib->max < l_wr_mas->mas->min) {
 		append_mas_cp(cp, sib, 0, sib->end);
+		offset += cp->src[cp->s_count - 1].end + 1;
+	}
 
 	/* Copy left 0 - offset */
 	if (l_wr_mas->mas->offset) {
@@ -2670,8 +2683,10 @@ void multi_src_setup(struct maple_copy *cp, struct ma_wr_state *l_wr_mas,
 
 		append_wr_mas_cp(cp, l_wr_mas, 0, off);
 		cp->src[cp->s_count - 1].max = cp->min - 1;
+		offset += off + 1;
 	}
 
+	cp->write_off += offset;
 	init_cp_src(cp);
 
 	/* Copy right either from offset or offset + 1 pending on r_max */
@@ -2749,26 +2764,6 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 
 		split = cp->split;
 		cp->dst[d].max = d_max;
-		/* Handle null entries */
-		if (cp->dst[d].max != ULONG_MAX &&
-		    !ma_slots(dst, d_mt)[dst_offset - 1]) {
-			if (s_offset == cp->src[s].start) {
-				s--;
-				src = cp->src[s].node;
-				src_end = cp->src[s].end;
-				s_max = cp->src[s].max;
-				s_mt = cp->src[s].mt;
-				s_offset = src_end;
-			} else {
-				s_offset--;
-			}
-			/* Set dst max and clear pivot */
-			split++;
-			data_offset--;
-			dst_offset--;
-			cp->dst[d].max = ma_pivots(dst, d_mt)[dst_offset - 1];
-		}
-
 		node_finalise(dst, d_mt, dst_offset);
 		++d; /* Next destination */
 		if (d == cp->d_count - 1)
@@ -3058,8 +3053,7 @@ static inline void mas_store_root(struct ma_state *mas, void *entry)
  * spans the node.
  * @wr_mas: The maple write state
  *
- * Spanning writes are writes that start in one node and end in another OR if
- * the write of a %NULL will cause the node to end with a %NULL.
+ * Spanning writes are writes that start in one node and end in another.
  *
  * Return: True if this is a spanning write, false otherwise.
  */
@@ -3068,28 +3062,18 @@ static bool mas_is_span_wr(struct ma_wr_state *wr_mas)
 	unsigned long max = wr_mas->r_max;
 	unsigned long last = wr_mas->mas->last;
 	enum maple_type type = wr_mas->type;
-	void *entry = wr_mas->entry;
 
 	/* Contained in this pivot, fast path */
-	if (last < max)
+	if (last <= max)
 		return false;
 
 	if (ma_is_leaf(type)) {
 		max = wr_mas->mas->max;
-		if (last < max)
+		if (last <= max)
 			return false;
 	}
 
-	if (last == max) {
-		/*
-		 * The last entry of leaf node cannot be NULL unless it is the
-		 * rightmost node (writing ULONG_MAX), otherwise it spans slots.
-		 */
-		if (entry || last == ULONG_MAX)
-			return false;
-	}
-
-	trace_ma_write(TP_FCT, wr_mas->mas, wr_mas->r_max, entry);
+	trace_ma_write(TP_FCT, wr_mas->mas, wr_mas->r_max, wr_mas->entry);
 	return true;
 }
 
@@ -3159,6 +3143,8 @@ static void mas_wr_walk_index(struct ma_wr_state *wr_mas)
 		mas_wr_walk_traverse(wr_mas);
 	}
 }
+static void *mas_prev_slot(struct ma_state *mas, unsigned long min,
+			   bool empty);
 /*
  * mas_extend_spanning_null() - Extend a store of a %NULL to include surrounding %NULLs.
  * @l_wr_mas: The left maple write state
@@ -3169,22 +3155,17 @@ static inline void mas_extend_spanning_null(struct ma_wr_state *l_wr_mas,
 {
 	struct ma_state *r_mas = r_wr_mas->mas;
 	struct ma_state *l_mas = l_wr_mas->mas;
-	unsigned char l_slot;
 
-	l_slot = l_mas->offset;
 	if (!l_wr_mas->content)
 		l_mas->index = l_wr_mas->r_min;
+	else if (l_mas->index == l_wr_mas->r_min &&
+		 l_mas->index) {
+		struct ma_state pmas = *l_mas;
 
-	if ((l_mas->index == l_wr_mas->r_min) &&
-		 (l_slot &&
-		  !mas_slot_locked(l_mas, l_wr_mas->slots, l_slot - 1))) {
-		if (l_slot > 1)
-			l_mas->index = l_wr_mas->pivots[l_slot - 2] + 1;
-		else
-			l_mas->index = l_mas->min;
-
-		l_mas->offset = l_slot - 1;
-		l_wr_mas->r_min = l_mas->index;
+		if (!mas_prev_slot(&pmas, 0, true)) {
+			*l_mas = pmas;
+			wr_mas_setup(l_wr_mas, l_mas);
+		}
 	}
 
 	if (!r_wr_mas->content) {
@@ -3378,6 +3359,39 @@ static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
 	mas_wmb_replace(mas, &cp);
 }
 
+static noinline void __cold
+mas_wr_node_store_mark_cp(struct ma_wr_state *wr_mas, struct maple_node *node,
+		unsigned char old_offset, unsigned char offset_end,
+		unsigned char suffix_len, bool left_insert,
+		unsigned char new_end)
+{
+	struct ma_state *mas = wr_mas->mas;
+	unsigned char entry_offset = old_offset + left_insert;
+	u8 *dst_marks, *src_marks;
+
+	dst_marks = ma_marks(node, wr_mas->type);
+	src_marks = ma_marks(wr_mas->node, wr_mas->type);
+	if (old_offset)
+		memcpy(dst_marks, src_marks, sizeof(u8) * old_offset);
+
+	if (left_insert)
+		dst_marks[old_offset] = src_marks[old_offset];
+
+	dst_marks[entry_offset] = src_marks[old_offset];
+
+	if (suffix_len)
+		memcpy(dst_marks + entry_offset + 1, src_marks + offset_end,
+		       sizeof(u8) * suffix_len);
+
+	/* mas_pop_node() already zeroes the whole node for the in_rcu case */
+	if (!mt_in_rcu(mas->tree)) {
+		unsigned char clear_from = new_end + 1;
+
+		ma_mark_clear_slots(dst_marks, wr_mas->type, clear_from,
+				    mt_slots[wr_mas->type]);
+	}
+}
+
 /*
  * mas_wr_node_store() - Attempt to store the value in a node
  * @wr_mas: The maple write state
@@ -3387,12 +3401,12 @@ static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
 static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 {
 	unsigned char dst_offset, offset_end;
-	unsigned char copy_size, node_pivots, node_slots;
+	unsigned char suffix_len, node_pivots, node_slots;
 	struct maple_node reuse, *newnode;
 	unsigned long *dst_pivots;
 	void __rcu **dst_slots;
-	u8 *dst_marks, *src_marks;
-	unsigned char new_end;
+	unsigned char new_end, old_offset, entry_offset;
+	bool left_insert;
 	struct ma_state *mas;
 	bool in_rcu;
 
@@ -3402,12 +3416,17 @@ static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 	offset_end = wr_mas->offset_end;
 	node_pivots = mt_pivots[wr_mas->type];
 	node_slots = mt_slots[wr_mas->type];
+	old_offset = mas->offset;
+	left_insert = wr_mas->r_min < mas->index;
 	/* Assume last adds an entry */
-	new_end = mas->end + 1 - offset_end + mas->offset;
+	new_end = mas->end + 1 - offset_end + old_offset;
 	if (mas->last == wr_mas->end_piv) {
 		offset_end++; /* don't copy this offset */
 		new_end--;
 	}
+
+	if (left_insert)
+		new_end++;
 
 	/* set up node. */
 	if (in_rcu) {
@@ -3419,60 +3438,42 @@ static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 	newnode->parent = mas_mn(mas)->parent;
 	dst_pivots = ma_pivots(newnode, wr_mas->type);
 	dst_slots = ma_slots(newnode, wr_mas->type);
-	dst_marks = ma_marks(newnode, wr_mas->type);
-	src_marks = ma_marks(wr_mas->node, wr_mas->type);
-	/* Copy from start to insert point */
-	if (mas->offset) {
-		memcpy(dst_pivots, wr_mas->pivots, sizeof(unsigned long) * mas->offset);
-		memcpy(dst_slots, wr_mas->slots, sizeof(void __rcu *) * mas->offset);
-		if (dst_marks && src_marks)
-			memcpy(dst_marks, src_marks, sizeof(u8) * mas->offset);
+	if (old_offset) {
+		memcpy(dst_pivots, wr_mas->pivots, sizeof(unsigned long) * old_offset);
+		memcpy(dst_slots, wr_mas->slots, sizeof(void __rcu *) * old_offset);
 	}
 
-	/* Handle insert of new range starting after old range */
-	if (wr_mas->r_min < mas->index) {
-		rcu_assign_pointer(dst_slots[mas->offset], wr_mas->content);
-		if (dst_marks && src_marks)
-			dst_marks[mas->offset] = src_marks[mas->offset];
-		dst_pivots[mas->offset++] = mas->index - 1;
-		new_end++;
+	if (left_insert) {
+		rcu_assign_pointer(dst_slots[old_offset], wr_mas->content);
+		dst_pivots[old_offset] = mas->index - 1;
 	}
 
-	/* Store the new entry and range end. */
-	if (mas->offset < node_pivots)
-		dst_pivots[mas->offset] = mas->last;
-	rcu_assign_pointer(dst_slots[mas->offset], wr_mas->entry);
-	if (dst_marks)
-		dst_marks[mas->offset] = 0;
+	entry_offset = old_offset + left_insert;
+	if (entry_offset < node_pivots)
+		dst_pivots[entry_offset] = mas->last;
+	rcu_assign_pointer(dst_slots[entry_offset], wr_mas->entry);
 
-	/*
-	 * this range wrote to the end of the node or it overwrote the rest of
-	 * the data
-	 */
-	if (offset_end > mas->end)
-		goto done;
+	suffix_len = 0;
+	if (offset_end <= mas->end) {
+		dst_offset = entry_offset + 1;
+		suffix_len = mas->end - offset_end + 1;
+		memcpy(dst_slots + dst_offset, wr_mas->slots + offset_end,
+		       sizeof(void __rcu *) * suffix_len);
+		memcpy(dst_pivots + dst_offset, wr_mas->pivots + offset_end,
+		       sizeof(unsigned long) * (suffix_len - 1));
 
-	dst_offset = mas->offset + 1;
-	/* Copy to the end of node if necessary. */
-	copy_size = mas->end - offset_end + 1;
-	memcpy(dst_slots + dst_offset, wr_mas->slots + offset_end,
-	       sizeof(void __rcu *) * copy_size);
-	if (dst_marks && src_marks)
-		memcpy(dst_marks + dst_offset, src_marks + offset_end,
-		       sizeof(u8) * copy_size);
-	memcpy(dst_pivots + dst_offset, wr_mas->pivots + offset_end,
-	       sizeof(unsigned long) * (copy_size - 1));
+		if (new_end < node_pivots)
+			dst_pivots[new_end] = mas->max;
+	}
+	mas->offset = entry_offset;
 
-	if (new_end < node_pivots)
-		dst_pivots[new_end] = mas->max;
+	if (unlikely(mt_has_marks(mas->tree)))
+		mas_wr_node_store_mark_cp(wr_mas, newnode, old_offset,
+					  offset_end, suffix_len, left_insert,
+					  new_end);
 
-done:
 	if (!in_rcu) {
 		unsigned char clear_from = new_end + 1;
-
-		if (dst_marks)
-			ma_mark_clear_slots(dst_marks, wr_mas->type, clear_from,
-					    node_slots);
 
 		if (new_end + 2 < node_slots) {
 
@@ -3488,8 +3489,8 @@ done:
 				       sizeof(unsigned long) *
 				       (node_pivots - clear_from));
 		}
-
 	}
+
 	mas_leaf_set_meta(newnode, wr_mas->type, new_end);
 	if (in_rcu) {
 		struct maple_enode *old_enode = mas->node;
@@ -3551,18 +3552,54 @@ static inline void mas_wr_slot_store(struct ma_wr_state *wr_mas)
 		mas_update_gap(mas);
 }
 
-static inline void mas_wr_extend_null(struct ma_wr_state *wr_mas)
+static void *mas_next_slot(struct ma_state *mas, unsigned long max,
+			   bool empty);
+
+
+static inline bool mas_next_is_null(struct ma_state *mas, unsigned char offset)
+{
+	struct ma_state nmas = *mas;
+	void *entry;
+
+	nmas.offset = offset;
+	entry = mas_next_slot(&nmas, ULONG_MAX, true);
+	if (!entry) {
+		mas->last = nmas.last;
+		return true;
+	}
+
+	return false;
+}
+
+static inline bool mas_prev_is_null(struct ma_state *mas)
+{
+	struct ma_state pmas = *mas;
+	void *entry;
+
+	entry = mas_prev_slot(&pmas, 0, true);
+	if (!entry) {
+		mas->index = pmas.index;
+		return true;
+	}
+
+	return false;
+}
+
+static inline bool mas_wr_extend_null(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
+	bool spanning = false;
 
 	if (!wr_mas->slots[wr_mas->offset_end]) {
 		/* If this one is null, the next and prev are not */
 		mas->last = wr_mas->end_piv;
-	} else {
-		/* Check next slot(s) if we are overwriting the end */
-		if ((mas->last == wr_mas->end_piv) &&
-		    (mas->end != wr_mas->offset_end) &&
-		    !wr_mas->slots[wr_mas->offset_end + 1]) {
+	} else if (mas->last == wr_mas->end_piv) {
+		/* Check next slot if we are overwriting the end */
+		if (mas->end == wr_mas->offset_end) {
+			if (mas->max != ULONG_MAX)
+				spanning = mas_next_is_null(mas,
+						    wr_mas->offset_end);
+		} else if (!wr_mas->slots[wr_mas->offset_end + 1]) {
 			wr_mas->offset_end++;
 			if (wr_mas->offset_end == mas->end)
 				mas->last = mas->max;
@@ -3575,16 +3612,27 @@ static inline void mas_wr_extend_null(struct ma_wr_state *wr_mas)
 	if (!wr_mas->content) {
 		/* If this one is null, the next and prev are not */
 		mas->index = wr_mas->r_min;
-	} else {
-		/* Check prev slot if we are overwriting the start */
-		if (mas->index == wr_mas->r_min && mas->offset &&
-		    !wr_mas->slots[mas->offset - 1]) {
+	} else if (mas->index == wr_mas->r_min) {
+		if (!mas->offset) {
+			if (mas->index)
+				spanning |= mas_prev_is_null(mas);
+		} else if (!wr_mas->slots[mas->offset - 1]) {
 			mas->offset--;
 			wr_mas->r_min = mas->index =
 				mas_safe_min(mas, wr_mas->pivots, mas->offset);
 			wr_mas->r_max = wr_mas->pivots[mas->offset];
 		}
 	}
+
+	if (spanning) {
+		wr_mas->sufficient_height = 0;
+		wr_mas->vacant_height = 0;
+		mas_reset(mas);
+		wr_mas->content = mas_start(mas);
+		mas_wr_walk(wr_mas);
+	}
+
+	return spanning;
 }
 
 static inline void mas_wr_end_piv(struct ma_wr_state *wr_mas)
@@ -3598,6 +3646,7 @@ static inline void mas_wr_end_piv(struct ma_wr_state *wr_mas)
 	else
 		wr_mas->end_piv = wr_mas->mas->max;
 }
+
 
 static inline unsigned char mas_wr_new_end(struct ma_wr_state *wr_mas)
 {
@@ -3981,13 +4030,18 @@ static inline enum store_type mas_wr_store_type(struct ma_wr_state *wr_mas)
 	if (unlikely(mas_is_none(mas) || mas_is_ptr(mas)))
 		return wr_store_root;
 
+	wr_mas->vacant_height = 0;
+	wr_mas->sufficient_height = 0;
+
 	if (unlikely(!mas_wr_walk(wr_mas)))
 		return wr_spanning_store;
 
 	/* At this point, we are at the leaf node that needs to be altered. */
 	mas_wr_end_piv(wr_mas);
-	if (!wr_mas->entry)
-		mas_wr_extend_null(wr_mas);
+	if (!wr_mas->entry) {
+		if (mas_wr_extend_null(wr_mas))
+			return wr_spanning_store;
+	}
 
 	if ((wr_mas->r_min == mas->index) && (wr_mas->r_max == mas->last))
 		return wr_exact_fit;
@@ -4513,6 +4567,9 @@ again:
 			mas->status = ma_overflow;
 			return NULL;
 		}
+
+		if (mas->offset >= mas->end)
+			goto retry;
 
 		mas->index = mas->last + 1;
 		goto again;
