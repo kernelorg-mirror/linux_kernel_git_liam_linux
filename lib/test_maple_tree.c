@@ -1348,7 +1348,7 @@ static noinline void __init check_ranges(struct maple_tree *mt)
 	check_store_range(mt, 8084, 8084, xa_mk_value(8084), 0);
 	check_store_range(mt, 8085, 8085, xa_mk_value(8085), 0);
 	/* triple split across multiple levels. */
-	check_store_range(mt, 8099, 8100, xa_mk_value(1), 0);
+	check_store_range(mt, 8097, 8099, xa_mk_value(1), 0);
 
 	mt_validate(mt);
 	if (!MAPLE_32BIT)

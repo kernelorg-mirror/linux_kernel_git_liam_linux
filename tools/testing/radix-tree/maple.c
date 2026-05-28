@@ -340,6 +340,7 @@ static noinline void __init check_erase_testset(struct maple_tree *mt)
 		  "SNULL" : "ERASE") \
 	)
 #define check_erase2_debug 0
+#define check_erase2_jump_set 23
 
 /* Calculate the overwritten entries. */
 int mas_ce2_over_count(struct ma_state *mas_start, struct ma_state *mas_end,
@@ -597,6 +598,14 @@ static noinline void __init check_erase2_testset(struct maple_tree *mt,
 		MA_STATE(mas_start, mt, set[i+1], set[i+1]);
 		MA_STATE(mas_end, mt, set[i+2], set[i+2]);
 		mt_set_non_kernel(127);
+		if (size == 9966 && i == 2493)
+			pr_err("set23 i=2493 pre a0000=%p a1ffe=%p a1fff=%p a2000=%p a2fff=%p a3000=%p\n",
+			       mtree_load(mt, 0x55df1a4a0000),
+			       mtree_load(mt, 0x55df1a4a1ffe),
+			       mtree_load(mt, 0x55df1a4a1fff),
+			       mtree_load(mt, 0x55df1a4a2000),
+			       mtree_load(mt, 0x55df1a4a2fff),
+			       mtree_load(mt, 0x55df1a4a3000));
 #if check_erase2_debug
 		pr_err("%s: %d %s %lu - %lu\n", __func__, i,
 				ec_type_str(set[i]),
@@ -685,6 +694,14 @@ static noinline void __init check_erase2_testset(struct maple_tree *mt,
 #endif
 
 		MT_BUG_ON(mt, check != entry_count);
+		if (size == 9966 && i == 2493)
+			pr_err("set23 i=2493 post a0000=%p a1ffe=%p a1fff=%p a2000=%p a2fff=%p a3000=%p\n",
+			       mtree_load(mt, 0x55df1a4a0000),
+			       mtree_load(mt, 0x55df1a4a1ffe),
+			       mtree_load(mt, 0x55df1a4a1fff),
+			       mtree_load(mt, 0x55df1a4a2000),
+			       mtree_load(mt, 0x55df1a4a2fff),
+			       mtree_load(mt, 0x55df1a4a3000));
 
 		check = 0;
 		addr = 0;
@@ -33497,6 +33514,9 @@ STORE, 140501948112896, 140501948116991,
 
 	MA_STATE(mas, mt, 0, 0);
 
+	if (check_erase2_jump_set == 23)
+		goto run_set23;
+
 	mt_set_non_kernel(3);
 	check_erase2_testset(mt, set, ARRAY_SIZE(set));
 	mt_set_non_kernel(0);
@@ -33691,6 +33711,8 @@ STORE, 140501948112896, 140501948116991,
 	mt_set_non_kernel(0);
 	mtree_destroy(mt);
 
+
+run_set23:
 	mt_set_non_kernel(99);
 	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
 	check_erase2_testset(mt, set23, ARRAY_SIZE(set23));
@@ -33698,6 +33720,9 @@ STORE, 140501948112896, 140501948116991,
 	mt_set_non_kernel(0);
 	mt_validate(mt);
 	mtree_destroy(mt);
+
+	if (check_erase2_jump_set)
+		goto check_erase2_sets_out;
 
 
 	mt_set_non_kernel(99);
@@ -33912,6 +33937,8 @@ STORE, 140501948112896, 140501948116991,
 	mt_set_non_kernel(0);
 	mt_validate(mt);
 	mtree_destroy(mt);
+
+check_erase2_sets_out:
 }
 #endif
 

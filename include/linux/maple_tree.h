@@ -221,6 +221,7 @@ struct maple_copy {
 	unsigned char d_count;
 	unsigned char split;
 	unsigned char data;
+	unsigned char write_off;
 	unsigned char height;
 };
 
