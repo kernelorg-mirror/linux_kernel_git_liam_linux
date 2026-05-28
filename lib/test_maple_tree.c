@@ -2805,8 +2805,7 @@ static noinline void __init check_fuzzer(struct maple_tree *mt)
 	 * 6.  When reusing a node with an implied pivot and the node is
 	 * shrinking, old data would be left in the implied slot
 	 * Fixed by checking the last pivot for the mas->max and clear
-	 * accordingly.  This only affected the left-most node as that node is
-	 * the only one allowed to end in NULL.
+	 * accordingly.
 	 */
 	mt_init_flags(mt, 0);
 	mtree_test_erase(mt, 3);
