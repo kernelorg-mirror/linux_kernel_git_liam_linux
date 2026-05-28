@@ -1517,12 +1517,9 @@ static inline unsigned long ma_leaf_max_gap(struct maple_node *mn,
 
 	/* reduce max_piv as the special case is checked before the loop */
 	max_piv = ma_data_end(mn, mt, pivots, max) - 1;
-	/*
-	 * Check end implied pivot which can only be a gap on the right most
-	 * node.
-	 */
-	if (unlikely(max == ULONG_MAX) && !slots[max_piv + 1]) {
-		gap = ULONG_MAX - pivots[max_piv];
+	/* Check the end implied pivot, which may be a gap on any node. */
+	if (!slots[max_piv + 1]) {
+		gap = max - pivots[max_piv];
 		if (gap > max_gap)
 			max_gap = gap;
 
@@ -2554,13 +2551,6 @@ static bool data_fits(struct ma_state *sib, struct ma_state *mas,
 	 * to end to convert the index to a size means that the below
 	 * calculation should be <=, but we want to keep an extra space in nodes
 	 * to reduce jitter.
-	 *
-	 * Note that it is still possible to get a full node on the left by the
-	 * NULL landing exactly on the split.  The NULL ending of a node happens
-	 * in the dst_setup() function, where we will either increase the split
-	 * by one or decrease it by one, if possible.  In the case of split
-	 * (this case), it is always possible to shift the spilt by one - again
-	 * because there is at least one slot free by the below checking.
 	 */
 	if (new_data < space)
 		return true;
@@ -2661,6 +2651,33 @@ static inline void spanning_data(struct maple_copy *cp,
 }
 
 /*
+ * cp_data_null() - Is entry @off of the data, across the sources, a NULL?
+ *
+ * A dense source is a slot an index, its NULL runs one entry each; the
+ * question is not asked of one.
+ */
+static inline bool cp_data_null(struct maple_copy *cp, struct maple_tree *mt,
+		unsigned char off)
+{
+	unsigned char s, n;
+
+	for (s = 0; s < cp->s_count; s++) {
+		if (unlikely(ma_is_dense(cp->src[s].mt)))
+			return false;
+
+		n = cp->src[s].end - cp->src[s].start + 1;
+		if (off < n)
+			return !mt_slot_locked(mt, ma_slots(cp->src[s].node,
+							   cp->src[s].mt),
+					       cp->src[s].start + off);
+
+		off -= n;
+	}
+
+	return false;
+}
+
+/*
  * dst_setup() - Set up one or more destinations for the new data.
  * @cp: The maple copy node
  * @mas: The maple state
@@ -2679,44 +2696,16 @@ void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt)
 
 	cp->split = (cp->data - 1) / 2;
 	cp->d_count = 2;
-	if (cp->data < mt_slots[mt] * 2)
-		goto node_setup;
-
-	if (cp->data == mt_slots[mt] * 2) {
-		unsigned char off;
-		unsigned char s;
-
-		if (!ma_is_leaf(mt))
-			goto node_setup;
-
+	if (cp->data <= mt_slots[mt] * 2) {
 		/*
-		 * Leaf nodes are a bit tricky because we cannot assume the data
-		 * can fit due to the NULL limitation on node ends.
+		 * A NULL on the split goes right while the right node has the
+		 * room, as when none could end a node: a fill towards lower
+		 * indexes writes left of it and keeps the slot.
 		 */
-		off = cp->split;
-		for (s = 0; s < cp->s_count; s++) {
-			unsigned char s_off;
-
-			s_off = cp->src[s].end - cp->src[s].start;
-			if (s_off >= off)
-				break;
-
-			s_off++;
-			off -= s_off;
-		}
-
-		off += cp->src[s].start;
-		if (ma_slots(cp->src[s].node, cp->src[s].mt)[off])
-			goto node_setup;
-
-		cp->split++;
-		if (cp->split < mt_slots[mt])
-			goto node_setup;
-
-		cp->split -= 2;
-		if (cp->data - 2 - cp->split < mt_slots[mt])
-			goto node_setup;
-
+		if (cp->data - cp->split <= mt_slots[mt] &&
+		    cp_data_null(cp, mas->tree, cp->split))
+			cp->split--;
+		goto node_setup;
 	}
 
 	/* No other choice but to 3-way split the data */
@@ -2882,26 +2871,6 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 
 		split = cp->split;
 		cp->dst[d].max = d_max;
-		/* Handle null entries */
-		if (cp->dst[d].max != ULONG_MAX &&
-		    !ma_slots(dst, d_mt)[dst_offset - 1]) {
-			if (s_offset == cp->src[s].start) {
-				s--;
-				src = cp->src[s].node;
-				src_end = cp->src[s].end;
-				s_max = cp->src[s].max;
-				s_mt = cp->src[s].mt;
-				s_offset = src_end;
-			} else {
-				s_offset--;
-			}
-			/* Set dst max and clear pivot */
-			split++;
-			data_offset--;
-			dst_offset--;
-			cp->dst[d].max = ma_pivots(dst, d_mt)[dst_offset - 1];
-		}
-
 		node_finalise(dst, d_mt, dst_offset);
 		++d; /* Next destination */
 		if (d == cp->d_count - 1)
@@ -3177,8 +3146,9 @@ static inline void mas_store_root(struct ma_state *mas, void *entry)
  * spans the node.
  * @wr_mas: The maple write state
  *
- * Spanning writes are writes that start in one node and end in another OR if
- * the write of a %NULL will cause the node to end with a %NULL.
+ * Spanning writes are writes that start in one node and end in another.  A
+ * %NULL that would sit beside a %NULL in a neighbouring node is made spanning
+ * by mas_wr_extend_null() to keep gaps whole.
  *
  * Return: True if this is a spanning write, false otherwise.
  */
@@ -3187,28 +3157,18 @@ static bool mas_is_span_wr(struct ma_wr_state *wr_mas)
 	unsigned long max = wr_mas->r_max;
 	unsigned long last = wr_mas->mas->last;
 	enum maple_type type = wr_mas->type;
-	void *entry = wr_mas->entry;
 
 	/* Contained in this pivot, fast path */
 	if (last < max)
 		return false;
 
-	if (ma_is_leaf(type)) {
+	if (ma_is_leaf(type))
 		max = wr_mas->mas->max;
-		if (last < max)
-			return false;
-	}
 
-	if (last == max) {
-		/*
-		 * The last entry of leaf node cannot be NULL unless it is the
-		 * rightmost node (writing ULONG_MAX), otherwise it spans slots.
-		 */
-		if (entry || last == ULONG_MAX)
-			return false;
-	}
+	if (last <= max)
+		return false;
 
-	trace_ma_write(TP_FCT, wr_mas->mas, wr_mas->r_max, entry);
+	trace_ma_write(TP_FCT, wr_mas->mas, wr_mas->r_max, wr_mas->entry);
 	return true;
 }
 
@@ -3278,6 +3238,48 @@ static void mas_wr_walk_index(struct ma_wr_state *wr_mas)
 		mas_wr_walk_traverse(wr_mas);
 	}
 }
+
+/*
+ * mas_wr_lookup() - The entry at @index, looked up from the root.
+ * @mas: The maple state of the write, which stays where it is
+ * @index: An index under the tree's ceiling
+ *
+ * A write that decides its range by a neighbour it has not walked to looks it
+ * up from the root rather than moving its own state there and back.  Out of
+ * line, so the lookup's state is not in the frame of every store.
+ */
+static noinline void *mas_wr_lookup(struct ma_state *mas, unsigned long index)
+{
+	MA_STATE(l, mas->tree, index, index);
+
+	return mas_walk(&l);
+}
+
+/*
+ * mas_next_is_null() - Does a NULL follow @mas->node?
+ *
+ * The store then spans: its last moves one past the node and the spanning
+ * store takes in the rest of the NULL.
+ */
+static inline bool mas_next_is_null(struct ma_state *mas)
+{
+	if (mas_wr_lookup(mas, mas->max + 1))
+		return false;
+
+	mas->last = mas->max + 1;
+	return true;
+}
+
+/* Does a NULL precede @mas->node?  The store then spans, as above. */
+static inline bool mas_prev_is_null(struct ma_state *mas)
+{
+	if (mas_wr_lookup(mas, mas->min - 1))
+		return false;
+
+	mas->index = mas->min - 1;
+	return true;
+}
+
 /*
  * mas_extend_spanning_null() - Extend a store of a %NULL to include surrounding %NULLs.
  * @l_wr_mas: The left maple write state
@@ -3439,10 +3441,9 @@ static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
 	 * state is duplicated.  The first maple state walks the left tree path
 	 * to ``index``, the duplicate walks the right tree path to ``last``.
 	 * The data in the two nodes are combined into a single node, two nodes,
-	 * or possibly three nodes (see the 3-way split above).  A ``NULL``
-	 * written to the last entry of a node is considered a spanning store as
-	 * a rebalance is required for the operation to complete and an overflow
-	 * of data may happen.
+	 * or possibly three nodes (see the 3-way split above).  A ``NULL`` is
+	 * extended over any ``NULL`` it would sit beside, in this node or the
+	 * neighbours, so gaps stay whole.
 	 */
 	mas = wr_mas->mas;
 	trace_ma_op(TP_FCT, mas);
@@ -3475,6 +3476,13 @@ static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
 	if (!wr_mas->entry) {
 		mas_extend_spanning_null(wr_mas, &r_wr_mas);
 		mas->last = r_mas.last;
+		/* The right side was walked at last + 1; do the same on the left. */
+		if (mas->index && mas->index == mas->min &&
+		    mas_prev_is_null(mas)) {
+			mas_reset(mas);
+			wr_mas->content = mas_start(mas);
+			mas_wr_walk_index(wr_mas);
+		}
 	}
 
 	/* expanding NULLs may make this cover the entire range */
@@ -3549,30 +3557,33 @@ static inline u8 mas_wr_node_store_mark_cp(struct ma_wr_state *wr_mas,
 static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 {
 	unsigned char dst_offset, offset_end;
-	unsigned char copy_size, node_pivots, node_slots;
+	unsigned char suffix_len, node_pivots, node_slots;
 	struct maple_node reuse, *newnode;
 	unsigned long *dst_pivots;
 	void __rcu **dst_slots;
-	u8 *dst_marks, *src_marks;
-	unsigned char new_end;
-	unsigned char old_offset;
+	unsigned char new_end, old_offset, entry_offset;
+	bool left_insert;
 	struct ma_state *mas;
 	bool in_rcu;
 	u8 lost = 0;
 
 	mas = wr_mas->mas;
-	old_offset = mas->offset;
 	trace_ma_op(TP_FCT, mas);
 	in_rcu = mt_in_rcu(mas->tree);
 	offset_end = wr_mas->offset_end;
 	node_pivots = mt_pivots[wr_mas->type];
 	node_slots = mt_slots[wr_mas->type];
+	old_offset = mas->offset;
+	left_insert = wr_mas->r_min < mas->index;
 	/* Assume last adds an entry */
-	new_end = mas->end + 1 - offset_end + mas->offset;
+	new_end = mas->end + 1 - offset_end + old_offset;
 	if (mas->last == wr_mas->end_piv) {
 		offset_end++; /* don't copy this offset */
 		new_end--;
 	}
+
+	if (left_insert)
+		new_end++;
 
 	/* set up node. */
 	if (in_rcu) {
@@ -3584,67 +3595,43 @@ static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 	newnode->parent = mas_mn(mas)->parent;
 	dst_pivots = ma_pivots(newnode, wr_mas->type);
 	dst_slots = ma_slots(newnode, wr_mas->type);
-	dst_marks = ma_marks(newnode, wr_mas->type);
-	src_marks = ma_marks(wr_mas->node, wr_mas->type);
-	/* Copy from start to insert point */
-	if (mas->offset) {
-		memcpy(dst_pivots, wr_mas->pivots, sizeof(unsigned long) * mas->offset);
-		memcpy(dst_slots, wr_mas->slots, sizeof(void __rcu *) * mas->offset);
-		if (dst_marks && src_marks)
-			memcpy(dst_marks, src_marks, sizeof(u8) * mas->offset);
+	if (old_offset) {
+		memcpy(dst_pivots, wr_mas->pivots, sizeof(unsigned long) * old_offset);
+		memcpy(dst_slots, wr_mas->slots, sizeof(void __rcu *) * old_offset);
 	}
 
-	/* Handle insert of new range starting after old range */
-	if (wr_mas->r_min < mas->index) {
-		rcu_assign_pointer(dst_slots[mas->offset], wr_mas->content);
-		if (dst_marks && src_marks)
-			dst_marks[mas->offset] = src_marks[mas->offset];
-		dst_pivots[mas->offset++] = mas->index - 1;
-		new_end++;
+	if (left_insert) {
+		rcu_assign_pointer(dst_slots[old_offset], wr_mas->content);
+		dst_pivots[old_offset] = mas->index - 1;
 	}
 
-	/* Store the new entry and range end. */
-	if (mas->offset < node_pivots)
-		dst_pivots[mas->offset] = mas->last;
-	rcu_assign_pointer(dst_slots[mas->offset], wr_mas->entry);
-	if (dst_marks) {
-		u8 entry_marks;
+	entry_offset = old_offset + left_insert;
+	if (entry_offset < node_pivots)
+		dst_pivots[entry_offset] = mas->last;
+	rcu_assign_pointer(dst_slots[entry_offset], wr_mas->entry);
 
-		/* The new entry gets the marks of the ranges it covers */
-		entry_marks = ma_marks_union(src_marks, old_offset,
-					     wr_mas->offset_end);
-		if (wr_mas->entry) {
-			dst_marks[mas->offset] = entry_marks;
-		} else {
-			dst_marks[mas->offset] = 0;
-			lost = entry_marks;
-		}
+	suffix_len = 0;
+	if (offset_end <= mas->end) {
+		dst_offset = entry_offset + 1;
+		suffix_len = mas->end - offset_end + 1;
+		memcpy(dst_slots + dst_offset, wr_mas->slots + offset_end,
+		       sizeof(void __rcu *) * suffix_len);
+		memcpy(dst_pivots + dst_offset, wr_mas->pivots + offset_end,
+		       sizeof(unsigned long) * (suffix_len - 1));
+
+		if (new_end < node_pivots)
+			dst_pivots[new_end] = mas->max;
 	}
+	mas->offset = entry_offset;
 
-	/*
-	 * this range wrote to the end of the node or it overwrote the rest of
-	 * the data
-	 */
-	if (offset_end > mas->end)
-		goto done;
+	if (unlikely(mt_has_marks(mas->tree)))
+		lost = mas_wr_node_store_mark_cp(wr_mas, newnode, old_offset,
+						 offset_end, suffix_len,
+						 left_insert);
 
-	dst_offset = mas->offset + 1;
-	/* Copy to the end of node if necessary. */
-	copy_size = mas->end - offset_end + 1;
-	memcpy(dst_slots + dst_offset, wr_mas->slots + offset_end,
-	       sizeof(void __rcu *) * copy_size);
-	if (dst_marks && src_marks)
-		memcpy(dst_marks + dst_offset, src_marks + offset_end,
-		       sizeof(u8) * copy_size);
-	memcpy(dst_pivots + dst_offset, wr_mas->pivots + offset_end,
-	       sizeof(unsigned long) * (copy_size - 1));
-
-	if (new_end < node_pivots)
-		dst_pivots[new_end] = mas->max;
-
-done:
 	if (!in_rcu) {
 		unsigned char clear_from = new_end + 1;
+		u8 *dst_marks = ma_marks(newnode, wr_mas->type);
 
 		if (dst_marks)
 			ma_mark_clear_slots(dst_marks, clear_from,
@@ -3664,8 +3651,8 @@ done:
 				       sizeof(unsigned long) *
 				       (node_pivots - clear_from));
 		}
-
 	}
+
 	mas_leaf_set_meta(newnode, wr_mas->type, new_end);
 	if (in_rcu) {
 		struct maple_enode *old_enode = mas->node;
@@ -3747,18 +3734,30 @@ static inline void mas_wr_slot_store(struct ma_wr_state *wr_mas)
 		mas_update_gap(mas);
 }
 
-static inline void mas_wr_extend_null(struct ma_wr_state *wr_mas)
+/*
+ * mas_wr_extend_null() - Extend a store of a %NULL over the %NULLs beside it.
+ * @wr_mas: The maple write state
+ *
+ * A neighbouring node may start or end with a %NULL; joining it makes the
+ * store spanning and the walk is redone for the new range.  Out of line, so
+ * a store of a value does not carry the frame of the rewalk.
+ *
+ * Return: True if the store now spans nodes.
+ */
+static noinline bool mas_wr_extend_null(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
+	bool spanning = false;
 
 	if (!wr_mas->slots[wr_mas->offset_end]) {
 		/* If this one is null, the next and prev are not */
 		mas->last = wr_mas->end_piv;
-	} else {
-		/* Check next slot(s) if we are overwriting the end */
-		if ((mas->last == wr_mas->end_piv) &&
-		    (mas->end != wr_mas->offset_end) &&
-		    !wr_mas->slots[wr_mas->offset_end + 1]) {
+	} else if (mas->last == wr_mas->end_piv) {
+		/* Check next slot if we are overwriting the end */
+		if (mas->end == wr_mas->offset_end) {
+			if (mas->max != ULONG_MAX)
+				spanning = mas_next_is_null(mas);
+		} else if (!wr_mas->slots[wr_mas->offset_end + 1]) {
 			wr_mas->offset_end++;
 			if (wr_mas->offset_end == mas->end)
 				mas->last = mas->max;
@@ -3771,16 +3770,28 @@ static inline void mas_wr_extend_null(struct ma_wr_state *wr_mas)
 	if (!wr_mas->content) {
 		/* If this one is null, the next and prev are not */
 		mas->index = wr_mas->r_min;
-	} else {
+	} else if (mas->index == wr_mas->r_min) {
 		/* Check prev slot if we are overwriting the start */
-		if (mas->index == wr_mas->r_min && mas->offset &&
-		    !wr_mas->slots[mas->offset - 1]) {
+		if (!mas->offset) {
+			if (mas->index)
+				spanning |= mas_prev_is_null(mas);
+		} else if (!wr_mas->slots[mas->offset - 1]) {
 			mas->offset--;
 			wr_mas->r_min = mas->index =
 				mas_safe_min(mas, wr_mas->pivots, mas->offset);
 			wr_mas->r_max = wr_mas->pivots[mas->offset];
 		}
 	}
+
+	if (spanning) {
+		wr_mas->sufficient_height = 0;
+		wr_mas->vacant_height = 0;
+		mas_reset(mas);
+		wr_mas->content = mas_start(mas);
+		mas_wr_walk(wr_mas);
+	}
+
+	return spanning;
 }
 
 static inline void mas_wr_end_piv(struct ma_wr_state *wr_mas)
@@ -4127,9 +4138,12 @@ set_content:
  * @wr_mas: The maple write state
  * @entry: The entry to store into the tree
  *
+ * Always inlined: a store that needs no node must not pay a call to learn it.
+ *
  * Return: Number of nodes required for preallocation.
  */
-static inline void mas_prealloc_calc(struct ma_wr_state *wr_mas, void *entry)
+static __always_inline void mas_prealloc_calc(struct ma_wr_state *wr_mas,
+		void *entry)
 {
 	struct ma_state *mas = wr_mas->mas;
 	unsigned char height = mas_mt_height(mas);
@@ -4143,6 +4157,9 @@ static inline void mas_prealloc_calc(struct ma_wr_state *wr_mas, void *entry)
 		ret = 0;
 		break;
 	case wr_spanning_store:
+		/* A NULL may yet be extended into a neighbour; keep the walk's worth. */
+		if (!entry)
+			break;
 		if (wr_mas->sufficient_height < wr_mas->vacant_height)
 			ret = (height - wr_mas->sufficient_height) * 3 + 1;
 		else
@@ -4203,8 +4220,9 @@ static inline enum store_type mas_wr_store_type(struct ma_wr_state *wr_mas)
 
 	/* At this point, we are at the leaf node that needs to be altered. */
 	mas_wr_end_piv(wr_mas);
-	if (!wr_mas->entry)
-		mas_wr_extend_null(wr_mas);
+	/* A NULL joining a NULL in the next or previous node spans them. */
+	if (!wr_mas->entry && mas_wr_extend_null(wr_mas))
+		return wr_spanning_store;
 
 	if ((wr_mas->r_min == mas->index) && (wr_mas->r_max == mas->last))
 		return wr_exact_fit;
@@ -4695,6 +4713,7 @@ again:
 		else
 			mas->last = mas->max;
 	} else  {
+next_node:
 		if (mas->last >= max) {
 			mas->status = ma_overflow;
 			return NULL;
@@ -4732,7 +4751,10 @@ again:
 		}
 
 		mas->index = mas->last + 1;
-		goto again;
+		/* A node may end in a NULL; carry on into the next one. */
+		if (mas->offset < mas->end)
+			goto again;
+		goto next_node;
 	}
 
 	return entry;
