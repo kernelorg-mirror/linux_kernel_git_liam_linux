@@ -36318,6 +36318,260 @@ static inline int check_vma_modification(struct maple_tree *mt)
 	return 0;
 }
 
+static noinline void __init test_mas_next_node(struct ma_state *mas)
+{
+	struct maple_enode *this_node;
+
+	MT_BUG_ON(mas->tree, !mas_is_active(mas));
+
+	this_node = mas->node;
+
+	while(this_node == mas->node) {
+		mas_next_range(mas, ULONG_MAX);
+		MT_BUG_ON(mas->tree, !mas_is_active(mas));
+	}
+
+}
+
+static noinline void __init test_mas_prev_node(struct ma_state *mas)
+{
+	struct maple_enode *this_node;
+
+	MT_BUG_ON(mas->tree, !mas_is_active(mas));
+
+	this_node = mas->node;
+
+	while(this_node == mas->node) {
+		mas_prev_range(mas, 0);
+		MT_BUG_ON(mas->tree, !mas_is_active(mas));
+	}
+
+}
+
+static noinline bool __init mas_node_first_split_offset(struct ma_state *mas)
+{
+	struct maple_enode *node = mas->node;
+	unsigned long high = mas->max;
+
+	while (mas_is_active(mas) && node == mas->node) {
+		if (mas->index != mas->last)
+			return true;
+
+		if (mas->last >= high)
+			break;
+		mas_next_range(mas, high);
+	}
+
+	return false;
+}
+
+static noinline bool __init mas_node_fill(struct ma_state *mas)
+{
+	int target, val;
+	void *fill = (void*)0x11111111;
+	unsigned long high;
+
+	if (!mas_is_active(mas))
+		mas_walk(mas);
+
+	if (!mas_is_active(mas))
+		return false;
+
+	if (mas->max - mas->min <= mt_slot_count(mas->node))
+		goto done;
+
+	val = mas_data_end(mas) + 1;
+	target = mt_slot_count(mas->node);
+	if (val == target)
+		goto full;
+
+	mas_walk(mas);
+	high = mas->max;
+	while (target > val && mas_is_active(mas)) {
+		unsigned long old_last = mas->last;
+		unsigned long new_last;
+
+		if (old_last > mas->index) {
+			new_last = mas->index + 1;
+			if (new_last <= mas->index || new_last > old_last)
+				new_last = old_last;
+			mas->last = new_last;
+			mas_store(mas, fill);
+			val = mas_data_end(mas) + 1;
+			if (target <= val)
+				break;
+		}
+		mas_next_range(mas, high);
+		if (!mas_is_active(mas))
+			break;
+	}
+	return mas_node_first_split_offset(mas);
+
+full:
+	if (mas->max - mas->min > mt_slot_count(mas->node))
+		return mas_node_first_split_offset(mas);
+done:
+	mas_set(mas, mas->max);
+	mas_walk(mas);
+	return false;
+}
+
+static noinline bool __init mas_node_split(struct ma_state *mas)
+{
+	void *fill = (void*)0x22222222;
+	unsigned long old_last, new_last;
+
+	if (mas_node_fill(mas)) {
+		old_last = mas->last;
+		if (old_last <= mas->index)
+			return false;
+
+		new_last = mas->index + 1;
+		if (new_last <= mas->index || new_last > old_last)
+			new_last = old_last;
+		mas->last = new_last;
+		mas_store(mas, fill);
+		return true;
+	}
+
+	return false;
+}
+
+static noinline void __init test_mas_node_depth(struct ma_state *mas,
+		int depth)
+{
+	mas_reset(mas);
+	mas_start(mas);
+	while (mas->depth < depth) {
+		unsigned long *piv;
+		int count, offset;
+
+		count = mas_data_end(mas);
+		piv = ma_pivots(mas_mn(mas), mte_node_type(mas->node));
+		offset = 0;
+		while (offset < count && mas->index > piv[offset]) {
+			offset++;
+		}
+		mas->offset = offset;
+		mas_descend(mas);
+		mas->depth++;
+	}
+
+}
+
+static noinline void __init mas_internal_node_fill(struct ma_state *mas)
+{
+	int val, target, depth;
+	unsigned long high, next;
+
+	MT_BUG_ON(mas->tree, mte_is_leaf(mas->node));
+	val = mas_data_end(mas) + 1;
+	target = mt_slot_count(mas->node);
+	if (val == target)
+		return;
+
+	high = mas->max;
+	depth = mas->depth;
+	while (mas_data_end(mas) + 1 < target) {
+		mas_walk(mas);
+		if (mas_node_split(mas)) {
+			next = mas->last + 1;
+		} else {
+			next = mas->max + 1;
+		}
+		if (!next || next > high)
+			return;
+
+		mas->index = next;
+		test_mas_node_depth(mas, depth);
+	}
+
+
+}
+
+static noinline void __init mas_internal_levels_fill(struct ma_state *mas)
+{
+	int depth;
+	int height = mt_height(mas->tree);
+	unsigned long val = mas->index;
+
+	/* Root is handled separately; fill below-root internal levels here. */
+	depth = (mas->depth < 1) ? 1 : mas->depth;
+
+	while (depth < height - 1) {
+		MT_BUG_ON(mas->tree, mt_height(mas->tree) > height);
+		mas_set(mas, val);
+		test_mas_node_depth(mas, depth);
+		mas_internal_node_fill(mas);
+		depth++;
+	}
+}
+
+/* Fill the right edge of a height 3 tree so one store splits every level. */
+static noinline void __init check_multilevel_triple_split(struct maple_tree *mt)
+{
+	struct ma_state mas;
+	int i, val, val2;
+	unsigned long index;
+
+	for (i = 0; i <= 1200; i++) {
+		val = i*10;
+		val2 = (i+1)*10;
+		check_store_range(mt, val, val2, xa_mk_value(val), 0);
+		MT_BUG_ON(mt, mt_height(mt) >= 4);
+		mt_validate(mt);
+	}
+
+	mt_set_non_kernel(9999);
+	mas_init(&mas, mt, 0);
+	mas_lock(&mas);
+	mas_start(&mas);
+	/* Fill Root */
+	mas_internal_node_fill(&mas);
+	mas_reset(&mas);
+	/* Fill the second-to-last subtree of the root. */
+	mas_start(&mas);
+	index = ma_pivots(mas_mn(&mas),
+			  mte_node_type(mas.node))[mas_data_end(&mas) - 2] + 1;
+	mas_set(&mas, index);
+	mas_start(&mas);
+	mas_internal_levels_fill(&mas);
+	mas_reset(&mas);
+	/* Fill the last subtree of the root */
+	mas_start(&mas);
+	index = ma_pivots(mas_mn(&mas),
+			  mte_node_type(mas.node))[mas_data_end(&mas) - 1] + 1;
+	mas_set(&mas, index);
+	mas_start(&mas);
+	mas_internal_levels_fill(&mas);
+
+	/* Fill leaves before the last-subtree split */
+	index--;
+	mas_set(&mas, index);
+	mas_walk(&mas);
+	test_mas_prev_node(&mas);
+	mas_set(&mas, mas.min);
+	mas_node_fill(&mas);
+	test_mas_next_node(&mas);
+	mas_set(&mas, mas.min);
+	/* Fill leaves after piv 8 split */
+	mas_node_fill(&mas);
+	test_mas_next_node(&mas);
+	mas_set(&mas, mas.min);
+	mas_node_fill(&mas);
+	test_mas_next_node(&mas);
+	mas_set(&mas, mas.min);
+	mas_node_fill(&mas);
+	mas_unlock(&mas);
+
+	/* triple split across multiple levels. */
+	check_store_range(mt, index, index+1, xa_mk_value(index), 0);
+
+	mt_validate(mt);
+	if (!MAPLE_32BIT)
+		MT_BUG_ON(mt, mt_height(mt) != 4);
+}
+
 void farmer_tests(void)
 {
 	struct maple_node *node;
@@ -36383,6 +36637,10 @@ void farmer_tests(void)
 
 	mt_init_flags(&tree, 0);
 	check_mtree_dup(&tree);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_multilevel_triple_split(&tree);
 	mtree_destroy(&tree);
 
 	if (!MAPLE_32BIT) {
