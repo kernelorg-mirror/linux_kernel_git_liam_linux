@@ -1406,13 +1406,65 @@ retry:
 		root = mas_root(mas);
 		/* Tree with nodes */
 		if (likely(xa_is_node(root))) {
-			mas->depth = 0;
 			mas->status = ma_active;
 			mas->node = mte_safe_root(root);
 			mas->offset = 0;
 			if (mte_dead_node(mas->node))
 				goto retry;
 
+			return NULL;
+		}
+
+		mas->node = NULL;
+		/* empty tree */
+		if (unlikely(!root)) {
+			mas->status = ma_none;
+			mas->offset = MAPLE_NODE_SLOTS;
+			return NULL;
+		}
+
+		/* Single entry tree */
+		mas->status = ma_root;
+		mas->offset = MAPLE_NODE_SLOTS;
+
+		/* Single entry tree. */
+		if (mas->index > 0)
+			return NULL;
+
+		return root;
+	}
+
+	return NULL;
+}
+
+/*
+ * mas_start_wr() - Sets up maple state for write operations.
+ * @mas: The maple state.
+ *
+ * If mas->status == ma_start, then set the min, max and depth to
+ * defaults.
+ *
+ * Return:
+ * - If mas->node is an error or not mas_start, return NULL.
+ * - If it's an empty tree:     NULL & mas->status == ma_none
+ * - If it's a single entry:    The entry & mas->status == ma_root
+ * - If it's a tree:            NULL & mas->status == ma_active
+ */
+static inline struct maple_enode *mas_start_wr(struct ma_state *mas)
+{
+	if (likely(mas_is_start(mas))) {
+		struct maple_enode *root;
+
+		mas_init_lock_check(mas);
+		mas->min = 0;
+		mas->max = ULONG_MAX;
+		mas->depth = 0;
+		root = mas_root(mas);
+		/* Tree with nodes */
+		if (likely(xa_is_node(root))) {
+			mas->status = ma_active;
+			mas->node = mte_safe_root(root);
+			mas->offset = 0;
 			return NULL;
 		}
 
@@ -3175,11 +3227,8 @@ static inline void mas_extend_spanning_null(struct ma_wr_state *l_wr_mas,
 	}
 }
 
-static inline void *mas_state_walk(struct ma_state *mas)
+static inline void *mas_started_walk(struct ma_state *mas, void *entry)
 {
-	void *entry;
-
-	entry = mas_start(mas);
 	if (mas_is_none(mas))
 		return NULL;
 
@@ -3187,6 +3236,22 @@ static inline void *mas_state_walk(struct ma_state *mas)
 		return entry;
 
 	return mtree_range_walk(mas);
+}
+
+static inline void *mas_state_walk(struct ma_state *mas)
+{
+	void *entry;
+
+	entry = mas_start(mas);
+	return mas_started_walk(mas, entry);
+}
+
+static inline void *mas_state_wr_walk(struct ma_state *mas)
+{
+	void *entry;
+
+	entry = mas_start_wr(mas);
+	return mas_started_walk(mas, entry);
 }
 
 /*
@@ -3628,7 +3693,7 @@ static inline bool mas_wr_extend_null(struct ma_wr_state *wr_mas)
 		wr_mas->sufficient_height = 0;
 		wr_mas->vacant_height = 0;
 		mas_reset(mas);
-		wr_mas->content = mas_start(mas);
+		wr_mas->content = mas_start_wr(mas);
 		mas_wr_walk(wr_mas);
 	}
 
@@ -3950,7 +4015,7 @@ static inline void mas_wr_prealloc_setup(struct ma_wr_state *wr_mas)
 reset:
 	mas_reset(mas);
 set_content:
-	wr_mas->content = mas_start(mas);
+	wr_mas->content = mas_start_wr(mas);
 }
 
 /**
@@ -4124,7 +4189,7 @@ static inline void *mas_insert(struct ma_state *mas, void *entry)
 	 * is when inserting at the end of a node (appending).  When done
 	 * carefully, appending can reuse the node in place.
 	 */
-	wr_mas.content = mas_start(mas);
+	wr_mas.content = mas_start_wr(mas);
 	if (wr_mas.content)
 		goto exists;
 
@@ -5162,7 +5227,7 @@ int mas_empty_area(struct ma_state *mas, unsigned long min,
 		return -EINVAL;
 
 	if (mas_is_start(mas))
-		mas_start(mas);
+		mas_start_wr(mas);
 	else if (mas->offset >= 2)
 		mas->offset -= 2;
 	else if (!mas_skip_node(mas))
@@ -5213,7 +5278,7 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
 		return -EINVAL;
 
 	if (mas_is_start(mas))
-		mas_start(mas);
+		mas_start_wr(mas);
 	else if ((mas->offset < 2) && (!mas_rewind_node(mas)))
 		return -EBUSY;
 
@@ -6248,7 +6313,7 @@ void *mas_erase(struct ma_state *mas)
 
 	mas_make_walkable(mas);
 write_retry:
-	entry = mas_state_walk(mas);
+	entry = mas_state_wr_walk(mas);
 	if (!entry)
 		goto out;
 
@@ -6793,7 +6858,7 @@ static inline void mas_dup_build(struct ma_state *mas, struct ma_state *new_mas,
 		return;
 	}
 
-	root = mas_start(mas);
+	root = mas_start_wr(mas);
 	if (mas_is_ptr(mas) || mas_is_none(mas))
 		goto set_new_tree;
 
