@@ -2835,6 +2835,85 @@ static noinline void __init check_spanning_relatives(struct maple_tree *mt)
 	mtree_store_range(mt, 9365, 9955, NULL, GFP_KERNEL);
 }
 
+static noinline void __init check_null_store_find_boundary(struct maple_tree *mt,
+					    unsigned long *left_end,
+					    unsigned long *right_start,
+					    unsigned long *right_end)
+{
+	MA_STATE(mas, mt, 0, 0);
+	struct maple_enode *left_node;
+	void *entry;
+
+	mas_lock(&mas);
+	mas_set(&mas, 0);
+	entry = mas_walk(&mas);
+	MT_BUG_ON(mt, !entry);
+	left_node = mas.node;
+	*left_end = mas.max;
+	MT_BUG_ON(mt, *left_end == ULONG_MAX);
+	*right_start = *left_end + 1;
+
+	mas_set(&mas, *right_start);
+	entry = mas_walk(&mas);
+	MT_BUG_ON(mt, !entry);
+	MT_BUG_ON(mt, mas.index != *right_start);
+	MT_BUG_ON(mt, mas.node == left_node);
+	*right_end = mas.max;
+	mas_unlock(&mas);
+}
+
+static noinline void __init check_null_store_extend_boundaries(struct maple_tree *mt)
+{
+	MA_STATE(mas, mt, 0, 0);
+	unsigned long left_end, right_start, right_end;
+	void *entry;
+
+	/* NULL extension across both leaf boundaries, across > 1 slot */
+	check_seq(mt, 1024, false);
+	check_null_store_find_boundary(mt, &left_end, &right_start, &right_end);
+	MT_BUG_ON(mt, left_end < 2);
+
+	/* End-1 + end overwrite with NULL in the next node. */
+	check_store_range(mt, right_start, right_start, NULL, 0);
+	check_store_range(mt, left_end - 1, left_end, NULL, 0);
+
+	mas_lock(&mas);
+	mas_set(&mas, left_end - 1);
+	entry = mas_walk(&mas);
+	MT_BUG_ON(mt, entry != NULL);
+	MT_BUG_ON(mt, mas.index != left_end - 1);
+	MT_BUG_ON(mt, mas.last != right_start);
+	mas_unlock(&mas);
+
+	check_load(mt, left_end - 2, xa_mk_value(left_end - 2));
+	check_load(mt, right_start + 1, xa_mk_value(right_start + 1));
+	mt_validate(mt);
+
+	mtree_destroy(mt);
+	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
+
+	check_seq(mt, 1024, false);
+	check_null_store_find_boundary(mt, &left_end, &right_start, &right_end);
+	MT_BUG_ON(mt, left_end < 1);
+	MT_BUG_ON(mt, right_end < right_start + 1);
+
+	/* Start + start+1 overwrite with NULL in the previous node. */
+	check_store_range(mt, left_end, left_end, NULL, 0);
+	check_store_range(mt, right_start, right_start + 1, NULL, 0);
+
+	mas_lock(&mas);
+	mas_set(&mas, left_end);
+	entry = mas_walk(&mas);
+	MT_BUG_ON(mt, entry != NULL);
+	MT_BUG_ON(mt, mas.index != left_end);
+	MT_BUG_ON(mt, mas.last != right_start + 1);
+	mas_unlock(&mas);
+
+	check_load(mt, left_end - 1, xa_mk_value(left_end - 1));
+	check_load(mt, right_start + 2, xa_mk_value(right_start + 2));
+	mt_validate(mt);
+}
+
 #define SPAN_STRESS_LAST	8191
 #define SPAN_STRESS_ITERS	60000
 
@@ -4766,6 +4845,10 @@ static int __init maple_tree_seed(void)
 
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
 	check_spanning_relatives(&tree);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_null_store_extend_boundaries(&tree);
 	mtree_destroy(&tree);
 
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
