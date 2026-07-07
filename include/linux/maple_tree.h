@@ -75,6 +75,7 @@
 struct maple_metadata {
 	unsigned char end;	/* end of data */
 	unsigned char gap;	/* offset of largest gap */
+	unsigned char pad[sizeof(void *) - 2];
 };
 
 /*
