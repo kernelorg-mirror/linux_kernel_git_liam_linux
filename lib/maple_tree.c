@@ -764,8 +764,10 @@ static inline void ma_set_meta(struct maple_node *mn, enum maple_type mt,
 {
 	struct maple_metadata *meta = ma_meta(mn, mt);
 
-	meta->gap = offset;
-	meta->end = end;
+	*meta = (struct maple_metadata) {
+		.gap = offset,
+		.end = end,
+	}; /* implicit clearing the padding */
 }
 
 /*
@@ -801,8 +803,7 @@ static inline void mt_clear_meta(struct maple_tree *mt, struct maple_node *mn,
 		return;
 	}
 
-	meta->gap = 0;
-	meta->end = 0;
+	*meta = (struct maple_metadata) { }; /* Clears even the padding */
 }
 
 /*
