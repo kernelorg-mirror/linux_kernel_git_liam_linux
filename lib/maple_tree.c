@@ -1224,7 +1224,6 @@ static __always_inline struct maple_node *mas_pop_node(struct ma_state *mas)
 	ret = kmem_cache_alloc_from_sheaf(maple_node_cache, GFP_NOWAIT, mas->sheaf);
 
 out:
-	memset(ret, 0, sizeof(*ret));
 	return ret;
 }
 
@@ -2303,6 +2302,41 @@ void node_finalise(struct maple_node *node, enum maple_type mt,
 		ma_set_meta(node, mt, gap_slot, end - 1);
 }
 
+/*
+ * node_clear_tail() - Cheaper node_finalise for root work
+ *
+ * @node: The maple node (always a leaf type)
+ * @type: The leaf node type
+ * @new_end: The index of the last occupied slot
+ */
+static inline void node_clear_tail(struct maple_node *node,
+		enum maple_type type, unsigned char new_end)
+{
+      unsigned char node_slots;
+      unsigned char clear_from;
+      unsigned char size;
+      u8 *marks;
+
+      node_slots = mt_slots[type];
+      clear_from = new_end + 1;
+      size = mt_slots[type] - clear_from;
+
+      if(WARN_ON_ONCE(clear_from >= node_slots))
+	      return;
+
+      memset(ma_slots(node, type) + clear_from, 0, size * sizeof(void *));
+
+      marks = ma_marks(node, type);
+      if (marks)
+	      ma_mark_clear_slots(marks, type, clear_from, node_slots);
+
+      if (--size)
+	      memset(ma_pivots(node, type) + clear_from, 0,
+		     size * sizeof(unsigned long));
+
+      mas_leaf_set_meta(node, type, new_end);
+}
+
 static inline void *mtree_range_walk(struct ma_state *mas)
 {
 	unsigned long *pivots;
@@ -3040,6 +3074,7 @@ static inline void mas_root_expand(struct ma_state *mas, void *entry)
 	void __rcu **slots;
 	unsigned long *pivots;
 	int offset = 0;
+	u8 *marks;
 
 	if (mt_has_marks(mas->tree))
 		type = maple_mleaf_64;
@@ -3047,6 +3082,7 @@ static inline void mas_root_expand(struct ma_state *mas, void *entry)
 	node = mas_pop_node(mas);
 	pivots = ma_pivots(node, type);
 	slots = ma_slots(node, type);
+	marks = ma_marks(node, type);
 	node->parent = ma_parent_ptr(mas_tree_parent(mas));
 	mas->node = mt_mk_node(node, type);
 	mas->status = ma_active;
@@ -3054,20 +3090,30 @@ static inline void mas_root_expand(struct ma_state *mas, void *entry)
 	if (mas->index) {
 		if (contents) {
 			rcu_assign_pointer(slots[offset], contents);
-			if (likely(mas->index > 1))
-				offset++;
+			pivots[offset] = 0;
+			offset++;
 		}
-		pivots[offset++] = mas->index - 1;
+		if (!contents || mas->index > 1) {
+			rcu_assign_pointer(slots[offset], NULL);
+			pivots[offset] = mas->index - 1;
+			offset++;
+		}
 	}
 
 	rcu_assign_pointer(slots[offset], entry);
-	mas->offset = offset;
 	pivots[offset] = mas->last;
-	if (mas->last != ULONG_MAX)
-		pivots[++offset] = ULONG_MAX;
+	mas->offset = offset;
+	if (mas->last != ULONG_MAX) {
+		offset++;
+		rcu_assign_pointer(slots[offset], NULL);
+		pivots[offset] = ULONG_MAX;
+	}
+
+	if (marks)
+		memset(marks, 0, (offset + 1) * sizeof(u8));
 
 	mt_set_height(mas->tree, 1);
-	ma_set_meta(node, type, 0, offset);
+	node_clear_tail(node, type, offset);
 	/* swap the new root into the tree */
 	rcu_assign_pointer(mas->tree->ma_root, mte_mk_root(mas->node));
 }
@@ -3314,6 +3360,8 @@ static inline void mas_new_root(struct ma_state *mas, void *entry)
 	struct maple_node *node;
 	void __rcu **slots;
 	unsigned long *pivots;
+	u8 *marks;
+
 
 	WARN_ON_ONCE(mas->index || mas->last != ULONG_MAX);
 
@@ -3333,11 +3381,15 @@ assign_node:
 	node = mas_pop_node(mas);
 	pivots = ma_pivots(node, type);
 	slots = ma_slots(node, type);
+	marks = ma_marks(node, type);
 	node->parent = ma_parent_ptr(mas_tree_parent(mas));
 	mas->node = mt_mk_node(node, type);
 	mas->status = ma_active;
 	rcu_assign_pointer(slots[0], entry);
 	pivots[0] = mas->last;
+	if (marks)
+		marks[0] = 0;
+	node_clear_tail(node, type, 0);
 	mt_set_height(mas->tree, 1);
 	rcu_assign_pointer(mas->tree->ma_root, mte_mk_root(mas->node));
 
@@ -3430,7 +3482,6 @@ mas_wr_node_store_mark_cp(struct ma_wr_state *wr_mas, struct maple_node *node,
 		unsigned char suffix_len, bool left_insert,
 		unsigned char new_end)
 {
-	struct ma_state *mas = wr_mas->mas;
 	unsigned char entry_offset = old_offset + left_insert;
 	u8 *dst_marks, *src_marks;
 
@@ -3447,14 +3498,6 @@ mas_wr_node_store_mark_cp(struct ma_wr_state *wr_mas, struct maple_node *node,
 	if (suffix_len)
 		memcpy(dst_marks + entry_offset + 1, src_marks + offset_end,
 		       sizeof(u8) * suffix_len);
-
-	/* mas_pop_node() already zeroes the whole node for the in_rcu case */
-	if (!mt_in_rcu(mas->tree)) {
-		unsigned char clear_from = new_end + 1;
-
-		ma_mark_clear_slots(dst_marks, wr_mas->type, clear_from,
-				    mt_slots[wr_mas->type]);
-	}
 }
 
 /*
@@ -3466,7 +3509,7 @@ mas_wr_node_store_mark_cp(struct ma_wr_state *wr_mas, struct maple_node *node,
 static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 {
 	unsigned char dst_offset, offset_end;
-	unsigned char suffix_len, node_pivots, node_slots;
+	unsigned char suffix_len, node_pivots;
 	struct maple_node reuse, *newnode;
 	unsigned long *dst_pivots;
 	void __rcu **dst_slots;
@@ -3480,7 +3523,6 @@ static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 	in_rcu = mt_in_rcu(mas->tree);
 	offset_end = wr_mas->offset_end;
 	node_pivots = mt_pivots[wr_mas->type];
-	node_slots = mt_slots[wr_mas->type];
 	old_offset = mas->offset;
 	left_insert = wr_mas->r_min < mas->index;
 	/* Assume last adds an entry */
@@ -3537,26 +3579,7 @@ static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 					  offset_end, suffix_len, left_insert,
 					  new_end);
 
-	if (!in_rcu) {
-		unsigned char clear_from = new_end + 1;
-
-		if (new_end + 2 < node_slots) {
-
-			/*
-			 * Note that the last slot is never cleared, since the metadata
-			 * will be stored there or it has a value.
-			 */
-			memset(dst_slots + clear_from, 0,
-			       sizeof(void __rcu *) * (node_slots - clear_from));
-
-			if (clear_from < node_pivots)
-				memset(dst_pivots + clear_from, 0,
-				       sizeof(unsigned long) *
-				       (node_pivots - clear_from));
-		}
-	}
-
-	mas_leaf_set_meta(newnode, wr_mas->type, new_end);
+	node_clear_tail(newnode, wr_mas->type, new_end);
 	if (in_rcu) {
 		struct maple_enode *old_enode = mas->node;
 
