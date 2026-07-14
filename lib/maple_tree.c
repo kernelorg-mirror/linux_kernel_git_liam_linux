@@ -3039,7 +3039,7 @@ static inline void mas_root_expand(struct ma_state *mas, void *entry)
 	struct maple_node *node;
 	void __rcu **slots;
 	unsigned long *pivots;
-	int slot = 0;
+	int offset = 0;
 
 	if (mt_has_marks(mas->tree))
 		type = maple_mleaf_64;
@@ -3053,21 +3053,21 @@ static inline void mas_root_expand(struct ma_state *mas, void *entry)
 
 	if (mas->index) {
 		if (contents) {
-			rcu_assign_pointer(slots[slot], contents);
+			rcu_assign_pointer(slots[offset], contents);
 			if (likely(mas->index > 1))
-				slot++;
+				offset++;
 		}
-		pivots[slot++] = mas->index - 1;
+		pivots[offset++] = mas->index - 1;
 	}
 
-	rcu_assign_pointer(slots[slot], entry);
-	mas->offset = slot;
-	pivots[slot] = mas->last;
+	rcu_assign_pointer(slots[offset], entry);
+	mas->offset = offset;
+	pivots[offset] = mas->last;
 	if (mas->last != ULONG_MAX)
-		pivots[++slot] = ULONG_MAX;
+		pivots[++offset] = ULONG_MAX;
 
 	mt_set_height(mas->tree, 1);
-	ma_set_meta(node, type, 0, slot);
+	ma_set_meta(node, type, 0, offset);
 	/* swap the new root into the tree */
 	rcu_assign_pointer(mas->tree->ma_root, mte_mk_root(mas->node));
 }
