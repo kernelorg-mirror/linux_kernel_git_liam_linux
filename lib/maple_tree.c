@@ -2033,7 +2033,7 @@ unsigned long node_copy(struct ma_state *mas, struct maple_node *src,
  * node_finalise() - Zero out unused area and populate metadata
  * @node: The maple node
  * @mt: The maple node type
- * @end: The end of the used area
+ * @end: the first offset that is not used.
  */
 static inline
 void node_finalise(struct maple_node *node, enum maple_type mt,
@@ -2061,7 +2061,7 @@ void node_finalise(struct maple_node *node, enum maple_type mt,
 		unsigned long max_gap;
 
 		max_gap = 0;
-		for (int i = 0; i <= end; i++)
+		for (int i = 0; i < end; i++)
 			if (gaps[i] > max_gap) {
 				gap_slot = i;
 				max_gap = gaps[i];
