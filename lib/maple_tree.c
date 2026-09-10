@@ -2582,6 +2582,7 @@ static inline void cp_leaf_init(struct maple_copy *cp,
 	 */
 
 	cp->height = 1;
+	cp->write_off = 0;
 	/* Remnants keep their marks, the new entry gets the union */
 	memset(cp->mark, 0, sizeof(cp->mark));
 	/* Create entries to insert including split entries to left and right */
@@ -3691,6 +3692,7 @@ static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 	bool left_insert;
 	struct ma_state *mas;
 	bool in_rcu;
+	bool gap = false;
 	u8 lost = 0;
 
 	mas = wr_mas->mas;
@@ -3700,6 +3702,18 @@ static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 	node_pivots = mt_pivots[wr_mas->type];
 	old_offset = mas->offset;
 	left_insert = wr_mas->r_min < mas->index;
+
+	/*
+	 * The largest gap can only change if a NULL is written, removed, or
+	 * resized.  Check the new entry and every slot the store touches.
+	 */
+	if (mt_is_alloc(mas->tree)) {
+		unsigned char i;
+
+		gap = !wr_mas->entry;
+		for (i = old_offset; !gap && i <= offset_end; i++)
+			gap = !wr_mas->slots[i];
+	}
 	/* Assume last adds an entry */
 	new_end = mas->end + 1 - offset_end + old_offset;
 	if (mas->last == wr_mas->end_piv) {
@@ -3764,7 +3778,8 @@ static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 		memcpy(wr_mas->node, newnode, sizeof(struct maple_node));
 	}
 	trace_ma_write(TP_FCT, mas, 0, wr_mas->entry);
-	mas_update_gap(mas);
+	if (gap)
+		mas_update_gap(mas);
 	if (lost)
 		mas_update_marks(mas, lost);
 	mas->end = new_end;
