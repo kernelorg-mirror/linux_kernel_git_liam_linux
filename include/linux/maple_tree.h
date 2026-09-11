@@ -31,6 +31,8 @@
 #define MAPLE_ARANGE64_SLOTS	10	/* 240 bytes */
 #define MAPLE_MRANGE64_SLOTS	15
 #define MAPLE_MRANGE32_SLOTS	19
+#define MAPLE_RANGE32_SLOTS	21	/* 256 bytes, 32-bit pivots */
+#define MAPLE_ARANGE32_SLOTS	15	/* 240 bytes, 32-bit pivots */
 
 #else
 /* 32bit sizes */
@@ -38,8 +40,9 @@
 #define MAPLE_RANGE64_SLOTS	32	/* 256 bytes */
 #define MAPLE_ARANGE64_SLOTS	21	/* 240 bytes */
 #define MAPLE_MRANGE64_SLOTS	20
-
 #define MAPLE_MRANGE32_SLOTS	28
+#define MAPLE_RANGE32_SLOTS	32	/* 256 bytes, 32-bit pivots */
+#define MAPLE_ARANGE32_SLOTS	21	/* 240 bytes, 32-bit pivots */
 #endif /* defined(CONFIG_64BIT) || defined(BUILD_VDSO32_64) */
 
 #define MAPLE_MARK_TYPES	8
@@ -153,6 +156,45 @@ struct maple_mrange_64 {
 	uint8_t mark[MAPLE_MRANGE64_SLOTS];
 };
 
+/*
+ * A range node whose pivots fit in 32 bits.  Used for trees whose index space
+ * is currently within UINT_MAX; a store of a larger index promotes the node to
+ * the maple_range_64 layout.
+ */
+struct maple_range_32 {
+	struct maple_pnode *parent;
+	u32 pivot[MAPLE_RANGE32_SLOTS - 1];
+	union {
+		void __rcu *slot[MAPLE_RANGE32_SLOTS];
+		struct {
+			void __rcu *pad[MAPLE_RANGE32_SLOTS - 1];
+			struct maple_metadata meta;
+		};
+	};
+};
+
+struct maple_arange_32 {
+	struct maple_pnode *parent;
+	u32 pivot[MAPLE_ARANGE32_SLOTS - 1];
+	void __rcu *slot[MAPLE_ARANGE32_SLOTS];
+	u32 gap[MAPLE_ARANGE32_SLOTS];
+	struct maple_metadata meta;
+};
+
+/* A marks node whose pivots fit in 32 bits.  See maple_mrange_64. */
+struct maple_mrange_32 {
+	struct maple_pnode *parent;
+	u32 pivot[MAPLE_MRANGE32_SLOTS - 1];
+	union {
+		void __rcu *slot[MAPLE_MRANGE32_SLOTS];
+		struct {
+			void __rcu *pad[MAPLE_MRANGE32_SLOTS - 1];
+			struct maple_metadata meta;
+		};
+	};
+	uint8_t mark[MAPLE_MRANGE32_SLOTS];
+};
+
 struct maple_topiary {
 	struct maple_pnode *parent;
 	struct maple_enode *next; /* Overlaps the pivot */
@@ -161,11 +203,16 @@ struct maple_topiary {
 enum maple_type {
 	maple_invalid,
 	maple_mleaf_64,
+	maple_mleaf_32,
 	maple_leaf_64,
+	maple_leaf_32,
 	maple_dense,
 	maple_range_64,
+	maple_range_32,
 	maple_arange_64,
+	maple_arange_32,
 	maple_mrange_64,
+	maple_mrange_32,
 	maple_copy,
 };
 
@@ -397,6 +444,9 @@ struct maple_node {
 		struct maple_range_64 mr64;
 		struct maple_arange_64 ma64;
 		struct maple_mrange_64 mm64;
+		struct maple_range_32 mr32;
+		struct maple_arange_32 ma32;
+		struct maple_mrange_32 mm32;
 		struct maple_copy cp;
 	};
 };
