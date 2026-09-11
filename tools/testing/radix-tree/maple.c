@@ -36385,9 +36385,12 @@ void farmer_tests(void)
 	check_mtree_dup(&tree);
 	mtree_destroy(&tree);
 
-	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
-	check_erase_rebalance(&tree);
-	mtree_destroy(&tree);
+	if (!MAPLE_32BIT) {
+		/* Validate that a 64b specific bug doesn't return */
+		mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+		check_erase_rebalance(&tree);
+		mtree_destroy(&tree);
+	}
 
 	/* RCU testing */
 	mt_init_flags(&tree, 0);
