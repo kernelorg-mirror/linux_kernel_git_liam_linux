@@ -104,6 +104,11 @@ static const unsigned long mt_max[] = {
 	[maple_arange_64]	= ULONG_MAX,
 	[maple_mrange_64]	= ULONG_MAX,
 	[maple_copy]		= ULONG_MAX,
+	[maple_leaf_32]		= UINT_MAX,
+	[maple_range_32]	= UINT_MAX,
+	[maple_arange_32]	= UINT_MAX,
+	[maple_mleaf_32]	= UINT_MAX,
+	[maple_mrange_32]	= UINT_MAX,
 };
 #define mt_node_max(x) mt_max[mte_node_type(x)]
 #endif
@@ -116,6 +121,11 @@ static const unsigned char mt_slots[] = {
 	[maple_arange_64]	= MAPLE_ARANGE64_SLOTS,
 	[maple_mrange_64]	= MAPLE_MRANGE64_SLOTS,
 	[maple_copy]		= 3,
+	[maple_leaf_32]		= MAPLE_RANGE32_SLOTS,
+	[maple_range_32]	= MAPLE_RANGE32_SLOTS,
+	[maple_arange_32]	= MAPLE_ARANGE32_SLOTS,
+	[maple_mleaf_32]	= MAPLE_MRANGE32_SLOTS,
+	[maple_mrange_32]	= MAPLE_MRANGE32_SLOTS,
 };
 #define mt_slot_count(x) mt_slots[mte_node_type(x)]
 
@@ -127,6 +137,11 @@ static const unsigned char mt_pivots[] = {
 	[maple_arange_64]	= MAPLE_ARANGE64_SLOTS - 1,
 	[maple_mrange_64]	= MAPLE_MRANGE64_SLOTS - 1,
 	[maple_copy]		= 3,
+	[maple_leaf_32]		= MAPLE_RANGE32_SLOTS - 1,
+	[maple_range_32]	= MAPLE_RANGE32_SLOTS - 1,
+	[maple_arange_32]	= MAPLE_ARANGE32_SLOTS - 1,
+	[maple_mleaf_32]	= MAPLE_MRANGE32_SLOTS - 1,
+	[maple_mrange_32]	= MAPLE_MRANGE32_SLOTS - 1,
 };
 #define mt_pivot_count(x) mt_pivots[mte_node_type(x)]
 
@@ -138,6 +153,11 @@ static const unsigned char mt_min_slots[] = {
 	[maple_arange_64]	= (MAPLE_ARANGE64_SLOTS / 2) - 1,
 	[maple_mrange_64]	= (MAPLE_MRANGE64_SLOTS / 2) - 2,
 	[maple_copy]		= 1, /* Should never be used */
+	[maple_leaf_32]		= (MAPLE_RANGE32_SLOTS / 2) - 2,
+	[maple_range_32]	= (MAPLE_RANGE32_SLOTS / 2) - 2,
+	[maple_arange_32]	= (MAPLE_ARANGE32_SLOTS / 2) - 1,
+	[maple_mleaf_32]	= (MAPLE_MRANGE32_SLOTS / 2) - 2,
+	[maple_mrange_32]	= (MAPLE_MRANGE32_SLOTS / 2) - 2,
 };
 #define mt_min_slot_count(x) mt_min_slots[mte_node_type(x)]
 
@@ -207,6 +227,38 @@ static __always_inline enum maple_type mte_node_type(
 static __always_inline bool ma_is_dense(const enum maple_type type)
 {
 	return type == maple_dense;
+}
+
+static __always_inline bool node_is_32b(const enum maple_type type)
+{
+	return type == maple_leaf_32 || type == maple_range_32 ||
+	       type == maple_arange_32 || type == maple_mleaf_32 ||
+	       type == maple_mrange_32;
+}
+
+/*
+ * node_transition_type() - The 64-bit-pivot node type a 32-bit node promotes to
+ * @type: The (possibly 32-bit) node type
+ *
+ * Return: The matching 64-bit-pivot type, or @type unchanged if already 64-bit.
+ */
+static __always_inline enum maple_type
+node_transition_type(const enum maple_type type)
+{
+	switch (type) {
+	case maple_leaf_32:
+		return maple_leaf_64;
+	case maple_range_32:
+		return maple_range_64;
+	case maple_arange_32:
+		return maple_arange_64;
+	case maple_mleaf_32:
+		return maple_mleaf_64;
+	case maple_mrange_32:
+		return maple_mrange_64;
+	default:
+		return type;
+	}
 }
 
 static __always_inline bool ma_is_leaf(const enum maple_type type)
@@ -388,6 +440,23 @@ static inline enum maple_type mt_range_type(struct maple_tree *mt)
 }
 
 /*
+ * mt_range_type_32() - The 32-bit-pivot internal node type for @mt
+ * @mt: The maple tree
+ *
+ * Mirrors mt_range_type() for nodes whose pivots fit in 32 bits.
+ */
+static inline enum maple_type mt_range_type_32(struct maple_tree *mt)
+{
+	if (!mt_has_secondary_storage(mt))
+		return maple_range_32;
+
+	if (mt_is_alloc(mt))
+		return maple_arange_32;
+
+	return maple_mrange_32;
+}
+
+/*
  * The Parent Pointer
  * Excluding root, the parent pointer is 256B aligned like all other tree nodes.
  * When storing a 32 or 64 bit values, the offset can fit into 5 bits.  The 16
@@ -469,6 +538,8 @@ enum maple_type mas_parent_type(struct ma_state *mas, struct maple_enode *enode)
 	switch (p_type) {
 	case MAPLE_PARENT_RANGE64: /* or MAPLE_PARENT_ARANGE64 */
 		return mt_range_type(mas->tree);
+	case MAPLE_PARENT_RANGE32:
+		return mt_range_type_32(mas->tree);
 	}
 
 	return maple_invalid;
@@ -563,10 +634,39 @@ static inline unsigned long *ma_pivots(struct maple_node *node,
 		return node->mr64.pivot;
 	case maple_copy:
 		return node->cp.pivot;
+	case maple_leaf_32:
+	case maple_range_32:
+	case maple_arange_32:
+	case maple_mleaf_32:
+	case maple_mrange_32:
+		return NULL; /* Use ma_pivots32() */
 	case maple_dense:
 		return NULL;
 	}
 	return NULL;
+}
+
+/*
+ * ma_pivots32() - Get a pointer to a 32-bit node's pivots.
+ * @node: the maple node
+ * @type: the node type (must be a 32-bit node type)
+ *
+ * Return: A pointer to the u32 pivot array, or NULL.
+ */
+static inline u32 *ma_pivots32(struct maple_node *node, enum maple_type type)
+{
+	switch (type) {
+	case maple_arange_32:
+		return node->ma32.pivot;
+	case maple_range_32:
+	case maple_leaf_32:
+		return node->mr32.pivot;
+	case maple_mleaf_32:
+	case maple_mrange_32:
+		return node->mm32.pivot;
+	default:
+		return NULL;
+	}
 }
 
 /*
@@ -591,8 +691,23 @@ static inline unsigned long *ma_gaps(struct maple_node *node,
 	case maple_leaf_64:
 	case maple_mrange_64:
 	case maple_dense:
+	case maple_mleaf_32:
+	case maple_mrange_32:
+		return NULL;
+	case maple_leaf_32:
+	case maple_range_32:
+	case maple_arange_32:
+		/* arange_32 gaps are u32; read width-aware (see ma_gaps32()) */
 		return NULL;
 	}
+	return NULL;
+}
+
+static inline u32 *ma_gaps32(struct maple_node *node, enum maple_type type)
+{
+	if (type == maple_arange_32)
+		return node->ma32.gap;
+
 	return NULL;
 }
 
@@ -602,6 +717,9 @@ static inline u8 *ma_marks(struct maple_node *node, enum maple_type type)
 	case maple_mleaf_64:
 	case maple_mrange_64:
 		return node->mm64.mark;
+	case maple_mleaf_32:
+	case maple_mrange_32:
+		return node->mm32.mark;
 	case maple_copy:
 		return node->cp.mark;
 	default:
@@ -768,6 +886,17 @@ static inline void mte_set_pivot(struct maple_enode *mn, unsigned char piv,
 	case maple_mrange_64:
 		node->mm64.pivot[piv] = val;
 		break;
+	case maple_range_32:
+	case maple_leaf_32:
+		node->mr32.pivot[piv] = val;
+		break;
+	case maple_arange_32:
+		node->ma32.pivot[piv] = val;
+		break;
+	case maple_mleaf_32:
+	case maple_mrange_32:
+		node->mm32.pivot[piv] = val;
+		break;
 	case maple_copy:
 	case maple_dense:
 		break;
@@ -797,6 +926,14 @@ static inline void __rcu **ma_slots(struct maple_node *mn, enum maple_type mt)
 		return mn->mr64.slot;
 	case maple_copy:
 		return mn->cp.slot;
+	case maple_arange_32:
+		return mn->ma32.slot;
+	case maple_range_32:
+	case maple_leaf_32:
+		return mn->mr32.slot;
+	case maple_mleaf_32:
+	case maple_mrange_32:
+		return mn->mm32.slot;
 	case maple_dense:
 		return mn->slot;
 	}
@@ -895,6 +1032,14 @@ struct maple_metadata *ma_meta(struct maple_node *mn, enum maple_type mt)
 	case maple_mleaf_64:
 	case maple_mrange_64:
 		return &mn->mm64.meta;
+	case maple_arange_32:
+		return &mn->ma32.meta;
+	case maple_range_32:
+	case maple_leaf_32:
+		return &mn->mr32.meta;
+	case maple_mleaf_32:
+	case maple_mrange_32:
+		return &mn->mm32.meta;
 	default:
 		return &mn->mr64.meta;
 	}
