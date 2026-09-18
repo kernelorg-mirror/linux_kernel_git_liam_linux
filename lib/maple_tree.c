@@ -2823,8 +2823,12 @@ void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt)
 
 	}
 
-	/* No other choice but to 3-way split the data */
-	cp->split = (cp->data + 2) / 3;
+	/*
+	 * 3-way only happens on a triple-split spanning store of two full
+	 * same-type nodes, so cp->data == 2 * mt_slots[mt] + 1.  Fill the left
+	 * two, land the right on min.  Revisit for mixed-width nodes.
+	 */
+	cp->split = (2 * mt_slots[mt] - mt_min_slots[mt]) / 2 - 1;
 	cp->d_count = 3;
 
 node_setup:
