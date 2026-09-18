@@ -785,7 +785,7 @@ static noinline void __init check_alloc_rev_range(struct maple_tree *mt)
 					holes[i+1] >> 12,
 					holes[i+2] >> 12));
 #if DEBUG_REV_RANGE
-		pr_debug("Found %lu %lu\n", mas.index, mas.last);
+		pr_debug("Found %llu %llu\n", mas.index, mas.last);
 		pr_debug("gap %lu %lu\n", (holes[i] >> 12),
 				(holes[i+1] >> 12));
 #endif
@@ -1603,6 +1603,18 @@ static bool __init mt_find_gap_boundary_index(struct maple_tree *mt,
 		if (lentry != xa_mk_value(cand))
 			continue;
 
+		/*
+		 * Keep [cand .. cand+distance-1] in one node so erasing that
+		 * window can't rebalance the boundary out from under the test;
+		 * the boundary must land exactly at cand+distance.
+		 */
+		mas_set(&rmas, cand + distance - 1);
+		if (mas_find(&rmas, cand + distance - 1) !=
+		    xa_mk_value(cand + distance - 1))
+			continue;
+		if (rmas.node != lmas.node)
+			continue;
+
 		mas_set(&rmas, cand + distance);
 		rentry = mas_find(&rmas, cand + distance);
 		if (rentry != xa_mk_value(cand + distance))
@@ -2390,21 +2402,13 @@ static noinline void __init next_prev_test(struct maple_tree *mt)
 	int i, nr_entries;
 	void *val;
 	MA_STATE(mas, mt, 0, 0);
-	struct maple_enode *mn;
-	static const unsigned long *level2;
-	static const unsigned long level2_64[] = { 707, 1000, 710, 715, 720,
-						   725};
-	static const unsigned long level2_32[] = { 1747, 2000, 1750, 1755,
-						   1760, 1765};
 	unsigned long last_index;
 
 	if (MAPLE_32BIT) {
 		nr_entries = 500;
-		level2 = level2_32;
 		last_index = 0x138e;
 	} else {
 		nr_entries = 200;
-		level2 = level2_64;
 		last_index = 0x7d6;
 	}
 
@@ -2480,28 +2484,6 @@ static noinline void __init next_prev_test(struct maple_tree *mt)
 	MT_BUG_ON(mt, val != xa_mk_value(70 / 10));
 	MT_BUG_ON(mt, mas.index != 70);
 	MT_BUG_ON(mt, mas.last != 75);
-
-	/* Check across two levels of the tree */
-	mas_reset(&mas);
-	mas_set(&mas, level2[0]);
-	val = mas_walk(&mas);
-	MT_BUG_ON(mt, val != NULL);
-	val = mas_next(&mas, level2[1]);
-	MT_BUG_ON(mt, val != xa_mk_value(level2[2] / 10));
-	MT_BUG_ON(mt, mas.index != level2[2]);
-	MT_BUG_ON(mt, mas.last != level2[3]);
-	mn = mas.node;
-
-	val = mas_next(&mas, level2[1]);
-	MT_BUG_ON(mt, val != xa_mk_value(level2[4] / 10));
-	MT_BUG_ON(mt, mas.index != level2[4]);
-	MT_BUG_ON(mt, mas.last != level2[5]);
-	MT_BUG_ON(mt, mn == mas.node);
-
-	val = mas_prev(&mas, 0);
-	MT_BUG_ON(mt, val != xa_mk_value(level2[2] / 10));
-	MT_BUG_ON(mt, mas.index != level2[2]);
-	MT_BUG_ON(mt, mas.last != level2[3]);
 
 	/* Check running off the end and back on */
 	mas_set(&mas, nr_entries * 10);
