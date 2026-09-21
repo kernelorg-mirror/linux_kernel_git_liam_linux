@@ -37,9 +37,9 @@
 #else
 /* 32bit sizes */
 #define MAPLE_NODE_SLOTS	63	/* 256 bytes including ->parent */
-#define MAPLE_RANGE64_SLOTS	32	/* 256 bytes */
-#define MAPLE_ARANGE64_SLOTS	21	/* 240 bytes */
-#define MAPLE_MRANGE64_SLOTS	20
+#define MAPLE_RANGE64_SLOTS	21	/* 256 bytes, 64-bit pivots */
+#define MAPLE_ARANGE64_SLOTS	12	/* 248 bytes, 64-bit pivots */
+#define MAPLE_MRANGE64_SLOTS	19	/* 248 bytes, 64-bit pivots */
 #define MAPLE_MRANGE32_SLOTS	28
 #define MAPLE_RANGE32_SLOTS	32	/* 256 bytes, 32-bit pivots */
 #define MAPLE_ARANGE32_SLOTS	21	/* 240 bytes, 32-bit pivots */
@@ -112,7 +112,7 @@ struct maple_metadata {
 
 struct maple_range_64 {
 	struct maple_pnode *parent;
-	unsigned long pivot[MAPLE_RANGE64_SLOTS - 1];
+	u64 pivot[MAPLE_RANGE64_SLOTS - 1];
 	union {
 		void __rcu *slot[MAPLE_RANGE64_SLOTS];
 		struct {
@@ -133,9 +133,9 @@ struct maple_range_64 {
  */
 struct maple_arange_64 {
 	struct maple_pnode *parent;
-	unsigned long pivot[MAPLE_ARANGE64_SLOTS - 1];
+	u64 pivot[MAPLE_ARANGE64_SLOTS - 1];
 	void __rcu *slot[MAPLE_ARANGE64_SLOTS];
-	unsigned long gap[MAPLE_ARANGE64_SLOTS];
+	u64 gap[MAPLE_ARANGE64_SLOTS];
 	struct maple_metadata meta;
 };
 
@@ -145,7 +145,7 @@ struct maple_arange_64 {
  */
 struct maple_mrange_64 {
 	struct maple_pnode *parent;
-	unsigned long pivot[MAPLE_MRANGE64_SLOTS - 1];
+	u64 pivot[MAPLE_MRANGE64_SLOTS - 1];
 	union {
 		void __rcu *slot[MAPLE_MRANGE64_SLOTS];
 		struct {
@@ -238,12 +238,12 @@ struct maple_copy {
 
 	struct {
 		struct maple_node *node;
-		unsigned long max;
+		u64 max;
 		enum maple_type mt;
 	} dst[3];
 	struct {
 		struct maple_node *node;
-		unsigned long max;
+		u64 max;
 		unsigned char start;
 		unsigned char end;
 		enum maple_type mt;
@@ -251,15 +251,15 @@ struct maple_copy {
 	/* Simulated node */
 	void __rcu *slot[3];
 	union {
-		unsigned long gap[3];
+		u64 gap[3];
 		uint8_t mark[3];
 	};
-	unsigned long min;
+	u64 min;
 	union {
-		unsigned long pivot[3];
+		u64 pivot[3];
 		struct {
-			void *_pad[2];
-			unsigned long max;
+			u64 _pad[2];
+			u64 max;
 		};
 	};
 	unsigned char end;
@@ -503,6 +503,16 @@ int __mt_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp);
 void mtree_destroy(struct maple_tree *mt);
 void __mt_destroy(struct maple_tree *mt);
 
+/* u64 and unsigned long exist for 32b compatibility */
+void *mtree_load_u64(struct maple_tree *mt, u64 index);
+int mtree_store_range_u64(struct maple_tree *mt, u64 first, u64 last,
+		void *entry, gfp_t gfp);
+int mtree_store_u64(struct maple_tree *mt, u64 index, void *entry, gfp_t gfp);
+int mtree_insert_range_u64(struct maple_tree *mt, u64 first, u64 last,
+		void *entry, gfp_t gfp);
+int mtree_insert_u64(struct maple_tree *mt, u64 index, void *entry, gfp_t gfp);
+void *mtree_erase_u64(struct maple_tree *mt, u64 index);
+
 /**
  * mtree_empty() - Determine if a tree has any present entries.
  * @mt: Maple Tree.
@@ -607,11 +617,11 @@ enum maple_status {
  */
 struct ma_state {
 	struct maple_tree *tree;	/* The tree we're operating in */
-	unsigned long index;		/* The index we're operating on - range start */
-	unsigned long last;		/* The last index we're operating on - range end */
+	u64 index;			/* The index we're operating on - range start */
+	u64 last;			/* The last index we're operating on - range end */
 	struct maple_enode *node;	/* The node containing this entry */
-	unsigned long min;		/* The minimum index of this node - implied pivot min */
-	unsigned long max;		/* The maximum index of this node - implied pivot max */
+	u64 min;			/* The minimum index of this node - implied pivot min */
+	u64 max;			/* The maximum index of this node - implied pivot max */
 	struct slab_sheaf *sheaf;	/* Allocated nodes for this operation */
 	struct maple_node *alloc;	/* A single allocated node for fast path writes */
 	unsigned long node_request;	/* The number of nodes to allocate for this operation */
@@ -632,12 +642,12 @@ struct ma_state {
 struct ma_wr_state {
 	struct ma_state *mas;
 	struct maple_node *node;	/* Decoded mas->node */
-	unsigned long r_min;		/* range min */
-	unsigned long r_max;		/* range max */
+	u64 r_min;			/* range min */
+	u64 r_max;			/* range max */
 	enum maple_type type;		/* mas->node type */
 	unsigned char offset_end;	/* The offset where the write ends */
-	unsigned long *pivots;		/* mas->node->pivots pointer */
-	unsigned long end_piv;		/* The pivot at the offset end */
+	u64 *pivots;			/* mas->node->pivots pointer */
+	u64 end_piv;			/* The pivot at the offset end */
 	void __rcu **slots;		/* mas->node->slots pointer */
 	void *entry;			/* The entry to write */
 	void *content;			/* The existing entry that is being overwritten */
@@ -714,8 +724,8 @@ int mas_alloc_cyclic(struct ma_state *mas, unsigned long *startp,
 		unsigned long *next, gfp_t gfp);
 
 bool mas_nomem(struct ma_state *mas, gfp_t gfp);
-bool mas_nomem_nofail(struct ma_state *mas, unsigned long index,
-		      unsigned long last);
+bool mas_nomem_nofail(struct ma_state *mas, u64 index,
+		      u64 last);
 void mas_pause(struct ma_state *mas);
 void maple_tree_init(void);
 void mas_destroy(struct ma_state *mas);
@@ -933,8 +943,8 @@ void mt_cache_shrink(void);
  * set the internal maple state values to a sub-range.
  * Please use mas_set_range() if you do not know where you are in the tree.
  */
-static inline void __mas_set_range(struct ma_state *mas, unsigned long start,
-		unsigned long last)
+static inline void __mas_set_range(struct ma_state *mas, u64 start,
+		u64 last)
 {
 	/* Ensure the range starts within the current slot */
 	MAS_WARN_ON(mas, mas_is_active(mas) &&
@@ -954,7 +964,7 @@ static inline void __mas_set_range(struct ma_state *mas, unsigned long start,
  * to move to an adjacent index.
  */
 static inline
-void mas_set_range(struct ma_state *mas, unsigned long start, unsigned long last)
+void mas_set_range(struct ma_state *mas, u64 start, u64 last)
 {
 	mas_reset(mas);
 	__mas_set_range(mas, start, last);
@@ -1067,7 +1077,7 @@ static inline void mt_set_in_rcu(struct maple_tree *mt)
 	}
 }
 
-static inline unsigned int mt_height(const struct maple_tree *mt)
+static inline unsigned char mt_height(const struct maple_tree *mt)
 {
 	return mt->ma_flags & MT_FLAGS_HEIGHT_MASK;
 }

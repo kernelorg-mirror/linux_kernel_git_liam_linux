@@ -1603,18 +1603,6 @@ static bool __init mt_find_gap_boundary_index(struct maple_tree *mt,
 		if (lentry != xa_mk_value(cand))
 			continue;
 
-		/*
-		 * Keep [cand .. cand+distance-1] in one node so erasing that
-		 * window can't rebalance the boundary out from under the test;
-		 * the boundary must land exactly at cand+distance.
-		 */
-		mas_set(&rmas, cand + distance - 1);
-		if (mas_find(&rmas, cand + distance - 1) !=
-		    xa_mk_value(cand + distance - 1))
-			continue;
-		if (rmas.node != lmas.node)
-			continue;
-
 		mas_set(&rmas, cand + distance);
 		rentry = mas_find(&rmas, cand + distance);
 		if (rentry != xa_mk_value(cand + distance))

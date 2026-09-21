@@ -151,7 +151,7 @@ static noinline void __init test_mas_node_depth(struct ma_state *mas,
 	mas_reset(mas);
 	mas_start(mas);
 	while (mas->depth < depth && !mte_is_leaf(mas->node)) {
-		unsigned long *piv;
+		u64 *piv;
 		int count, offset;
 
 		count = mas_data_end(mas);
@@ -708,7 +708,7 @@ static inline void mas_node_walk(struct ma_state *mas, struct maple_node *node,
 			 unsigned long *range_max)
 
 {
-	unsigned long *pivots;
+	u64 *pivots;
 	unsigned char count;
 	unsigned long prev, max;
 	unsigned char offset;
@@ -35269,7 +35269,7 @@ static void mas_dfs_preorder(struct ma_state *mas)
 
 	struct maple_enode *prev;
 	unsigned char end, slot = 0;
-	unsigned long *pivots;
+	u64 *pivots;
 
 	if (mas->status == ma_start) {
 		mas_start(mas);
@@ -35318,9 +35318,13 @@ static void check_dfs_preorder(struct maple_tree *mt)
 
 	MA_STATE(mas, mt, 0, 0);
 
-	/* Node count depends on per-node fan-out, which differs by build. */
+	/*
+	 * Node counts depend on the per-node fan-out.  The 32-bit build uses
+	 * narrower nodes (MAPLE_RANGE64_SLOTS / MAPLE_ARANGE64_SLOTS), so a
+	 * 1000-entry tree occupies more nodes than the 64-bit build.
+	 */
 	if (MAPLE_32BIT)
-		e = 37;
+		e = 56;
 	else
 		e = 74;
 
@@ -35336,7 +35340,7 @@ static void check_dfs_preorder(struct maple_tree *mt)
 	mas_reset(&mas);
 	count = 0;
 	if (MAPLE_32BIT)
-		e = 37;
+		e = 58;
 	else
 		e = 77;
 
@@ -35375,7 +35379,7 @@ static unsigned char get_vacant_height(struct ma_wr_state *wr_mas, void *entry)
 	struct ma_state *mas = wr_mas->mas;
 	char vacant_height = 0;
 	enum maple_type type;
-	unsigned long *pivots;
+	u64 *pivots;
 	unsigned long min = 0;
 	unsigned long max = ULONG_MAX;
 	unsigned char offset;
@@ -35561,10 +35565,7 @@ static noinline void __init check_prealloc(struct maple_tree *mt)
 	 * as the root contains two entries which means it is on the verge of
 	 * insufficiency. The worst case full height of the tree is needed.
 	 */
-	if (MAPLE_32BIT)
-		MT_BUG_ON(mt, allocated != 1 + (height - vacant_height) * 2);
-	else
-		MT_BUG_ON(mt, allocated != height * 3 + 1);
+	MT_BUG_ON(mt, allocated != height * 3 + 1);
 	mas_store_prealloc(&mas, ptr);
 	MT_BUG_ON(mt, mas_allocated(&mas) != 0);
 	mas_set_range(&mas, 0, 200);
@@ -36868,7 +36869,7 @@ static unsigned long get_last_index(struct ma_state *mas)
 {
 	struct maple_node *node = mas_mn(mas);
 	enum maple_type mt = mte_node_type(mas->node);
-	unsigned long *pivots = ma_pivots(node, mt);
+	u64 *pivots = ma_pivots(node, mt);
 	unsigned long last_index = mas_data_end(mas);
 
 	BUG_ON(last_index == 0);
