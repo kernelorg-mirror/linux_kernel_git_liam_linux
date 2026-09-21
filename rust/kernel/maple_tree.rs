@@ -515,12 +515,12 @@ impl<'tree, T: ForeignOwnable> MaState<'tree, T> {
         Self {
             state: bindings::ma_state {
                 tree: mt.tree.get(),
-                index: first,
-                last: end,
+                index: first as u64,
+                last: end as u64,
                 node: ptr::null_mut(),
                 status: bindings::maple_status_ma_start,
                 min: 0,
-                max: usize::MAX,
+                max: u64::MAX,
                 alloc: ptr::null_mut(),
                 mas_flags: 0,
                 store_type: bindings::store_type_wr_invalid,
@@ -539,7 +539,7 @@ impl<'tree, T: ForeignOwnable> MaState<'tree, T> {
     fn mas_find_raw(&mut self, max: usize) -> *mut c_void {
         // SAFETY: By the type invariants, the `ma_state` is active and we have read/write access
         // to the tree.
-        unsafe { bindings::mas_find(self.as_raw(), max) }
+        unsafe { bindings::mas_find(self.as_raw(), max as u64) }
     }
 
     /// Find the next entry in the maple tree.
