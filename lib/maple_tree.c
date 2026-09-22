@@ -5675,7 +5675,7 @@ static bool mas_find_rev_setup(struct ma_state *mas, unsigned long min,
 static void *mas_next_marked(struct ma_state *mas, unsigned long max,
 			     mt_mark_t mark)
 {
-	u64 *pivots, min, pivot;
+	u64 min, pivot;
 	struct maple_node *node;
 	void __rcu **slots;
 	unsigned char offset, end;
@@ -5686,10 +5686,9 @@ static void *mas_next_marked(struct ma_state *mas, unsigned long max,
 retry:
 	node = mas_mn(mas);
 	type = mte_node_type(mas->node);
-	pivots = ma_pivots(node, type);
 	marks = ma_marks(node, type);
 	slots = ma_slots(node, type);
-	end = ma_data_end64(node, type, pivots, mas->max);
+	end = ma_data_end(node, type, mas->max);
 	if (unlikely(mas_rewalk_if_dead(mas, node, mas->index)))
 		goto retry;
 
@@ -5769,7 +5768,7 @@ overflow:
 static void *mas_prev_marked(struct ma_state *mas, unsigned long min,
 			     mt_mark_t mark)
 {
-	u64 *pivots, low, pivot;
+	u64 low, pivot;
 	struct maple_node *node;
 	void __rcu **slots;
 	unsigned char offset, end;
@@ -5780,10 +5779,9 @@ static void *mas_prev_marked(struct ma_state *mas, unsigned long min,
 retry:
 	node = mas_mn(mas);
 	type = mte_node_type(mas->node);
-	pivots = ma_pivots(node, type);
 	marks = ma_marks(node, type);
 	slots = ma_slots(node, type);
-	end = ma_data_end64(node, type, pivots, mas->max);
+	end = ma_data_end(node, type, mas->max);
 	if (unlikely(mas_rewalk_if_dead(mas, node, mas->last)))
 		goto retry;
 
