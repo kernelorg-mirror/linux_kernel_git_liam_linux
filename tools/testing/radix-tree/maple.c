@@ -35269,7 +35269,6 @@ static void mas_dfs_preorder(struct ma_state *mas)
 
 	struct maple_enode *prev;
 	unsigned char end, slot = 0;
-	u64 *pivots;
 
 	if (mas->status == ma_start) {
 		mas_start(mas);
@@ -35302,9 +35301,10 @@ walk_up:
 		mas_ascend(mas);
 		goto walk_up;
 	}
-	pivots = ma_pivots(mte_to_node(prev), mte_node_type(prev));
-	mas->max = mas_safe_pivot(mas, pivots, slot, mte_node_type(prev));
-	mas->min = mas_safe_min(mas, pivots, slot);
+	mas->max = mas_safe_pivot(mas, mte_to_node(prev), mte_node_type(prev),
+				  slot);
+	mas->min = mas_safe_min(mas, mte_to_node(prev), mte_node_type(prev),
+				slot);
 
 	return;
 done:
