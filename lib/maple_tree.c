@@ -5307,8 +5307,11 @@ static inline bool mas_anode_descend(struct ma_state *mas, unsigned long size)
 	slots = ma_slots(node, type);
 	gaps = ma_gaps(node, type);
 	offset = mas->offset;
-	min = mas_safe_min(mas, pivots, offset);
-	data_end = ma_data_end(node, type, pivots, mas->max);
+	data_end = ma_data_end64(node, type, pivots, mas->max);
+	if (offset > data_end)
+		return false;
+
+	min = mas_safe_min(mas, node, type, offset);
 	for (; offset <= data_end; offset++) {
 		pivot = mas_safe_pivot(mas, pivots, offset, type);
 
