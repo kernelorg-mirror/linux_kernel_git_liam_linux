@@ -4365,8 +4365,8 @@ static inline bool mas_anode_descend(struct ma_state *mas, unsigned long size)
 	slots = ma_slots(node, type);
 	gaps = ma_gaps(node, type);
 	offset = mas->offset;
-	min = mas_safe_min(mas, pivots, offset);
 	data_end = ma_data_end(node, type, pivots, mas->max);
+	min = mas_safe_min(mas, pivots, offset);
 	for (; offset <= data_end; offset++) {
 		pivot = mas_safe_pivot(mas, pivots, offset, type);
 
@@ -4498,7 +4498,7 @@ static inline bool mas_skip_node(struct ma_state *mas)
  */
 static inline void mas_awalk(struct ma_state *mas, unsigned long size)
 {
-	struct maple_enode *last = NULL;
+	struct maple_enode *last;
 
 	/*
 	 * There are 4 options:
@@ -4507,12 +4507,14 @@ static inline void mas_awalk(struct ma_state *mas, unsigned long size)
 	 * no gap found. (return, error == -EBUSY)
 	 * found the gap. (return)
 	 */
-	while (!mas_is_err(mas) && !mas_anode_descend(mas, size)) {
+	do {
+		last = mas->node;
+		if (mas_anode_descend(mas, size))
+			return;
+
 		if (last == mas->node)
 			mas_skip_node(mas);
-		else
-			last = mas->node;
-	}
+	} while (!mas_is_err(mas));
 }
 
 /*
