@@ -1236,10 +1236,12 @@ static __always_inline unsigned char ma_meta_end(struct maple_node *mn,
 /*
  * ma_meta_gap() - Get the largest gap location of a node from the metadata
  * @mn: The maple node
+ * @mt: The maple node type
  */
-static inline unsigned char ma_meta_gap(struct maple_node *mn)
+static inline unsigned char ma_meta_gap(struct maple_node *mn,
+		enum maple_type mt)
 {
-	return mn->ma64.meta.gap;
+	return ma_meta(mn, mt)->gap;
 }
 
 /*
@@ -1865,17 +1867,96 @@ void wr_mas_ascend(struct ma_wr_state *wr_mas)
 	wr_mas->offset_end = mas->offset;
 }
 
-static inline u64 ma_leaf_max_gap(struct maple_node *mn,
-		enum maple_type mt, u64 min, u64 max,
-		u64 *pivots, void __rcu **slots)
+/*
+ * ma_leaf_max_gap64() / ma_leaf_max_gap32() - Largest gap in a non-dense leaf.
+ *
+ * The first implied pivot optimizes the loop; slot 1 may be skipped on a gap in
+ * slot 0.  The end implied pivot runs to the node max, or to the node's own
+ * ceiling when the right-most node is walked with the tree ceiling.
+ */
+static inline u64 ma_leaf_max_gap64(struct maple_node *mn, enum maple_type mt,
+		u64 min, u64 max, u64 *pivots, void __rcu **slots)
 {
-	u64 pstart, gap, max_gap;
-	unsigned char i;
-	unsigned char max_piv;
+	u64 ceiling = mt_max[mt];
+	u64 pstart, gap, max_gap = 0;
+	unsigned char i, max_piv;
 
-	max_gap = 0;
+	if (likely(!slots[0])) {
+		max_gap = pivots[0] - min + 1;
+		i = 2;
+	} else {
+		i = 1;
+	}
+
+	max_piv = ma_data_end64(mn, mt, pivots, max) - 1;
+	if (!slots[max_piv + 1]) {
+		gap = (max < ceiling ? max : ceiling) - pivots[max_piv];
+		if (gap > max_gap)
+			max_gap = gap;
+
+		if (max_gap > pivots[max_piv] - min)
+			return max_gap;
+	}
+
+	for (; i <= max_piv; i++) {
+		if (likely(slots[i]))
+			continue;
+
+		pstart = pivots[i - 1];
+		gap = pivots[i] - pstart;
+		if (gap > max_gap)
+			max_gap = gap;
+		i++;	/* There cannot be two gaps in a row. */
+	}
+	return max_gap;
+}
+
+static inline u64 ma_leaf_max_gap32(struct maple_node *mn, enum maple_type mt,
+		u64 min, u64 max, u32 *pivots, void __rcu **slots)
+{
+	u64 ceiling = mt_max[mt];
+	u64 pstart, gap, max_gap = 0;
+	unsigned char i, max_piv;
+
+	if (likely(!slots[0])) {
+		max_gap = pivots[0] - min + 1;
+		i = 2;
+	} else {
+		i = 1;
+	}
+
+	max_piv = ma_data_end32(mn, mt, pivots, max) - 1;
+	if (!slots[max_piv + 1]) {
+		gap = (max < ceiling ? max : ceiling) - pivots[max_piv];
+		if (gap > max_gap)
+			max_gap = gap;
+
+		if (max_gap > pivots[max_piv] - min)
+			return max_gap;
+	}
+
+	for (; i <= max_piv; i++) {
+		if (likely(slots[i]))
+			continue;
+
+		pstart = pivots[i - 1];
+		gap = pivots[i] - pstart;
+		if (gap > max_gap)
+			max_gap = gap;
+		i++;	/* There cannot be two gaps in a row. */
+	}
+	return max_gap;
+}
+
+static __always_inline
+u64 ma_leaf_max_gap(struct maple_node *mn, enum maple_type mt, u64 min, u64 max,
+		void __rcu **slots)
+{
+	unsigned char i;
+	u64 gap, max_gap;
+
 	if (unlikely(ma_is_dense(mt))) {
-		gap = 0;
+		gap = max_gap = 0;
 		for (i = 0; i < mt_slots[mt]; i++) {
 			if (slots[i]) {
 				if (gap > max_gap)
@@ -1890,43 +1971,11 @@ static inline u64 ma_leaf_max_gap(struct maple_node *mn,
 		return max_gap;
 	}
 
-	/*
-	 * Check the first implied pivot optimizes the loop below and slot 1 may
-	 * be skipped if there is a gap in slot 0.
-	 */
-	if (likely(!slots[0])) {
-		max_gap = pivots[0] - min + 1;
-		i = 2;
-	} else {
-		i = 1;
-	}
+	if (node_is_32b(mt))
+		return ma_leaf_max_gap32(mn, mt, min, max, ma_pivots32(mn, mt),
+					 slots);
 
-	/* reduce max_piv as the special case is checked before the loop */
-	max_piv = ma_data_end64(mn, mt, pivots, max) - 1;
-	/* Check the end implied pivot, which may be a gap on any node. */
-	if (!slots[max_piv + 1]) {
-		gap = max - pivots[max_piv];
-		if (gap > max_gap)
-			max_gap = gap;
-
-		if (max_gap > pivots[max_piv] - min)
-			return max_gap;
-	}
-
-	for (; i <= max_piv; i++) {
-		/* data == no gap. */
-		if (likely(slots[i]))
-			continue;
-
-		pstart = pivots[i - 1];
-		gap = pivots[i] - pstart;
-		if (gap > max_gap)
-			max_gap = gap;
-
-		/* There cannot be two gaps in a row. */
-		i++;
-	}
-	return max_gap;
+	return ma_leaf_max_gap64(mn, mt, min, max, ma_pivots(mn, mt), slots);
 }
 
 /*
@@ -1939,22 +1988,67 @@ static inline u64 mas_leaf_max_gap(struct ma_state *mas)
 {
 	enum maple_type mt;
 	struct maple_node *mn;
-	u64 *pivots;
 	void __rcu **slots;
 
 	mn = mas_mn(mas);
 	mt = mte_node_type(mas->node);
 	slots = ma_slots(mn, mt);
-	pivots = ma_pivots(mn, mt);
 
-	return ma_leaf_max_gap(mn, mt, mas->min, mas->max, pivots, slots);
+	return ma_leaf_max_gap(mn, mt, mas->min, mas->max, slots);
 }
 
 /*
- * ma_max_gap() - Get the maximum gap in a maple node (non-leaf)
- * @node: The maple node
- * @gaps: The pointer to the gaps
- * @mt: The maple node type
+ * The arrays of an allocation node the gap climb reads and writes at every
+ * level, by its width: a parent is an allocation node of one width or the
+ * other, so this is one test, not a switch per array.
+ */
+struct ma_arange {
+	void __rcu **slots;
+	union {
+		u64 *g64;
+		u32 *g32;
+	};
+	struct maple_metadata *meta;
+	bool is32;
+};
+
+static __always_inline
+void ma_arange_of(struct ma_arange *a, struct maple_node *node,
+		enum maple_type type)
+{
+	if (type == maple_arange_32) {
+		a->is32 = true;
+		a->slots = node->ma32.slot;
+		a->g32 = node->ma32.gap;
+		a->meta = &node->ma32.meta;
+	} else {
+		a->is32 = false;
+		a->slots = node->ma64.slot;
+		a->g64 = node->ma64.gap;
+		a->meta = &node->ma64.meta;
+	}
+}
+
+static __always_inline
+u64 ma_arange_gap(const struct ma_arange *a, unsigned char offset)
+{
+	if (a->is32)
+		return a->g32[offset];
+	return a->g64[offset];
+}
+
+static __always_inline
+void ma_arange_set_gap(const struct ma_arange *a, unsigned char offset, u64 gap)
+{
+	if (a->is32)
+		a->g32[offset] = gap;
+	else
+		a->g64[offset] = gap;
+}
+
+/*
+ * ma_arange_max_gap() - Get the maximum gap in an allocation node (non-leaf)
+ * @a: The node's arrays
  * @off: Pointer to store the offset location of the gap.
  *
  * Uses the metadata data end to scan backwards across set gaps.
@@ -1962,19 +2056,27 @@ static inline u64 mas_leaf_max_gap(struct ma_state *mas)
  * Return: The maximum gap value
  */
 static inline u64
-ma_max_gap(struct maple_node *node, u64 *gaps, enum maple_type mt,
-	    unsigned char *off)
+ma_arange_max_gap(const struct ma_arange *a, unsigned char *off)
 {
 	unsigned char offset, i;
 	u64 max_gap = 0;
 
-	i = offset = ma_meta_end(node, mt);
-	do {
-		if (gaps[i] > max_gap) {
-			max_gap = gaps[i];
-			offset = i;
-		}
-	} while (i--);
+	i = offset = a->meta->end;
+	if (a->is32) {
+		do {
+			if (a->g32[i] > max_gap) {
+				max_gap = a->g32[i];
+				offset = i;
+			}
+		} while (i--);
+	} else {
+		do {
+			if (a->g64[i] > max_gap) {
+				max_gap = a->g64[i];
+				offset = i;
+			}
+		} while (i--);
+	}
 
 	*off = offset;
 	return max_gap;
@@ -1988,7 +2090,6 @@ ma_max_gap(struct maple_node *node, u64 *gaps, enum maple_type mt,
  */
 static inline u64 mas_max_gap(struct ma_state *mas)
 {
-	u64 *gaps;
 	unsigned char offset;
 	enum maple_type mt;
 	struct maple_node *node;
@@ -1998,10 +2099,9 @@ static inline u64 mas_max_gap(struct ma_state *mas)
 		return mas_leaf_max_gap(mas);
 
 	node = mas_mn(mas);
-	MAS_BUG_ON(mas, mt != maple_arange_64);
-	offset = ma_meta_gap(node);
-	gaps = ma_gaps(node, mt);
-	return gaps[offset];
+	MAS_BUG_ON(mas, mt != maple_arange_64 && mt != maple_arange_32);
+	offset = ma_meta_gap(node, mt);
+	return ma_gap(node, mt, offset);
 }
 
 /*
@@ -2019,21 +2119,21 @@ static inline void mas_parent_gap(struct ma_state *mas, unsigned char offset,
 	u64 meta_gap = 0;
 	struct maple_node *pnode;
 	struct maple_enode *penode;
-	u64 *pgaps;
 	unsigned char meta_offset;
 	enum maple_type pmt;
+	struct ma_arange a;
 
 	pnode = mte_parent(mas->node);
 	pmt = mas_parent_type(mas, mas->node);
 	penode = mt_mk_node(pnode, pmt);
-	pgaps = ma_gaps(pnode, pmt);
 
 ascend:
-	MAS_BUG_ON(mas, pmt != maple_arange_64);
-	meta_offset = ma_meta_gap(pnode);
-	meta_gap = pgaps[meta_offset];
+	MAS_BUG_ON(mas, pmt != maple_arange_64 && pmt != maple_arange_32);
+	ma_arange_of(&a, pnode, pmt);
+	meta_offset = a.meta->gap;
+	meta_gap = ma_arange_gap(&a, meta_offset);
 
-	pgaps[offset] = new;
+	ma_arange_set_gap(&a, offset, new);
 
 	if (meta_gap == new)
 		return;
@@ -2042,10 +2142,10 @@ ascend:
 		if (meta_gap > new)
 			return;
 
-		ma_set_meta_gap(pnode, pmt, offset);
+		a.meta->gap = offset;
 	} else if (new < meta_gap) {
-		new = ma_max_gap(pnode, pgaps, pmt, &meta_offset);
-		ma_set_meta_gap(pnode, pmt, meta_offset);
+		new = ma_arange_max_gap(&a, &meta_offset);
+		a.meta->gap = meta_offset;
 	}
 
 	if (ma_is_root(pnode))
@@ -2054,7 +2154,6 @@ ascend:
 	/* Go to the parent node. */
 	pnode = mte_parent(penode);
 	pmt = mas_parent_type(mas, penode);
-	pgaps = ma_gaps(pnode, pmt);
 	offset = mte_parent_slot(penode);
 	penode = mt_mk_node(pnode, pmt);
 	goto ascend;
@@ -2067,8 +2166,8 @@ static __always_inline void mas_update_gap_known(struct ma_state *mas,
 	u64 p_gap;
 
 	pslot = mte_parent_slot(mas->node);
-	p_gap = ma_gaps(mte_parent(mas->node),
-			mas_parent_type(mas, mas->node))[pslot];
+	p_gap = ma_gap(mte_parent(mas->node),
+		       mas_parent_type(mas, mas->node), pslot);
 
 	if (p_gap != gap)
 		mas_parent_gap(mas, pslot, gap);
@@ -3395,15 +3494,14 @@ static inline void cp_dst_to_slots(struct maple_copy *cp, u64 min,
 		if (mt_is_alloc(mas->tree)) {
 			if (ma_is_leaf(mt)) {
 				cp->gap[d] = ma_leaf_max_gap(mn, mt, slot_min,
-						 slot_max, ma_pivots(mn, mt),
-						 ma_slots(mn, mt));
+						 slot_max, ma_slots(mn, mt));
 			} else {
 				u64 *gaps = ma_gaps(mn, mt);
 
 				if (gaps) {
 					unsigned char gap_slot;
 
-					gap_slot = ma_meta_gap(mn);
+					gap_slot = ma_meta_gap(mn, mt);
 					cp->gap[d] = gaps[gap_slot];
 				}
 			}
@@ -8477,7 +8575,7 @@ static void mas_validate_gaps(struct ma_state *mas)
 counted:
 	if (mt == maple_arange_64) {
 		MT_BUG_ON(mas->tree, !gaps);
-		offset = ma_meta_gap(node);
+		offset = ma_meta_gap(node, mt);
 		if (offset > i) {
 			pr_err("gap offset " PTR_FMT "[%u] is invalid\n", node, offset);
 			MT_BUG_ON(mas->tree, 1);
