@@ -158,7 +158,7 @@ struct maple_mrange_64 {
 
 /*
  * A range node whose pivots fit in 32 bits.  Used for trees whose index space
- * is currently within UINT_MAX; a store of a larger index promotes the node to
+ * is currently within U32_MAX; a store of a larger index promotes the node to
  * the maple_range_64 layout.
  */
 struct maple_range_32 {
@@ -271,6 +271,7 @@ struct maple_copy {
 	unsigned char data;
 	unsigned char write_off;
 	unsigned char height;
+	bool dst_64b;			/* Destination nodes need 64-bit pivots */
 };
 
 static_assert(sizeof(struct maple_copy) <= 256);
@@ -630,6 +631,7 @@ struct ma_state {
 	unsigned char offset;
 	unsigned char mas_flags;
 	unsigned char end;		/* The end of the node */
+	bool root_64b;			/* Root holds 64-bit pivots (else born-32) */
 	enum store_type store_type;	/* The type of store needed for this operation */
 #ifdef CONFIG_LOCKDEP
 	u32 ld_seq;
@@ -646,7 +648,10 @@ struct ma_wr_state {
 	u64 r_max;			/* range max */
 	enum maple_type type;		/* mas->node type */
 	unsigned char offset_end;	/* The offset where the write ends */
-	u64 *pivots;			/* mas->node->pivots pointer */
+	union {
+		u64 *pivots;		/* node pivots (64-bit node) */
+		u32 *pivots32;		/* node pivots (32-bit node) */
+	};
 	u64 end_piv;			/* The pivot at the offset end */
 	void __rcu **slots;		/* mas->node->slots pointer */
 	void *entry;			/* The entry to write */
@@ -680,7 +685,7 @@ struct ma_wr_state {
 		.node = NULL,						\
 		.status = ma_start,					\
 		.min = 0,						\
-		.max = ULONG_MAX,					\
+		.max = U64_MAX,						\
 		.sheaf = NULL,						\
 		.alloc = NULL,						\
 		.node_request = 0,					\
@@ -750,7 +755,7 @@ static inline void mas_init(struct ma_state *mas, struct maple_tree *tree,
 	memset(mas, 0, sizeof(struct ma_state));
 	mas->tree = tree;
 	mas->index = mas->last = addr;
-	mas->max = ULONG_MAX;
+	mas->max = U64_MAX;
 	mas->status = ma_start;
 	mas->node = NULL;
 }
@@ -765,10 +770,14 @@ static inline bool mas_is_err(struct ma_state *mas)
 	return mas->status == ma_error;
 }
 
-/* The largest index the tree can hold; width-dependent once 32-bit nodes land. */
+/*
+ * mas_tree_max() - The physical ceiling of the tree: U32_MAX while born-32,
+ * U64_MAX once the root has been promoted to 64-bit.  Use this, not a bare
+ * U64_MAX, for "is this the rightmost node / whole-tree store" tests.
+ */
 static __always_inline u64 mas_tree_max(const struct ma_state *mas)
 {
-	return ULONG_MAX;
+	return mas->root_64b ? U64_MAX : U32_MAX;
 }
 
 /**
