@@ -5552,7 +5552,6 @@ static int mas_next_marked_node(struct ma_state *mas, unsigned long max,
 {
 	struct maple_node *node = mas_mn(mas);
 	struct maple_enode *enode;
-	u64 *pivots;
 	void __rcu **slots;
 	u64 min, max_piv;
 	unsigned char offset, end;
@@ -5572,9 +5571,8 @@ ascend:
 
 		node = mas_mn(mas);
 		mt = mte_node_type(mas->node);
-		pivots = ma_pivots(node, mt);
 		marks = ma_marks(node, mt);
-		end = ma_data_end64(node, mt, pivots, mas->max);
+		end = ma_data_end(node, mt, mas->max);
 		if (unlikely(ma_dead_node(node)))
 			return 1;
 
@@ -5598,8 +5596,7 @@ ascend:
 		mas->max = max_piv;
 		node = mte_to_node(enode);
 		mt = mte_node_type(enode);
-		pivots = ma_pivots(node, mt);
-		end = ma_data_end64(node, mt, pivots, mas->max);
+		end = ma_data_end(node, mt, mas->max);
 		if (unlikely(ma_dead_node(node)))
 			return 1;
 
@@ -5629,7 +5626,6 @@ static void *mas_next_marked(struct ma_state *mas, unsigned long max,
 			      mt_mark_t mark)
 {
 	void __rcu **slots;
-	u64 *pivots;
 	u64 save_point = mas->last;
 	unsigned char mark_end;
 	struct maple_node *node;
@@ -5640,7 +5636,6 @@ static void *mas_next_marked(struct ma_state *mas, unsigned long max,
 retry:
 	node = mas_mn(mas);
 	type = mte_node_type(mas->node);
-	pivots = ma_pivots(node, type);
 	if (unlikely(mas_rewalk_if_dead(mas, node, save_point)))
 		goto retry;
 
@@ -5648,7 +5643,7 @@ retry:
 		u64 pivot;
 
 		if (likely(mas->offset < mas->end))
-			pivot = pivots[mas->offset];
+			pivot = ma_pivot(node, type, mas->offset);
 		else
 			pivot = mas->max;
 
@@ -5662,7 +5657,7 @@ retry:
 	}
 
 	if (likely(mas->offset < mas->end)) {
-		mas->index = pivots[mas->offset] + 1;
+		mas->index = ma_pivot(node, type, mas->offset) + 1;
 		mas->offset++;
 	} else {
 		if (mas->last >= max) {
@@ -5683,7 +5678,6 @@ retry:
 		mas->index = mas->min;
 		node = mas_mn(mas);
 		type = mte_node_type(mas->node);
-		pivots = ma_pivots(node, type);
 		if (unlikely(mas_rewalk_if_dead(mas, node, save_point)))
 			goto retry;
 	}
@@ -5708,7 +5702,7 @@ retry:
 		mas->index = mas_safe_min(mas, node, type, mas->offset);
 
 		if (likely(mas->offset < mas->end))
-			mas->last = pivots[mas->offset];
+			mas->last = ma_pivot(node, type, mas->offset);
 		else
 			mas->last = mas->max;
 
