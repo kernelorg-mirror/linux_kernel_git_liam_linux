@@ -35370,17 +35370,35 @@ static unsigned long check_dfs_count(struct maple_tree *mt)
 static void check_dfs_preorder(struct maple_tree *mt)
 {
 	unsigned long count, max = 1000;
+	u64 hi = (u64)U32_MAX + 1;
 
+	if (!MAPLE_32BIT) {
+		/* Plain tree, 64-bit nodes (above UINT_MAX). */
+		mt_init_flags(mt, 0);
+		check_dfs_fill(mt, hi, max);
+		count = check_dfs_count(mt);
+		MT_BUG_ON(mt, count != 74);
+		mtree_destroy(mt);
+
+		/* Alloc tree, 64-bit nodes. */
+		mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
+		check_dfs_fill(mt, hi, max);
+		count = check_dfs_count(mt);
+		MT_BUG_ON(mt, count != 77);
+		mtree_destroy(mt);
+	}
+
+	/* Plain tree, 32-bit nodes (born-32 at 0-max). */
 	mt_init_flags(mt, 0);
 	check_dfs_fill(mt, 0, max);
 	count = check_dfs_count(mt);
-	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 56 : 74));
+	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 37 : 56));
 	mtree_destroy(mt);
 
 	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
 	check_dfs_fill(mt, 0, max);
 	count = check_dfs_count(mt);
-	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 58 : 77));
+	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 37 : 57));
 	mtree_destroy(mt);
 
 	rcu_barrier();
@@ -36790,13 +36808,14 @@ static noinline void __init check_multilevel_triple_split(struct maple_tree *mt)
 /* next/prev across adjacent leaves with different parents. */
 static noinline void __init check_next_prev_two_level(struct maple_tree *mt)
 {
-	int i, nr_entries = MAPLE_32BIT ? 500 : 200;
 	unsigned long level2[6], e1_index, e1_last;
 	struct maple_enode *mn, *pleaf;
 	void *val;
+	int i;
 	MA_STATE(mas, mt, 0, 0);
 
-	for (i = 0; i <= nr_entries; i++)
+	/* Needs leaves under different parents. */
+	for (i = 0; mt_height(mt) < 3; i++)
 		mtree_store_range(mt, i*10, i*10 + 5,
 				  xa_mk_value(i), GFP_KERNEL);
 
