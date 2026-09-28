@@ -151,13 +151,13 @@ static noinline void __init test_mas_node_depth(struct ma_state *mas,
 	mas_reset(mas);
 	mas_start(mas);
 	while (mas->depth < depth && !mte_is_leaf(mas->node)) {
-		u64 *piv;
 		int count, offset;
 
 		count = mas_data_end(mas);
-		piv = ma_pivots(mas_mn(mas), mte_node_type(mas->node));
 		offset = 0;
-		while (offset < count && mas->index > piv[offset]) {
+		while (offset < count &&
+		       mas->index > ma_pivot(mas_mn(mas),
+					      mte_node_type(mas->node), offset)) {
 			offset++;
 		}
 		mas->offset = offset;
@@ -215,24 +215,55 @@ static noinline void __init mas_internal_levels_fill(struct ma_state *mas)
 	}
 }
 
-/* Fill the node at @depth on the path to @index by splitting its ranges. */
+/*
+ * Fill the node at @depth on the path to @index to full using singletons,
+ * without disturbing the slot that defines the boundary we care about.  This
+ * is width-agnostic: the node's own max is UINT_MAX on a born-32 node and
+ * ULONG_MAX on a born-64 one, so filling toward the interior never touches the
+ * trailing range that runs to the (implied) node max.
+ *
+ * @descending: leave the last slot (the trailing range, and a null beyond it if
+ * present) alone and write singletons downward starting from the previous
+ * slot's max.  Otherwise leave slot 0 alone and write singletons upward
+ * starting one past it.  Filling stops the moment the node is full, so it never
+ * splits and its height and boundary slot are preserved.
+ */
 static void __maybe_unused mas_fill_node_at_depth(struct maple_tree *mt,
-		unsigned long index, unsigned char depth)
+		unsigned long index, unsigned char depth, bool descending)
 {
 	MA_STATE(mas, mt, index, index);
-	unsigned long min, max, i;
+	unsigned long node_min, node_max, v;
+	unsigned char end;
 
 	test_mas_node_depth(&mas, depth);
-	min = mas.min;
-	max = mas.max;
+	node_min = mas.min;
+	node_max = mas.max;
+	end = mas_data_end(&mas);
 
-	for (i = min; i <= max; i++) {
+	if (descending)
+		v = end ? ma_pivot(mas_mn(&mas), mte_node_type(mas.node),
+				   end - 1) : node_max - 1;
+	else
+		v = (end ? ma_pivot(mas_mn(&mas), mte_node_type(mas.node), 0) :
+			   node_min) + 1;
+
+	for (;;) {
 		mas_set(&mas, index);
 		test_mas_node_depth(&mas, depth);
 		if (mas_data_end(&mas) >= mt_slot_count(mas.node) - 1)
 			return;			/* node is full */
-		mas_set(&mas, i);
-		mas_store_gfp(&mas, xa_mk_value(i), GFP_KERNEL);
+		if (descending) {
+			if (v <= node_min)
+				return;
+		} else if (v >= node_max) {
+			return;
+		}
+		mas_set(&mas, v);
+		mas_store_gfp(&mas, xa_mk_value(v), GFP_KERNEL);
+		if (descending)
+			v--;
+		else
+			v++;
 	}
 }
 
@@ -244,12 +275,14 @@ static void __maybe_unused fill_both_sides_of_first_root_pivot(struct maple_tree
 	unsigned char d, height;
 
 	mas_start(&mas);
-	boundary = ma_pivots(mas_mn(&mas), mte_node_type(mas.node))[0];
+	boundary = ma_pivot(mas_mn(&mas), mte_node_type(mas.node), 0);
 	height = mt_height(mt);
 
 	for (d = 1; d <= height; d++) {
-		mas_fill_node_at_depth(mt, boundary, d);
-		mas_fill_node_at_depth(mt, boundary + 1, d);
+		/* Left of the boundary: fill down, keep the slot ending at it. */
+		mas_fill_node_at_depth(mt, boundary, d, true);
+		/* Right of the boundary: fill up, keep the slot starting at it. */
+		mas_fill_node_at_depth(mt, boundary + 1, d, false);
 	}
 }
 
@@ -274,7 +307,7 @@ static unsigned long __maybe_unused find_value_ending_node(struct maple_tree *mt
 		} else {
 			entry = mas_next_range(mas, ULONG_MAX);
 		}
-	} while (mas->last != ULONG_MAX);
+	} while (mas->last != mas_tree_max(mas));
 
 	return 0;
 }
@@ -306,7 +339,7 @@ static unsigned long __maybe_unused find_full_node_boundary(struct maple_tree *m
 		} else {
 			mas_next_range(mas, ULONG_MAX);
 		}
-	} while (mas->last != ULONG_MAX);
+	} while (mas->last != mas_tree_max(mas));
 
 	return 0;
 }
@@ -708,7 +741,6 @@ static inline void mas_node_walk(struct ma_state *mas, struct maple_node *node,
 			 unsigned long *range_max)
 
 {
-	u64 *pivots;
 	unsigned char count;
 	unsigned long prev, max;
 	unsigned char offset;
@@ -723,8 +755,7 @@ static inline void mas_node_walk(struct ma_state *mas, struct maple_node *node,
 		return;
 	}
 
-	pivots = ma_pivots(node, type);
-	max = pivots[0];
+	max = ma_pivot(node, type, 0);
 	if (unlikely(ma_dead_node(node)))
 		return;
 
@@ -737,7 +768,7 @@ static inline void mas_node_walk(struct ma_state *mas, struct maple_node *node,
 	count = mt_pivots[type];
 	while (++offset < count) {
 		prev = max;
-		max = pivots[offset];
+		max = ma_pivot(node, type, offset);
 		if (unlikely(ma_dead_node(node)))
 			return;
 
@@ -35312,64 +35343,47 @@ done:
 }
 
 
-static void check_dfs_preorder(struct maple_tree *mt)
+/* Insert max+1 sequential singletons based at u64 @base. */
+static void check_dfs_fill(struct maple_tree *mt, u64 base, unsigned long max)
 {
-	unsigned long e, count = 0, max = 1000;
+	unsigned long i;
 
+	for (i = 0; i <= max; i++)
+		MT_BUG_ON(mt, mtree_insert_u64(mt, base + i,
+					       xa_mk_value(i), GFP_KERNEL));
+}
+
+/* Count the DFS pre-order nodes of @mt. */
+static unsigned long check_dfs_count(struct maple_tree *mt)
+{
+	unsigned long count = 0;
 	MA_STATE(mas, mt, 0, 0);
 
-	/*
-	 * Node counts depend on the per-node fan-out.  The 32-bit build uses
-	 * narrower nodes (MAPLE_RANGE64_SLOTS / MAPLE_ARANGE64_SLOTS), so a
-	 * 1000-entry tree occupies more nodes than the 64-bit build.
-	 */
-	if (MAPLE_32BIT)
-		e = 56;
-	else
-		e = 74;
-
-	check_seq(mt, max, false);
 	do {
 		count++;
 		mas_dfs_preorder(&mas);
 	} while (!mas_is_none(&mas));
-	MT_BUG_ON(mt, count != e);
+
+	return count;
+}
+
+static void check_dfs_preorder(struct maple_tree *mt)
+{
+	unsigned long count, max = 1000;
+
+	mt_init_flags(mt, 0);
+	check_dfs_fill(mt, 0, max);
+	count = check_dfs_count(mt);
+	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 56 : 74));
 	mtree_destroy(mt);
 
 	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
-	mas_reset(&mas);
-	count = 0;
-	if (MAPLE_32BIT)
-		e = 58;
-	else
-		e = 77;
-
-	check_seq(mt, max, false);
-	do {
-		count++;
-		mas_dfs_preorder(&mas);
-	} while (!mas_is_none(&mas));
-	MT_BUG_ON(mt, count != e);
-	mtree_destroy(mt);
-
-	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
-	mas_reset(&mas);
-	count = 0;
-	check_rev_seq(mt, max, false);
-	do {
-		count++;
-		mas_dfs_preorder(&mas);
-	} while (!mas_is_none(&mas));
-	MT_BUG_ON(mt, count != e);
+	check_dfs_fill(mt, 0, max);
+	count = check_dfs_count(mt);
+	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 58 : 77));
 	mtree_destroy(mt);
 
 	rcu_barrier();
-	/*
-	 * pr_info(" ->seq test of 0-%lu %luK in %d active (%d total)\n",
-	 *	max, mt_get_alloc_size()/1024, mt_nr_allocated(),
-	 *	mt_nr_tallocated());
-	 */
-
 }
 /* End of depth first search tests */
 
@@ -35379,7 +35393,6 @@ static unsigned char get_vacant_height(struct ma_wr_state *wr_mas, void *entry)
 	struct ma_state *mas = wr_mas->mas;
 	char vacant_height = 0;
 	enum maple_type type;
-	u64 *pivots;
 	unsigned long min = 0;
 	unsigned long max = ULONG_MAX;
 	unsigned char offset;
@@ -35392,19 +35405,23 @@ static unsigned char get_vacant_height(struct ma_wr_state *wr_mas, void *entry)
 
 	type = mte_node_type(mas->node);
 	wr_mas->type = type;
+	wr_mas->sufficient_height = 0;
 	while (!ma_is_leaf(type)) {
 		mas_node_walk(mas, mte_to_node(mas->node), type, &min, &max);
 		offset = mas->offset;
 		mas->end = mas_data_end(mas);
-		pivots = ma_pivots(mte_to_node(mas->node), type);
 
-		if (pivots) {
+		if (!ma_is_dense(type)) {
 			if (offset)
-				min = pivots[mas->offset - 1];
+				min = ma_pivot(mte_to_node(mas->node), type,
+					       mas->offset - 1);
 			if (offset < mas->end)
-				max = pivots[mas->offset];
+				max = ma_pivot(mte_to_node(mas->node), type,
+					       mas->offset);
 		}
-		wr_mas->r_max = offset < mas->end ? pivots[offset] : mas->max;
+		wr_mas->r_max = offset < mas->end ?
+			ma_pivot(mte_to_node(mas->node), type, offset) :
+			mas->max;
 
 		/* detect spanning write */
 		if (mas_is_span_wr(wr_mas))
@@ -35413,11 +35430,19 @@ static unsigned char get_vacant_height(struct ma_wr_state *wr_mas, void *entry)
 		if (mas->end < mt_slot_count(mas->node) - 1)
 			vacant_height = mas->depth + 1;
 
+		if (ma_is_root(mas_mn(mas))) {
+			if (mas->end > 2)
+				wr_mas->sufficient_height = 1;
+		} else if (mas->end > mt_min_slots[type] + 1) {
+			wr_mas->sufficient_height = mas->depth + 1;
+		}
+
 		mas_descend(mas);
 		type = mte_node_type(mas->node);
 		mas->depth++;
 	}
 
+	wr_mas->vacant_height = vacant_height;
 	return vacant_height;
 }
 
@@ -35433,13 +35458,57 @@ static int mas_allocated(struct ma_state *mas)
 
 	return total;
 }
+/*
+ * expected_prealloc() - The node count mas_prealloc_calc() should compute for
+ * the store set up on @wr_mas.  Mirrors that formula so the prealloc test stays
+ * correct across node widths: born-32 changes which store type a given index
+ * triggers, so the test detects the actual store_type instead of assuming one.
+ * Requires get_vacant_height(wr_mas) to have run (sets vacant/sufficient height)
+ * and mas->store_type to be set by a preceding preallocate.
+ */
+static unsigned long expected_prealloc(struct ma_wr_state *wr_mas, void *entry)
+{
+	struct ma_state *mas = wr_mas->mas;
+	unsigned char height = mas_mt_height(mas);
+	unsigned char delta = height - wr_mas->vacant_height;
+
+	switch (mas->store_type) {
+	case wr_exact_fit:
+	case wr_append:
+	case wr_slot_store:
+		return 0;
+	case wr_spanning_store:
+		if (wr_mas->sufficient_height < wr_mas->vacant_height)
+			return (height - wr_mas->sufficient_height) * 3 + 1;
+		return delta * 3 + 1;
+	case wr_split_store:
+		return delta * 2 + 1;
+	case wr_rebalance:
+		if (wr_mas->sufficient_height < wr_mas->vacant_height)
+			return (height - wr_mas->sufficient_height) * 2 + 1;
+		return delta * 2 + 1;
+	case wr_node_store:
+		return mt_in_rcu(mas->tree) ? 1 : 0;
+	case wr_new_root:
+		return 1;
+	case wr_store_root:
+		if ((mas->last != 0) || (mas->index != 0))
+			return 1;
+		if (((unsigned long)(entry) & 3) == 2)
+			return 1;
+		if (mt_has_marks(mas->tree))
+			return 1;
+		return 0;
+	default:
+		return 0;
+	}
+}
+
 /* Preallocation testing */
 static noinline void __init check_prealloc(struct maple_tree *mt)
 {
 	unsigned long i, max = 100;
 	unsigned long allocated;
-	unsigned char height;
-	unsigned char vacant_height;
 	struct maple_node *mn;
 	void *ptr = check_prealloc;
 	MA_STATE(mas, mt, 10, 20);
@@ -35456,10 +35525,9 @@ static noinline void __init check_prealloc(struct maple_tree *mt)
 	MT_BUG_ON(mt, mas.store_type != wr_spanning_store);
 	MT_BUG_ON(mt, mas_is_err(&mas));
 	allocated = mas_allocated(&mas);
-	height = mas_mt_height(&mas);
-	vacant_height = get_vacant_height(&wr_mas, ptr);
+	get_vacant_height(&wr_mas, ptr);
 	MT_BUG_ON(mt, allocated == 0);
-	MT_BUG_ON(mt, allocated != 1 + (height - vacant_height) * 3);
+	MT_BUG_ON(mt, allocated != expected_prealloc(&wr_mas, ptr));
 	mas_destroy(&mas);
 	allocated = mas_allocated(&mas);
 	MT_BUG_ON(mt, allocated != 0);
@@ -35467,10 +35535,9 @@ static noinline void __init check_prealloc(struct maple_tree *mt)
 	mas_wr_preallocate(&wr_mas, ptr);
 	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
 	allocated = mas_allocated(&mas);
-	height = mas_mt_height(&mas);
-	vacant_height = get_vacant_height(&wr_mas, ptr);
+	get_vacant_height(&wr_mas, ptr);
 	MT_BUG_ON(mt, allocated == 0);
-	MT_BUG_ON(mt, allocated != 1 + (height - vacant_height) * 3);
+	MT_BUG_ON(mt, allocated != expected_prealloc(&wr_mas, ptr));
 	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
 	mas_destroy(&mas);
 	allocated = mas_allocated(&mas);
@@ -35479,9 +35546,8 @@ static noinline void __init check_prealloc(struct maple_tree *mt)
 
 	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
 	allocated = mas_allocated(&mas);
-	height = mas_mt_height(&mas);
-	vacant_height = get_vacant_height(&wr_mas, ptr);
-	MT_BUG_ON(mt, allocated != 1 + (height - vacant_height) * 3);
+	get_vacant_height(&wr_mas, ptr);
+	MT_BUG_ON(mt, allocated != expected_prealloc(&wr_mas, ptr));
 	mn = mas_pop_node(&mas);
 	MT_BUG_ON(mt, mas_allocated(&mas) != allocated - 1);
 	mn->parent = ma_parent_ptr(mn);
@@ -35493,9 +35559,8 @@ static noinline void __init check_prealloc(struct maple_tree *mt)
 
 	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
 	allocated = mas_allocated(&mas);
-	height = mas_mt_height(&mas);
-	vacant_height = get_vacant_height(&wr_mas, ptr);
-	MT_BUG_ON(mt, allocated != 1 + (height - vacant_height) * 3);
+	get_vacant_height(&wr_mas, ptr);
+	MT_BUG_ON(mt, allocated != expected_prealloc(&wr_mas, ptr));
 	mn = mas_pop_node(&mas);
 	MT_BUG_ON(mt, mas_allocated(&mas) != allocated - 1);
 	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
@@ -35507,9 +35572,8 @@ static noinline void __init check_prealloc(struct maple_tree *mt)
 
 	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
 	allocated = mas_allocated(&mas);
-	height = mas_mt_height(&mas);
-	vacant_height = get_vacant_height(&wr_mas, ptr);
-	MT_BUG_ON(mt, allocated != 1 + (height - vacant_height) * 3);
+	get_vacant_height(&wr_mas, ptr);
+	MT_BUG_ON(mt, allocated != expected_prealloc(&wr_mas, ptr));
 	mas_store_prealloc(&mas, ptr);
 	MT_BUG_ON(mt, mas_allocated(&mas) != 0);
 
@@ -35524,7 +35588,6 @@ static noinline void __init check_prealloc(struct maple_tree *mt)
 	mas_set_range(&mas, 6, 10);
 	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
 	allocated = mas_allocated(&mas);
-	height = mas_mt_height(&mas);
 	MT_BUG_ON(mt, allocated != 0);
 	mas_store_prealloc(&mas, ptr);
 	MT_BUG_ON(mt, mas_allocated(&mas) != 0);
@@ -35536,12 +35599,8 @@ static noinline void __init check_prealloc(struct maple_tree *mt)
 		mas_set_range(&mas, 54, 54);
 	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
 	allocated = mas_allocated(&mas);
-	height = mas_mt_height(&mas);
-	vacant_height = get_vacant_height(&wr_mas, ptr);
-	if (MAPLE_32BIT)
-		MT_BUG_ON(mt, allocated != height * 3 + 1);
-	else
-		MT_BUG_ON(mt, allocated != 1 + (height - vacant_height) * 2);
+	get_vacant_height(&wr_mas, ptr);
+	MT_BUG_ON(mt, allocated != expected_prealloc(&wr_mas, ptr));
 	mas_store_prealloc(&mas, ptr);
 	MT_BUG_ON(mt, mas_allocated(&mas) != 0);
 	mt_set_non_kernel(1);
@@ -35549,7 +35608,6 @@ static noinline void __init check_prealloc(struct maple_tree *mt)
 	mas_set_range(&mas, 1, 100);
 	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_NOWAIT) == 0);
 	allocated = mas_allocated(&mas);
-	height = mas_mt_height(&mas);
 	MT_BUG_ON(mt, allocated != 0);
 	mas_destroy(&mas);
 
@@ -35557,22 +35615,21 @@ static noinline void __init check_prealloc(struct maple_tree *mt)
 	/* Spanning store */
 	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
 	allocated = mas_allocated(&mas);
-	height = mas_mt_height(&mas);
-	vacant_height = get_vacant_height(&wr_mas, ptr);
+	get_vacant_height(&wr_mas, ptr);
 	MT_BUG_ON(mt, allocated == 0);
 	/*
 	 * vacant height cannot be used to compute the number of nodes needed
 	 * as the root contains two entries which means it is on the verge of
 	 * insufficiency. The worst case full height of the tree is needed.
+	 * expected_prealloc() captures this via the sufficient < vacant branch.
 	 */
-	MT_BUG_ON(mt, allocated != height * 3 + 1);
+	MT_BUG_ON(mt, allocated != expected_prealloc(&wr_mas, ptr));
 	mas_store_prealloc(&mas, ptr);
 	MT_BUG_ON(mt, mas_allocated(&mas) != 0);
 	mas_set_range(&mas, 0, 200);
 	mt_set_non_kernel(1);
 	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_NOWAIT) == 0);
 	allocated = mas_allocated(&mas);
-	height = mas_mt_height(&mas);
 	MT_BUG_ON(mt, allocated != 0);
 
 	/* Chaining multiple preallocations */
@@ -35733,7 +35790,7 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 
 		mas_set(&mas, 0);
 		mas_start(&mas);
-		boundary = ma_pivots(mas_mn(&mas), mte_node_type(mas.node))[0];
+		boundary = ma_pivot(mas_mn(&mas), mte_node_type(mas.node), 0);
 
 		/* Ensure the parent node at the boundary is full. */
 		mas_set(&mas, boundary);
@@ -35889,64 +35946,99 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 }
 /* End of spanning write testing */
 
-/* Writes to a NULL area that are adjacent to other NULLs */
-static noinline void __init check_null_expand(struct maple_tree *mt)
+/*
+ * Find a value that has a null before and after it in the same leaf node, and
+ * one that will not cause the node to be completely consumed on rebalance.
+ */
+static __init unsigned long find_val_null_surrounded(struct ma_state *mas,
+		unsigned long base, unsigned long from, int nvals)
 {
-	unsigned long i, max = 100;
+	unsigned char span = 2 * nvals - 1;
+	unsigned long v;
+
+	for (v = from; v <= 990; v += 10) {
+		mas_set(mas, base + v);
+		if (!mas_walk(mas))
+			continue;
+		if (mas->offset < 1 || mas->offset + span > mas->end)
+			continue;
+		if (mas->end - 2 * nvals < mt_min_slots[mte_node_type(mas->node)])
+			continue;
+		return v;
+	}
+	return 0;
+}
+
+/* Writes to a NULL area that are adjacent to other NULLs */
+static __init void check_null_expand_base(struct maple_tree *mt,
+		unsigned long base)
+{
+	unsigned long i, max = 100, v;
 	unsigned char data_end;
-	MA_STATE(mas, mt, 959, 959);
+	MA_STATE(mas, mt, 0, 0);
 
 	for (i = 0; i <= max; i++)
-		mtree_test_store_range(mt, i * 10, i * 10 + 5, &i);
-	/* Test expanding null at start. */
+		mtree_test_store_range(mt, base + i * 10, base + i * 10 + 5, &i);
+	/* A surrounded value must sit in a leaf under an internal node. */
+	MT_BUG_ON(mt, mt_height(mt) < 2);
 	mas_lock(&mas);
-	mas_walk(&mas);
+
+	/* Test expanding null at start. */
+	v = find_val_null_surrounded(&mas, base, 10, 1);
+	MT_BUG_ON(mt, !v);
 	data_end = mas_data_end(&mas);
-	mas_set_range(&mas, 959, 963);
+	mas_set_range(&mas, base + v - 1, base + v + 3);
 	mas_store_gfp(&mas, NULL, GFP_KERNEL);
-	MT_BUG_ON(mt, mtree_load(mt, 963) != NULL);
+	MT_BUG_ON(mt, mtree_load(mt, base + v + 3) != NULL);
 	MT_BUG_ON(mt, data_end != mas_data_end(&mas));
 
 	/* Test expanding null at end. */
-	mas_set(&mas, 880);
-	mas_walk(&mas);
+	v = find_val_null_surrounded(&mas, base, v + 20, 1);
+	MT_BUG_ON(mt, !v);
 	data_end = mas_data_end(&mas);
-	mas_set_range(&mas, 884, 887);
+	mas_set_range(&mas, base + v + 4, base + v + 7);
 	mas_store_gfp(&mas, NULL, GFP_KERNEL);
-	MT_BUG_ON(mt, mtree_load(mt, 884) != NULL);
-	MT_BUG_ON(mt, mtree_load(mt, 889) != NULL);
-#if CONFIG_64BIT
+	MT_BUG_ON(mt, mtree_load(mt, base + v + 4) != NULL);
+	MT_BUG_ON(mt, mtree_load(mt, base + v + 9) != NULL);
 	MT_BUG_ON(mt, data_end != mas_data_end(&mas));
-#endif
 
 	/* Test expanding null at start and end. */
-	mas_set(&mas, 890);
-	mas_walk(&mas);
+	v = find_val_null_surrounded(&mas, base, v + 20, 1);
+	MT_BUG_ON(mt, !v);
 	data_end = mas_data_end(&mas);
-	mas_set_range(&mas, 900, 905);
+	mas_set_range(&mas, base + v, base + v + 5);
 	mas_store_gfp(&mas, NULL, GFP_KERNEL);
-	MT_BUG_ON(mt, mtree_load(mt, 899) != NULL);
-	MT_BUG_ON(mt, mtree_load(mt, 900) != NULL);
-	MT_BUG_ON(mt, mtree_load(mt, 905) != NULL);
-	MT_BUG_ON(mt, mtree_load(mt, 906) != NULL);
-#if CONFIG_64BIT
+	MT_BUG_ON(mt, mtree_load(mt, base + v - 1) != NULL);
+	MT_BUG_ON(mt, mtree_load(mt, base + v) != NULL);
+	MT_BUG_ON(mt, mtree_load(mt, base + v + 5) != NULL);
+	MT_BUG_ON(mt, mtree_load(mt, base + v + 6) != NULL);
 	MT_BUG_ON(mt, data_end - 2 != mas_data_end(&mas));
-#endif
 
 	/* Test expanding null across multiple slots. */
-	mas_set(&mas, 800);
-	mas_walk(&mas);
+	v = find_val_null_surrounded(&mas, base, v + 20, 2);
+	MT_BUG_ON(mt, !v);
 	data_end = mas_data_end(&mas);
-	mas_set_range(&mas, 810, 825);
+	mas_set_range(&mas, base + v, base + v + 15);
 	mas_store_gfp(&mas, NULL, GFP_KERNEL);
-	MT_BUG_ON(mt, mtree_load(mt, 809) != NULL);
-	MT_BUG_ON(mt, mtree_load(mt, 810) != NULL);
-	MT_BUG_ON(mt, mtree_load(mt, 825) != NULL);
-	MT_BUG_ON(mt, mtree_load(mt, 826) != NULL);
-#if CONFIG_64BIT
+	MT_BUG_ON(mt, mtree_load(mt, base + v - 1) != NULL);
+	MT_BUG_ON(mt, mtree_load(mt, base + v) != NULL);
+	MT_BUG_ON(mt, mtree_load(mt, base + v + 15) != NULL);
+	MT_BUG_ON(mt, mtree_load(mt, base + v + 16) != NULL);
 	MT_BUG_ON(mt, data_end - 4 != mas_data_end(&mas));
-#endif
 	mas_unlock(&mas);
+}
+
+static noinline void __init check_null_expand(struct maple_tree *mt)
+{
+	unsigned int flags __maybe_unused = mt->ma_flags;
+
+	check_null_expand_base(mt, 0);
+#if CONFIG_64BIT
+	/* Re-run with 64-bit nodes. */
+	mtree_destroy(mt);
+	mt_init_flags(mt, flags);
+	check_null_expand_base(mt, 0x100000000UL);
+#endif
 }
 /* End of NULL area expansions */
 
@@ -36634,11 +36726,12 @@ static noinline void __init check_multilevel_triple_split(struct maple_tree *mt)
 	struct ma_state mas;
 	int i, val, val2;
 	unsigned long index;
+	unsigned long base = MAPLE_32BIT ? 0 : (1UL + UINT_MAX);
 
 	for (i = 0; i <= 1200; i++) {
 		val = i*10;
 		val2 = (i+1)*10;
-		check_store_range(mt, val, val2, xa_mk_value(val), 0);
+		check_store_range(mt, base + val, base + val2, xa_mk_value(val), 0);
 		MT_BUG_ON(mt, mt_height(mt) >= 4);
 		mt_validate(mt);
 	}
@@ -36652,16 +36745,16 @@ static noinline void __init check_multilevel_triple_split(struct maple_tree *mt)
 	mas_reset(&mas);
 	/* Fill the second-to-last subtree of the root. */
 	mas_start(&mas);
-	index = ma_pivots(mas_mn(&mas),
-			  mte_node_type(mas.node))[mas_data_end(&mas) - 2] + 1;
+	index = ma_pivot(mas_mn(&mas), mte_node_type(mas.node),
+			 mas_data_end(&mas) - 2) + 1;
 	mas_set(&mas, index);
 	mas_start(&mas);
 	mas_internal_levels_fill(&mas);
 	mas_reset(&mas);
 	/* Fill the last subtree of the root */
 	mas_start(&mas);
-	index = ma_pivots(mas_mn(&mas),
-			  mte_node_type(mas.node))[mas_data_end(&mas) - 1] + 1;
+	index = ma_pivot(mas_mn(&mas), mte_node_type(mas.node),
+			 mas_data_end(&mas) - 1) + 1;
 	mas_set(&mas, index);
 	mas_start(&mas);
 	mas_internal_levels_fill(&mas);
@@ -36755,6 +36848,238 @@ static noinline void __init check_next_prev_two_level(struct maple_tree *mt)
 	mas_unlock(&mas);
 }
 
+static bool __init mt_find_gap_boundary_index(struct maple_tree *mt,
+		unsigned long min, unsigned long max,
+		unsigned long distance,
+		unsigned long avoid, unsigned long *index)
+{
+	MA_STATE(lmas, mt, min, min);
+	MA_STATE(rmas, mt, min, min);
+	unsigned long cand;
+	void *lentry;
+	void *rentry;
+
+	if (distance == 0 || max < min || max - min < distance)
+		return false;
+
+	rcu_read_lock();
+	for (cand = min; cand + distance <= max; cand++) {
+		if (cand == avoid)
+			continue;
+
+		mas_set(&lmas, cand);
+		lentry = mas_find(&lmas, cand);
+		if (lentry != xa_mk_value(cand))
+			continue;
+
+		mas_set(&rmas, cand + distance);
+		rentry = mas_find(&rmas, cand + distance);
+		if (rentry != xa_mk_value(cand + distance))
+			continue;
+
+		if (lmas.node != rmas.node) {
+			unsigned long e;
+			bool usable = true;
+
+			/*
+			 * The caller opens the gap by erasing cand+1 ..
+			 * cand+(distance-2).  A NULL written to a node's last
+			 * slot is a spanning store that rebalances and may merge
+			 * the two nodes, dissolving the boundary; erasing enough
+			 * entries to drop a node below min_slots rebalances too.
+			 * Only accept a boundary whose erased entries stay
+			 * interior to a node with room to lose them - this keeps
+			 * the test width-agnostic across born-32 node fan-outs.
+			 */
+			for (e = cand + 1; e + 1 < cand + distance; e++) {
+				MA_STATE(emas, mt, e, e);
+
+				if (mas_walk(&emas) != xa_mk_value(e) ||
+				    emas.max == e ||
+				    mas_data_end(&emas) <
+				    mt_min_slot_count(emas.node) + (distance - 2)) {
+					usable = false;
+					break;
+				}
+			}
+			if (!usable)
+				continue;
+
+			*index = cand;
+			rcu_read_unlock();
+			return true;
+		}
+	}
+	rcu_read_unlock();
+
+	return false;
+}
+
+static noinline void __init check_gap_combining(struct maple_tree *mt)
+{
+	struct maple_enode *mn1, *mn2;
+	void *entry;
+	unsigned long singletons = 100;
+	static const unsigned long seq2000[] = {
+		1152, 1151,
+		1100, 1200, 2,
+	};
+	static const unsigned long seq400[] = {
+		286, 318,
+		256, 260, 266, 270, 275, 280, 290, 398,
+		286, 310,
+	};
+	unsigned long index;
+	unsigned long index2;
+
+	MA_STATE(mas, mt, 0, 0);
+
+	MT_BUG_ON(mt, !mtree_empty(mt));
+	check_seq(mt, singletons, false); /* create 100 singletons. */
+
+	if (!mt_find_gap_boundary_index(mt, 60, 95, 4, ULONG_MAX, &index))
+		MT_BUG_ON(mt, !mt_find_gap_boundary_index(mt, 20, 95,
+						   4, ULONG_MAX, &index));
+
+	if (!mt_find_gap_boundary_index(mt, 20, 70, 5, index, &index2))
+		MT_BUG_ON(mt, !mt_find_gap_boundary_index(mt, 2, 95, 5,
+						   index, &index2));
+
+	mt_set_non_kernel(1);
+	mtree_test_erase(mt, index + 2);
+	check_load(mt, index + 2, NULL);
+	mtree_test_erase(mt, index + 1);
+	check_load(mt, index + 1, NULL);
+
+	rcu_read_lock();
+	mas_set(&mas, index);
+	entry = mas_find(&mas, ULONG_MAX);
+	MT_BUG_ON(mt, entry != xa_mk_value(index));
+	mn1 = mas.node;
+	mas_next(&mas, ULONG_MAX);
+	entry = mas_next(&mas, ULONG_MAX);
+	MT_BUG_ON(mt, entry != xa_mk_value(index + 4));
+	mn2 = mas.node;
+	MT_BUG_ON(mt, mn1 == mn2); /* test the test. */
+
+	/*
+	 * At this point, there is a gap of 2 at index + 1.
+	 */
+	mt_set_non_kernel(1);
+	mas_reset(&mas);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, index, index + 4, 2));
+	MT_BUG_ON(mt, mas.index != index + 1);
+	rcu_read_unlock();
+
+	index = index2;
+	mtree_test_erase(mt, index + 1);
+	check_load(mt, index + 1, NULL);
+	mtree_test_erase(mt, index + 2);
+	check_load(mt, index + 2, NULL);
+	mtree_test_erase(mt, index + 3);
+
+	rcu_read_lock();
+	mas.index = index;
+	mas.last = index;
+	mas_reset(&mas);
+	entry = mas_find(&mas, ULONG_MAX);
+	MT_BUG_ON(mt, entry != xa_mk_value(index));
+	mn1 = mas.node;
+	entry = mas_next(&mas, ULONG_MAX);
+	MT_BUG_ON(mt, entry != xa_mk_value(index + 4));
+	mas_next(&mas, ULONG_MAX); /* go to the next entry. */
+	mn2 = mas.node;
+	MT_BUG_ON(mt, mn1 == mn2); /* test the next entry is in the next node. */
+
+	/*
+	 * At this point, there is a gap of 3 at index + 1.
+	 */
+	mas_reset(&mas);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, index, index + 6, 3));
+	MT_BUG_ON(mt, mas.index != index + 1);
+	rcu_read_unlock();
+
+	mt_set_non_kernel(1);
+	mtree_store(mt, 80, NULL, GFP_KERNEL);
+	check_load(mt, 80, NULL);
+	check_load(mt, 81, xa_mk_value(81));
+	mtree_store(mt, 81, NULL, GFP_KERNEL);
+	check_load(mt, 80, NULL);
+	check_load(mt, 81, NULL);
+
+	mas_reset(&mas);
+	rcu_read_lock();
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 76, 82, 2));
+	MT_BUG_ON(mt, mas.index != 80);
+	mt_validate(mt);
+	rcu_read_unlock();
+
+	/*
+	 * *DEPRECATED: no retries anymore* Test retry entry in the start of a
+	 * gap.
+	 */
+	mt_set_non_kernel(2);
+	mtree_test_store_range(mt, 79, 81, NULL);
+	mtree_test_erase(mt, 82);
+	mas_reset(&mas);
+	rcu_read_lock();
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 76, 85, 4));
+	rcu_read_unlock();
+	MT_BUG_ON(mt, mas.index != 79);
+	mt_validate(mt);
+	mtree_destroy(mt);
+
+	/* seq 2000 tests are for multi-level tree gaps */
+	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
+	check_seq(mt, 2000, false);
+	mt_set_non_kernel(1);
+	mtree_test_erase(mt, seq2000[0]);
+	mtree_test_erase(mt, seq2000[1]);
+
+	mt_set_non_kernel(2);
+	mas_reset(&mas);
+	rcu_read_lock();
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, seq2000[2], seq2000[3],
+					     seq2000[4]));
+	MT_BUG_ON(mt, mas.index != seq2000[1]);
+	rcu_read_unlock();
+	mt_validate(mt);
+	mtree_destroy(mt);
+
+	/* seq 400 tests rebalancing over two levels. */
+	mt_set_non_kernel(99);
+	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
+	check_seq(mt, 400, false);
+	mtree_test_store_range(mt, seq400[0], seq400[1], NULL);
+	mt_set_non_kernel(0);
+	mtree_destroy(mt);
+
+	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
+	check_seq(mt, 400, false);
+	mt_set_non_kernel(50);
+	mtree_test_store_range(mt, seq400[2], seq400[9],
+			       xa_mk_value(seq400[2]));
+	mtree_test_store_range(mt, seq400[3], seq400[9],
+			       xa_mk_value(seq400[3]));
+	mtree_test_store_range(mt, seq400[4], seq400[9],
+			       xa_mk_value(seq400[4]));
+	mtree_test_store_range(mt, seq400[5], seq400[9],
+			       xa_mk_value(seq400[5]));
+	mtree_test_store_range(mt, seq400[0], seq400[9],
+			       xa_mk_value(seq400[0]));
+	mtree_test_store_range(mt, seq400[6], seq400[9],
+			       xa_mk_value(seq400[6]));
+	mtree_test_store_range(mt, seq400[7], seq400[9],
+			       xa_mk_value(seq400[7]));
+	mtree_test_store_range(mt, seq400[8], seq400[9],
+			       xa_mk_value(seq400[8]));
+	mtree_test_store_range(mt, seq400[10], seq400[11],
+			       xa_mk_value(seq400[10]));
+	mt_validate(mt);
+	mt_set_non_kernel(0);
+	mtree_destroy(mt);
+}
+
 void farmer_tests(void)
 {
 	struct maple_node *node;
@@ -36830,6 +37155,10 @@ void farmer_tests(void)
 	check_next_prev_two_level(&tree);
 	mtree_destroy(&tree);
 
+	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_gap_combining(&tree);
+	mtree_destroy(&tree);
+
 	if (!MAPLE_32BIT) {
 		/* Validate that a 64b specific bug doesn't return */
 		mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
@@ -36869,12 +37198,11 @@ static unsigned long get_last_index(struct ma_state *mas)
 {
 	struct maple_node *node = mas_mn(mas);
 	enum maple_type mt = mte_node_type(mas->node);
-	u64 *pivots = ma_pivots(node, mt);
 	unsigned long last_index = mas_data_end(mas);
 
 	BUG_ON(last_index == 0);
 
-	return pivots[last_index - 1] + 1;
+	return ma_pivot(node, mt, last_index - 1) + 1;
 }
 
 /*

@@ -765,6 +765,12 @@ static inline bool mas_is_err(struct ma_state *mas)
 	return mas->status == ma_error;
 }
 
+/* The largest index the tree can hold; width-dependent once 32-bit nodes land. */
+static __always_inline u64 mas_tree_max(const struct ma_state *mas)
+{
+	return ULONG_MAX;
+}
+
 /**
  * mas_reset() - Reset a Maple Tree operation state.
  * @mas: Maple Tree operation state.
