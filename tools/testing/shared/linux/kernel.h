@@ -12,6 +12,14 @@
 #include <linux/bitops.h>
 #include <linux/log2.h>
 #include "../../../include/linux/kconfig.h"
+#include <linux/types.h>
+
+#ifndef U32_MAX
+#define U32_MAX		((u32)~0U)
+#endif
+#ifndef U64_MAX
+#define U64_MAX		((u64)~0ULL)
+#endif
 
 #define printk printf
 #define pr_err printk
