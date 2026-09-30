@@ -1,0 +1,42 @@
+{maple_marks_v4¹//linux} $ KCONFIG_CONFIG=/home/jedix/dev/configs/config_deb fakeroot make bindeb-pkg
+  GEN     debian
+dpkg-buildpackage --build=binary --no-pre-clean --unsigned-changes -R'make -f debian/rules' -j1 -a$(cat debian/arch)
+dpkg-buildpackage: info: source package linux-upstream
+dpkg-buildpackage: info: source version 7.3.0~rc5-ga708c3d8f0ea-3
+dpkg-buildpackage: info: source distribution trixie
+dpkg-buildpackage: info: source changed by Liam R. Howlett <liam@infradead.org>
+dpkg-buildpackage: info: host architecture amd64
+ dpkg-source --before-build .
+ make -f debian/rules binary
+#
+# No change to /home/jedix/dev/configs/config_deb
+#
+  DESCEND objtool
+  UPD     init/utsversion-tmp.h
+  CC      init/version.o
+  AR      init/built-in.a
+  CC      lib/maple_tree.o
+  AR      lib/lib.a
+  AR      built-in.a
+  AR      built-in-fixup.a
+  COPY    vmlinux.a
+  LD      vmlinux.o
+  GEN     .vmlinux.objs
+  MODPOST Module.symvers
+  UPD     include/generated/utsversion.h
+  CC      init/version-timestamp.o
+  KSYMS   .tmp_vmlinux0.kallsyms.S
+  AS      .tmp_vmlinux0.kallsyms.o
+  LD      .tmp_vmlinux1
+ld: vmlinux.o: in function `aie2_get_sensors':
+/home/jedix/dev/linux/drivers/accel/amdxdna/aie2_pci.c:761:(.text+0xb59bc0): undefined reference to `amd_pmf_get_npu_data'
+ld: vmlinux.o: in function `npu4_update_counters':
+/home/jedix/dev/linux/drivers/accel/amdxdna/npu4_regs.c:131:(.text+0xb667f7): undefined reference to `amd_pmf_get_npu_data'
+make[5]: *** [scripts/Makefile.vmlinux:72: vmlinux.unstripped] Error 1
+make[4]: *** [Makefile:1387: vmlinux] Error 2
+make[3]: *** [debian/rules:80: build-arch] Error 2
+dpkg-buildpackage: error: make -f debian/rules binary subprocess returned exit status 2
+make[2]: *** [scripts/Makefile.package:126: bindeb-pkg] Error 2
+make[1]: *** [/home/jedix/dev/linux/Makefile:1839: bindeb-pkg] Error 2
+make: *** [Makefile:248: __sub-make] Error 2
+KCONFIG_CONFIG=/home/jedix/dev/configs/config_deb fakeroot make bindeb-pkg  52.09s user 26.89s system 82% cpu 1:35.96 total
