@@ -3407,7 +3407,6 @@ static inline void cp_data_calc(struct maple_copy *cp,
 	cp->data += cp->end + 1;
 	/* Data from right (offset + 1 to end), +1 for zero */
 	cp->data += r_wr_mas->mas->end - r_wr_mas->offset_end;
-	cp->dst_64b = (r_wr_mas->mas->max > U32_MAX) || (cp->max > U32_MAX);
 }
 
 static bool data_fits(struct ma_state *sib, struct ma_state *mas,
@@ -3419,10 +3418,13 @@ static bool data_fits(struct ma_state *sib, struct ma_state *mas,
 	unsigned char end;
 
 	type = mte_node_type(mas->node);
-	space = 2 * mt_slots[type];
-	end = sib->end;
+	/* No push across the 4G seam: mixed widths can take three nodes. */
+	if (node_is_32b(type) != node_is_32b(mte_node_type(sib->node)))
+		return false;
 
+	end = sib->end;
 	new_data = end + 1 + cp->data;
+	space = 2 * mt_slots[type];
 	if (new_data > space)
 		return false;
 
@@ -3507,7 +3509,6 @@ static inline void rebalance_data(struct maple_copy *cp,
 use_sib:
 
 	cp->data += sib->end + 1;
-	cp->dst_64b |= sib->max > U32_MAX;
 }
 
 /*
@@ -3526,13 +3527,14 @@ static inline void spanning_data(struct maple_copy *cp,
 {
 	enum maple_type type = r_wr_mas->type;
 
+	/* Data below the 4G seam may be born 32-bit: that minimum applies. */
+	type = node_born_type(type, r_wr_mas->mas->max);
 	cp_data_calc(cp, l_wr_mas, r_wr_mas);
 	if (((l_wr_mas->mas->min != 0) ||
 	     (r_wr_mas->mas->max != mas_tree_max(r_wr_mas->mas))) &&
 	    (cp->data <= mt_min_slots[type])) {
 		spanning_sib(l_wr_mas, r_wr_mas, sib);
 		cp->data += sib->end + 1;
-		cp->dst_64b |= sib->max > U32_MAX;
 	} else {
 		sib->end = 0;
 	}
@@ -3566,6 +3568,36 @@ static inline bool cp_data_null(struct maple_copy *cp, struct maple_tree *mt,
 }
 
 /*
+ * cp_data_32b() - The leading entries, across the sources, whose pivot fits a
+ * 32-bit node.
+ * @cp: The maple copy node
+ *
+ * Data ending below the 4G seam is all of them.  Otherwise a source below the
+ * seam counts whole and the pivots of the one across it are read.
+ */
+static inline unsigned char cp_data_32b(struct maple_copy *cp)
+{
+	struct ma_layout l;
+	unsigned char n = 0;
+	unsigned char s, off;
+
+	if (cp->src[cp->s_count - 1].max <= U32_MAX)
+		return cp->data;
+
+	for (s = 0; cp->src[s].max <= U32_MAX; s++)
+		n += cp->src[s].end - cp->src[s].start + 1;
+
+	ma_layout_of(&l, cp->src[s].node, cp->src[s].mt);
+	for (off = cp->src[s].start; off < cp->src[s].end; off++) {
+		if (ma_layout_pivot(&l, off) > U32_MAX)
+			break;
+		n++;
+	}
+
+	return n;
+}
+
+/*
  * dst_setup() - Set up one or more destinations for the new data.
  * @cp: The maple copy node
  * @mas: The maple state
@@ -3574,13 +3606,22 @@ static inline bool cp_data_null(struct maple_copy *cp, struct maple_tree *mt,
 static inline
 void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt)
 {
+	enum maple_type mt64 = node_transition_type(mt);
+	enum maple_type mt32 = node_born_type(mt64, 0);
+	unsigned char n32 = cp_data_32b(cp);
+	bool src32;
+	unsigned char i, n;
+
 	/* Data is 1 indexed, every src has +1 added.  */
 
-	/* Widen to 64-bit when the span needs it or the source already is; a
-	 * 64-bit source is never narrowed back to 32-bit. */
-	mt = node_born_type(node_transition_type(mt),
-			    (cp->dst_64b || !node_is_32b(mt)) ? U64_MAX : 0);
+	/* Widths only stay as they are when the whole write is 32-bit. */
+	src32 = n32 == cp->data;
+	for (i = 0; src32 && i < cp->s_count; i++)
+		if (cp->src[i].mt != maple_copy && !node_is_32b(cp->src[i].mt))
+			src32 = false;
 
+	/* Size by the width of the last entry; each dst is born to its own max. */
+	mt = (n32 == cp->data) ? mt32 : mt64;
 	if (cp->data <= mt_slots[mt]) {
 		cp->split = cp->data - 1;
 		cp->d_count = 1;
@@ -3601,17 +3642,54 @@ void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt)
 		goto node_setup;
 	}
 
+	/* A 32-bit prefix insufficient for a node of its own goes with the rest. */
+	if (n32 > mt_min_slots[mt32] && n32 != cp->data) {
+		/*
+		 * Mixed widths only straddle the 4G seam: keep what fits 32-bit
+		 * in one node and split just the 64-bit remainder, which is at
+		 * most mt_slots[mt64] + 2.
+		 */
+		unsigned char a = n32, r;
+
+		if (a > mt_slots[mt32] - 1)
+			a = mt_slots[mt32] - 1;
+		/* The 64-bit rest needs its own minimum too. */
+		if (a > cp->data - mt_min_slots[mt64] - 1)
+			a = cp->data - mt_min_slots[mt64] - 1;
+		r = cp->data - a;
+		cp->dst[0].size = a;
+		if (r < mt_slots[mt64]) {
+			cp->d_count = 2;
+			cp->dst[1].size = r;
+		} else {
+			cp->d_count = 3;
+			cp->dst[1].size = (r - 1) / 2 + 1;
+			cp->dst[2].size = r - cp->dst[1].size;
+		}
+		goto alloc;
+	}
+
 	/*
 	 * 3-way only happens on a triple-split spanning store of two full
 	 * same-type nodes, so cp->data == 2 * mt_slots[mt] + 1.  Fill the left
-	 * two, land the right on min.  Revisit for mixed-width nodes.
+	 * two, land the right on min.
 	 */
 	cp->split = (2 * mt_slots[mt] - mt_min_slots[mt]) / 2 - 1;
 	cp->d_count = 3;
 
 node_setup:
-	for (int i = 0; i < cp->d_count; i++) {
-		cp->dst[i].mt = mt;
+	for (i = 0; i < cp->d_count - 1; i++)
+		cp->dst[i].size = cp->split + 1;
+	cp->dst[i].size = cp->data - i * (cp->split + 1);
+
+alloc:
+	n = 0;
+	for (i = 0; i < cp->d_count; i++) {
+		n += cp->dst[i].size;
+		/* Otherwise a 32-bit node needs its own minimum. */
+		cp->dst[i].mt = (n <= n32 &&
+				 (src32 || cp->dst[i].size > mt_min_slots[mt32])) ?
+				mt32 : mt64;
 		cp->dst[i].node = ma_mnode_ptr(mas_pop_node(mas));
 	}
 }
@@ -3710,7 +3788,6 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 	unsigned char dst_offset;
 	unsigned char data_offset;
 	unsigned char src_end, s_offset;
-	unsigned char split;
 	u64 d_max;
 	unsigned char dst_size;
 	enum maple_type s_mt, d_mt;
@@ -3720,7 +3797,6 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 	/* Readability help */
 	s_offset = cp->src[s].start;
 	src_end = cp->src[s].end;
-	split = cp->split;
 	s_mt = cp->src[s].mt;
 	ma_layout_of(&sl, cp->src[s].node, s_mt);
 	sl.max = cp->src[s].max;
@@ -3729,7 +3805,7 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 		dst_offset = 0;
 		d_max = 0;
 		d_mt = cp->dst[d].mt;
-		dst_size = split + 1;
+		dst_size = cp->dst[d].size;
 		ma_layout_of(&dl, cp->dst[d].node, d_mt);
 
 		while (dst_size) {
@@ -3765,17 +3841,16 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 			data_offset += size;
 		}
 
-		split = cp->split;
 		cp->dst[d].max = d_max;
 		ma_finalise(&dl, dst_offset);
 		++d; /* Next destination */
-		if (d == cp->d_count - 1)
-			split = cp->data - data_offset;
-
 		if (d >= cp->d_count) {
 			WARN_ON(data_offset < cp->data);
 			return;
 		}
+
+		if (d == cp->d_count - 1)
+			cp->dst[d].size = cp->data - data_offset;
 
 	} while (data_offset <= cp->data);
 }
@@ -3841,18 +3916,10 @@ static inline bool cp_is_new_root(struct maple_copy *cp, struct ma_state *mas)
 
 		cp->data = cp->d_count;
 		cp->s_count = 0;
-		cp->dst_64b = cp->max > U32_MAX;
-		/*
-		 * A new root is born to the width of its data, not the
-		 * canonical 64-bit range type: a tree still bounded by U32_MAX
-		 * stays 32-bit.  Narrow the template before dst_setup() so
-		 * never-narrow (which would otherwise keep the _64 template)
-		 * cannot spuriously promote a born-32 tree.
-		 */
-		mt = node_born_type(mt, cp->dst_64b ? U64_MAX : 0);
-		dst_setup(cp, mas, mt);
-		mt = cp->dst[0].mt;	/* dst_setup may narrow to 32-bit */
 		init_cp_src(cp);
+		/* A new root is born to the width of its data. */
+		dst_setup(cp, mas, mt);
+		mt = cp->dst[0].mt;
 		ma_layout_of(&sl, cp->src[0].node, maple_copy);
 		sl.max = cp->max;
 		ma_layout_of(&dl, cp->dst[0].node, mt);
@@ -4933,10 +5000,8 @@ static inline void split_data(struct maple_copy *cp,
 	}
 
 	push_data_sib(cp, wr_mas->mas, sib, parent);
-	if (sib->end) {
+	if (sib->end)
 		cp->data = cp->data + sib->end + 1;
-		cp->dst_64b |= sib->max > U32_MAX;
-	}
 }
 
 /*
