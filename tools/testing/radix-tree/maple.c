@@ -345,7 +345,13 @@ static unsigned long __maybe_unused find_full_node_boundary(struct maple_tree *m
 }
 
 #define RCU_RANGE_COUNT 1000
-#define RCU_MT_BUG_ON(test, y) {if (y) { test->stop = true; } MT_BUG_ON(test->mt, y); }
+#define RCU_MT_BUG_ON(test, y) do {					\
+	int __y = !!(y);						\
+									\
+	if (__y)							\
+		test->stop = true;					\
+	MT_BUG_ON(test->mt, __y);					\
+} while (0)
 
 struct rcu_test_struct2 {
 	struct maple_tree *mt;
@@ -682,8 +688,9 @@ int mas_ce2_over_count(struct ma_state *mas_start, struct ma_state *mas_end,
 	entry = mas_next(&tmp, mas_end->last);
 	while (entry) {
 		BUG_ON(retry > 50); /* stop infinite retry on testing. */
-		if (xa_is_zero(s_entry)) {
+		if (xa_is_zero(entry)) {
 			retry++;
+			entry = mas_next(&tmp, mas_end->last);
 			continue;
 		}
 		count++;
@@ -34731,7 +34738,7 @@ static void rcu_stress(struct maple_tree *mt, bool forward)
 	mt_set_in_rcu(mt);
 	do {
 		usleep(5);
-	} while (test.thread_count > ARRAY_SIZE(readers));
+	} while (test.thread_count < ARRAY_SIZE(readers));
 
 	if (forward)
 		rcu_stress_fwd(mt, &test, count, test_reader);
@@ -35196,7 +35203,7 @@ static noinline void __init check_rcu_simulated(struct maple_tree *mt)
 static noinline void __init check_rcu_threaded(struct maple_tree *mt)
 {
 	unsigned long i, nr_entries = 1000;
-	struct rcu_test_struct vals;
+	struct rcu_test_struct vals = { };
 
 	vals.val_sleep = 200;
 	vals.loop_sleep = 110;
@@ -35234,9 +35241,9 @@ static noinline void __init check_rcu_threaded(struct maple_tree *mt)
 	vals.mt = mt;
 	vals.index = 4390;
 	vals.last = 4398;
-	vals.entry1 = xa_mk_value(4390);
-	vals.entry2 = xa_mk_value(439);
-	vals.entry3 = xa_mk_value(439);
+	vals.entry1 = xa_mk_value(439);
+	vals.entry2 = xa_mk_value(4390);
+	vals.entry3 = xa_mk_value(4390);
 	vals.seen_entry2 = 0;
 	vals.range_start = 4316;
 	vals.range_end = 5035;
@@ -37084,8 +37091,8 @@ static noinline void __init check_mtree_dup(struct maple_tree *mt)
 	/* Test memory allocation failed. */
 	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
 	for (i = 0; i < 30; i += 3) {
-		mtree_store_range(mt, j * 10, j * 10 + 5,
-					  xa_mk_value(j), GFP_KERNEL);
+		mtree_store_range(mt, i * 10, i * 10 + 5,
+					  xa_mk_value(i), GFP_KERNEL);
 	}
 
 	/* Failed at the first node. */
@@ -37179,6 +37186,7 @@ static void check_collapsing_rebalance(struct maple_tree *mt)
 	}
 
 	/* delete all entries one at a time, starting from the right */
+	mtree_lock(mt);
 	do {
 		mas_erase(&mas);
 	} while (mas_prev(&mas, 0) != NULL);

@@ -1527,11 +1527,11 @@ static noinline void __init check_root_expand(struct maple_tree *mt)
 	mas_store_gfp(&mas, ptr, GFP_KERNEL);
 	ptr = mas_next(&mas, ULONG_MAX);
 	MT_BUG_ON(mt, ptr != NULL);
-	MT_BUG_ON(mt, (mas.index != 1) && (mas.last != mas_tree_max(&mas)));
+	MT_BUG_ON(mt, (mas.index != 1) || (mas.last != mas_tree_max(&mas)));
 
 	mas_set(&mas, 1);
 	ptr = mas_prev(&mas, 0);
-	MT_BUG_ON(mt, (mas.index != 0) && (mas.last != 0));
+	MT_BUG_ON(mt, (mas.index != 0) || (mas.last != 0));
 	MT_BUG_ON(mt, ptr != (void *)((unsigned long) check_prev_entry | 1UL));
 
 	mas_unlock(&mas);
@@ -1545,11 +1545,11 @@ static noinline void __init check_root_expand(struct maple_tree *mt)
 	mas_store_gfp(&mas, ptr, GFP_KERNEL);
 	ptr = mas_next(&mas, ULONG_MAX);
 	MT_BUG_ON(mt, ptr != NULL);
-	MT_BUG_ON(mt, (mas.index != ULONG_MAX) && (mas.last != mas_tree_max(&mas)));
+	MT_BUG_ON(mt, (mas.index != 1) || (mas.last != mas_tree_max(&mas)));
 
 	mas_set(&mas, 1);
 	ptr = mas_prev(&mas, 0);
-	MT_BUG_ON(mt, (mas.index != 0) && (mas.last != 0));
+	MT_BUG_ON(mt, (mas.index != 0) || (mas.last != 0));
 	MT_BUG_ON(mt, ptr != (void *)((unsigned long) check_prev_entry | 2UL));
 
 
