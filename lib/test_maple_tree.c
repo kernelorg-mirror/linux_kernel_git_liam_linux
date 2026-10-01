@@ -3710,32 +3710,49 @@ static noinline void __init alloc_cyclic_testing(struct maple_tree *mt)
 	MT_BUG_ON(mt, ret != 1);
 }
 
+/*
+ * Destroy a copy of the tree under RCU at every fill of the nodes above the
+ * leaves.  Inserting at the right edge only changes the upper nodes when the
+ * last leaf splits or pushes, seen as its end dropping.  Growing to height 4
+ * and as far again takes the root through every child count at heights 2 and
+ * 3, and the right-most node two levels above the leaves through every count
+ * at height 4.  No node size or split policy is assumed.
+ */
 static noinline void __init check_range64_in_rcu(struct maple_tree *mt)
 {
-	unsigned long i;
-	unsigned long nr_entries = 226; /* Build a full maple_range_64 root node */
+	unsigned long i, grow = 0, dups = 0;
+	unsigned char end, last_end = 0;
+	struct maple_tree new;
+	MA_STATE(mas, mt, 0, 0);
 
 	MT_BUG_ON(mt, !mtree_empty(mt));
 	mt_init_flags(mt, MT_FLAGS_USE_RCU);
+	mt_init_flags(&new, MT_FLAGS_USE_RCU);
 
-	for (i = 0; i < nr_entries; i++) {
-		MT_BUG_ON(mt, mtree_test_insert_range(mt, i*10, i*10 + 9,
+	for (i = 0; !grow || i < 2 * grow; i++) {
+		MT_BUG_ON(mt, mtree_test_insert_range(mt, i * 10, i * 10 + 9,
 						      xa_mk_value(i)));
+		if (!grow && mt_height(mt) == 4)
+			grow = i;
+
+		mtree_lock(mt);
+		mas_set(&mas, i * 10);
+		mas_walk(&mas);
+		end = mas.end;
+		mtree_unlock(mt);
+		if (end > last_end) {
+			last_end = end;
+			continue;
+		}
+		last_end = end;
+
+		MT_BUG_ON(mt, mtree_dup(mt, &new, GFP_KERNEL));
+		mtree_destroy(&new);
+		if (!(++dups % 64))
+			rcu_barrier();
 	}
 
-	mtree_destroy(mt);
-	rcu_barrier();
-
-	nr_entries = 3166; /* Height 3. Root has 15 children + metadata */
-
-	MT_BUG_ON(mt, !mtree_empty(mt));
-	mt_init_flags(mt, MT_FLAGS_USE_RCU);
-
-	for (i = 0; i < nr_entries; i++) {
-		MT_BUG_ON(mt, mtree_test_insert_range(mt, i*10, i*10 + 9,
-						      xa_mk_value(i)));
-	}
-
+	MT_BUG_ON(mt, mt_height(mt) < 4);
 	mtree_destroy(mt);
 	rcu_barrier();
 }
