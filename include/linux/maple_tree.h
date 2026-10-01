@@ -240,6 +240,7 @@ struct maple_copy {
 		struct maple_node *node;
 		u64 max;
 		enum maple_type mt;
+		unsigned char size;
 	} dst[3];
 	struct {
 		struct maple_node *node;
@@ -271,7 +272,6 @@ struct maple_copy {
 	unsigned char data;
 	unsigned char write_off;
 	unsigned char height;
-	bool dst_64b;			/* Destination nodes need 64-bit pivots */
 };
 
 static_assert(sizeof(struct maple_copy) <= 256);
