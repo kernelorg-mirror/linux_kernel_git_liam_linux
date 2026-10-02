@@ -3658,7 +3658,7 @@ static bool spanning_ascend(struct maple_copy *cp, struct ma_state *mas,
 			    struct ma_wr_state *l_wr_mas, struct ma_wr_state *r_wr_mas,
 			    struct ma_state *sib)
 {
-	/* Promote from 32 to 64b */
+	/* A store past a 32-bit root widens the rightmost spine to the root. */
 	bool promote = !mas->root_64b && mas->last > U32_MAX;
 
 	if (sib->end) {
@@ -4479,6 +4479,9 @@ static inline bool mas_wr_extend_null(struct ma_wr_state *wr_mas)
 	}
 
 	if (spanning) {
+		/* NULL expansion cannot cause two inserts */
+		wr_mas->span_nodes = (node_is_32b(wr_mas->type) &&
+				      mas->root_64b) ? 3 : 2;
 		wr_mas->sufficient_height = 0;
 		wr_mas->vacant_height = 0;
 		mas_reset(mas);
@@ -4849,13 +4852,11 @@ static inline void mas_prealloc_calc(struct ma_wr_state *wr_mas, void *entry)
 		ret = 0;
 		break;
 	case wr_spanning_store:
-		/* A NULL may yet be extended into a neighbour; keep the walk's worth. */
-		if (!entry)
-			break;
 		if (wr_mas->sufficient_height < wr_mas->vacant_height)
-			ret = (height - wr_mas->sufficient_height) * 3 + 1;
+			ret = (height - wr_mas->sufficient_height) *
+			      wr_mas->span_nodes + 1;
 		else
-			ret = delta * 3 + 1;
+			ret = delta * wr_mas->span_nodes + 1;
 		break;
 	case wr_split_store:
 		ret = delta * 2 + 1;
@@ -4890,6 +4891,100 @@ static inline void mas_prealloc_calc(struct ma_wr_state *wr_mas, void *entry)
 }
 
 /*
+ * mas_wr_span_walk() - Walk both sides of a spanning store in step.
+ * @l_wr: The left write state, at the node the write spans
+ * @r_wr: The right write state, at the same node with the right index
+ *
+ * Return: true if a level pairs a 32-bit left node with a 64-bit right node.
+ * Only such a level can hold more than two 64-bit nodes of data without both
+ * sides being full; a 32-bit right node means every entry fits 32-bit and the
+ * data is sized to that.
+ */
+static bool mas_wr_span_walk(struct ma_wr_state *l_wr, struct ma_wr_state *r_wr)
+{
+	struct ma_state *l_mas = l_wr->mas;
+	struct ma_state *r_mas = r_wr->mas;
+	bool mixed = false;
+
+	while (true) {
+		mas_wr_walk_descend(l_wr);
+		mas_wr_walk_descend(r_wr);
+		if (node_is_32b(l_wr->type) && !node_is_32b(r_wr->type))
+			mixed = true;
+
+		l_wr->content = mas_slot_locked(l_mas, l_wr->slots, l_mas->offset);
+		r_wr->content = mas_slot_locked(r_mas, r_wr->slots, r_mas->offset);
+		if (ma_is_leaf(l_wr->type))
+			return mixed;
+
+		mas_wr_walk_traverse(l_wr);
+		mas_wr_walk_traverse(r_wr);
+	}
+}
+
+/*
+ * mas_wr_span_setup() - Settle the range and path of a spanning store.
+ * @wr_mas: The maple write state, stopped at the node the write spans
+ *
+ * The store takes the node holding last + 1 as its right side, to join a NULL
+ * there and to replace a node the write ends on; a NULL also grows over a NULL
+ * ending the previous node.  Do the same here so the heights recorded by the
+ * walk, and the nodes per level, are those the store will use.  Only a write
+ * cutting the last slot of a full left leaf whose right side starts a full
+ * node can 3-way split; a level mixing widths at the 4G seam is treated as if
+ * it could.
+ */
+static void mas_wr_span_setup(struct ma_wr_state *wr_mas)
+{
+	struct ma_state *mas = wr_mas->mas;
+	struct ma_state l_mas, r_mas;
+	MA_WR_STATE(l_wr, &l_mas, wr_mas->entry);
+	MA_WR_STATE(r_wr, &r_mas, wr_mas->entry);
+	u64 last = mas->last;
+	bool mixed;
+
+	if (mas->last < mas_tree_max(mas))
+		mas->last++;
+
+walk:
+	/* Walk to the right side the store will use for the true heights. */
+	mas_reset(mas);
+	wr_mas->sufficient_height = 0;
+	wr_mas->vacant_height = 0;
+	wr_mas->content = mas_start_wr(mas);
+	mas_wr_walk(wr_mas);
+	l_mas = *mas;
+	r_mas = *mas;
+	r_mas.index = r_mas.last;
+	mixed = mas_wr_span_walk(&l_wr, &r_wr);
+
+	if (!wr_mas->entry) {
+		if (!r_wr.content && r_wr.r_max > last)
+			last = r_wr.r_max;
+
+		/* Growing left into the previous node may move the span up. */
+		if (l_wr.content && !l_mas.offset &&
+		    l_mas.index == l_wr.r_min && l_mas.index &&
+		    mas_prev_is_null(&l_mas)) {
+			mas->index = l_mas.index;
+			goto walk;
+		}
+	}
+	mas->last = last;
+
+	if (mixed)
+		wr_mas->span_nodes = 3;
+	else if (l_mas.offset == l_mas.end &&
+		 l_mas.end == mt_slots[l_wr.type] - 1 &&
+		 !r_mas.offset && r_mas.end == mt_slots[r_wr.type] - 1 &&
+		 l_wr.r_min < mas->index &&
+		 (wr_mas->entry || (l_wr.content && r_wr.content)))
+		wr_mas->span_nodes = 3;
+	else
+		wr_mas->span_nodes = 2;
+}
+
+/*
  * mas_wr_store_type() - Determine the store type for a given
  * store operation.
  * @wr_mas: The maple write state
@@ -4907,8 +5002,10 @@ static inline enum store_type mas_wr_store_type(struct ma_wr_state *wr_mas)
 	if (unlikely(mas_is_none(mas) || mas_is_ptr(mas)))
 		return wr_store_root;
 
-	if (unlikely(!mas_wr_walk(wr_mas)))
+	if (unlikely(!mas_wr_walk(wr_mas))) {
+		mas_wr_span_setup(wr_mas);
 		return wr_spanning_store;
+	}
 
 	/* At this point, we are at the leaf node that needs to be altered. */
 	mas_wr_end_piv(wr_mas);
