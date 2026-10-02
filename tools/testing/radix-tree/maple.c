@@ -280,15 +280,16 @@ static void __maybe_unused mas_fill_node_at_depth(struct maple_tree *mt,
 	}
 }
 
-/* Fill both sides of the first root boundary full at every level. */
-static void __maybe_unused fill_both_sides_of_first_root_pivot(struct maple_tree *mt)
+/* Fill the branches either side of root pivot @offset full at every level. */
+static void __maybe_unused fill_root_branches(struct maple_tree *mt,
+		unsigned char offset)
 {
 	MA_STATE(mas, mt, 0, 0);
 	unsigned long boundary;
 	unsigned char d, height;
 
 	mas_start(&mas);
-	boundary = ma_pivot(mas_mn(&mas), mte_node_type(mas.node), 0);
+	boundary = ma_pivot(mas_mn(&mas), mte_node_type(mas.node), offset);
 	height = mt_height(mt);
 
 	for (d = 1; d <= height; d++) {
@@ -36182,9 +36183,12 @@ static unsigned long expected_prealloc(struct ma_wr_state *wr_mas, void *entry)
 	case wr_slot_store:
 		return 0;
 	case wr_spanning_store:
+		if (!wr_mas->span_nodes)
+			return height * 3 + 1;
 		if (wr_mas->sufficient_height < wr_mas->vacant_height)
-			return (height - wr_mas->sufficient_height) * 3 + 1;
-		return delta * 3 + 1;
+			return (height - wr_mas->sufficient_height) *
+			       wr_mas->span_nodes + 1;
+		return delta * wr_mas->span_nodes + 1;
 	case wr_split_store:
 		return delta * 2 + 1;
 	case wr_rebalance:
@@ -36235,6 +36239,43 @@ static noinline void __init check_prealloc(struct maple_tree *mt)
 	mas_destroy(&mas);
 	allocated = mas_allocated(&mas);
 	MT_BUG_ON(mt, allocated != 0);
+
+	/* From a leaf's first slot it cannot 3-way split: two nodes a level. */
+	mas_set_range(&mas, 1, 300);
+	mas_wr_preallocate(&wr_mas, ptr);
+	MT_BUG_ON(mt, mas.store_type != wr_spanning_store);
+	MT_BUG_ON(mt, wr_mas.span_nodes != 2);
+	allocated = mas_allocated(&mas);
+	get_vacant_height(&wr_mas, ptr);
+	MT_BUG_ON(mt, allocated != expected_prealloc(&wr_mas, ptr));
+	mas_destroy(&mas);
+
+	{
+		MA_WR_STATE(null_wr, &mas, NULL);
+
+		/* A NULL joining the next node's leading NULL takes its slot. */
+		i = find_value_ending_node(mt, &mas);
+		MT_BUG_ON(mt, !i);
+		mas_set_range(&mas, i, mas.last);
+		mas_wr_preallocate(&null_wr, NULL);
+		MT_BUG_ON(mt, mas.store_type != wr_spanning_store);
+		MT_BUG_ON(mt, null_wr.span_nodes != 2);
+		allocated = mas_allocated(&mas);
+		get_vacant_height(&null_wr, NULL);
+		MT_BUG_ON(mt, allocated != expected_prealloc(&null_wr, NULL));
+		mas_destroy(&mas);
+
+		/* A NULL spanning at walk time grows the same way. */
+		mas_set_range(&mas, i - 1, i + 6);
+		mas_wr_preallocate(&null_wr, NULL);
+		MT_BUG_ON(mt, mas.store_type != wr_spanning_store);
+		MT_BUG_ON(mt, null_wr.span_nodes != 2);
+		MT_BUG_ON(mt, mas.last != i + 9);
+		allocated = mas_allocated(&mas);
+		get_vacant_height(&null_wr, NULL);
+		MT_BUG_ON(mt, allocated != expected_prealloc(&null_wr, NULL));
+		mas_destroy(&mas);
+	}
 
 	mas_wr_preallocate(&wr_mas, ptr);
 	MT_BUG_ON(mt, mas_preallocate(&mas, ptr, GFP_KERNEL) != 0);
@@ -36488,7 +36529,7 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 	 * geometry-independent: it fills until the nodes are actually full,
 	 * so it works for any node fan-out.
 	 */
-	fill_both_sides_of_first_root_pivot(mt);
+	fill_root_branches(mt, 0);
 	{
 		unsigned long boundary;
 
@@ -36591,7 +36632,7 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 	/* Store a value across a node boundary that causes a 3 way split */
 
 	/* Prime the first root boundary so both sides are full at every level. */
-	fill_both_sides_of_first_root_pivot(mt);
+	fill_root_branches(mt, 0);
 	i = find_full_node_boundary(mt, &mas, false);
 	MT_BUG_ON(mt, !i);
 
@@ -36610,7 +36651,17 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 
 		/* Store a value spanning the boundary -> 3 way split. */
 		mas_set_range(&mas, vend, vend + 2);
-		mas_store_gfp(&mas, check_spanning_write, GFP_KERNEL);
+		{
+			MA_WR_STATE(wr_mas, &mas, check_spanning_write);
+
+			mt_set_non_kernel(100);
+			mas_wr_preallocate(&wr_mas, check_spanning_write);
+			mt_set_non_kernel(0);
+			MT_BUG_ON(mt, mas_is_err(&mas));
+			MT_BUG_ON(mt, mas.store_type != wr_spanning_store);
+			MT_BUG_ON(mt, wr_mas.span_nodes != 3);
+		}
+		mas_store_prealloc(&mas, check_spanning_write);
 		MT_BUG_ON(mt, mas.index != vend);
 		MT_BUG_ON(mt, mas.last != vend + 2);
 	}
@@ -36622,7 +36673,7 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 	 * the first root boundary (the previous store split part of it) and
 	 * detect a full-leaf boundary whose two sides have different parents.
 	 */
-	fill_both_sides_of_first_root_pivot(mt);
+	fill_root_branches(mt, 0);
 	i = find_full_node_boundary(mt, &mas, true);
 	MT_BUG_ON(mt, !i);
 	mas_set(&mas, i);
@@ -36643,6 +36694,84 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 		mas_store_gfp(&mas, check_spanning_write, GFP_KERNEL);
 	}
 	mt_validate(mt);
+
+	/*
+	 * A store ending on a parent's max: the write spans the parent, but the
+	 * right source is the full leaf after it, under the next parent, so the
+	 * leaf level still 3-way splits and the leaf written over is dropped.
+	 * The leaves around the first root pivot are index-dense after the
+	 * stores above and cannot be filled again, so start from a fresh tree.
+	 */
+	mtree_unlock(mt);
+	mtree_destroy(mt);
+	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
+	for (i = 0; i <= max; i++)
+		mtree_test_store_range(mt, i * 10, i * 10 + 5, &i);
+
+	mtree_lock(mt);
+	fill_root_branches(mt, 0);
+	mas_set(&mas, 0);
+	mas_start(&mas);
+	i = ma_pivot(mas_mn(&mas), mte_node_type(mas.node), 0);
+	/* The leaf ending on the first root pivot is full and ends in a value. */
+	mas_set(&mas, i);
+	MT_BUG_ON(mt, mas_walk(&mas) == NULL);
+	MT_BUG_ON(mt, mas.last != i);
+	MT_BUG_ON(mt, mas.offset != mas.end);
+	MT_BUG_ON(mt, mas.end != mt_slot_count(mas.node) - 1);
+	pnode = mte_parent(mas.node);
+	{
+		unsigned long pmax = i;		/* pnode's max, its last leaf's */
+		unsigned long amax;
+
+		/* The leaf after the pivot is full, under another parent. */
+		mas_set(&mas, i + 1);
+		mas_walk(&mas);
+		MT_BUG_ON(mt, mas.index != i + 1);
+		MT_BUG_ON(mt, mas.end != mt_slot_count(mas.node) - 1);
+		MT_BUG_ON(mt, mte_parent(mas.node) == pnode);
+
+		/* The leaf before it: full, the write starts inside its last slot. */
+		mas_set(&mas, i);
+		mas_walk(&mas);
+		test_mas_prev_node(&mas);
+		amax = mas.max;
+		mas_fill_node_at_depth(mt, amax, mt_height(mt), true);
+		mas_set(&mas, amax);
+		MT_BUG_ON(mt, mas_walk(&mas) == NULL);
+		if (mas.index == mas.last) {
+			mas_set_range(&mas, amax - 1, amax);
+			mas_store_gfp(&mas, xa_mk_value(amax - 1), GFP_KERNEL);
+			mas_fill_node_at_depth(mt, amax, mt_height(mt), true);
+			mas_set(&mas, amax);
+			MT_BUG_ON(mt, mas_walk(&mas) == NULL);
+		}
+		MT_BUG_ON(mt, mas.index == mas.last);
+		MT_BUG_ON(mt, mas.end != mt_slot_count(mas.node) - 1);
+		MT_BUG_ON(mt, mas.offset != mas.end);
+		MT_BUG_ON(mt, mte_parent(mas.node) != pnode);
+
+		mas_set_range(&mas, amax, pmax);
+		{
+			MA_WR_STATE(wr_mas, &mas, check_spanning_write);
+
+			mt_set_non_kernel(100);
+			mas_wr_preallocate(&wr_mas, check_spanning_write);
+			mt_set_non_kernel(0);
+			MT_BUG_ON(mt, mas_is_err(&mas));
+			MT_BUG_ON(mt, mas.store_type != wr_spanning_store);
+			MT_BUG_ON(mt, wr_mas.span_nodes != 3);
+		}
+		mas_store_prealloc(&mas, check_spanning_write);
+		MT_BUG_ON(mt, mas.index != amax || mas.last != pmax);
+		mt_validate(mt);
+		mas_set(&mas, pmax);
+		MT_BUG_ON(mt, mas_walk(&mas) != check_spanning_write);
+		MT_BUG_ON(mt, mas.index != amax);
+		mas_set(&mas, pmax + 1);
+		mas_walk(&mas);
+		MT_BUG_ON(mt, mas.index != pmax + 1);
+	}
 
 	mtree_unlock(mt);
 	mtree_destroy(mt);
@@ -37560,6 +37689,95 @@ static noinline void __init check_multilevel_triple_split(struct maple_tree *mt)
 		MT_BUG_ON(mt, mt_height(mt) != 4);
 }
 
+/*
+ * Fill @mt and find two neighbouring leaves: @l_min is the first node's min,
+ * @r_max the second's max.  Returns with @mas walked to the range after @r_max
+ * and the tree locked.
+ */
+static void whole_node_bounds(struct maple_tree *mt, struct ma_state *mas,
+		unsigned long *l_min, unsigned long *r_max)
+{
+	unsigned long i;
+
+	for (i = 0; i <= 1000; i++)
+		mtree_store_range(mt, i * 10, i * 10 + 5, xa_mk_value(i),
+				  GFP_KERNEL);
+
+	mtree_lock(mt);
+	mas_set(mas, 5000);
+	mas_walk(mas);
+	*l_min = mas->min;
+	mas_set(mas, mas->max + 1);
+	mas_walk(mas);
+	*r_max = mas->max;
+	mas_set(mas, *r_max + 1);
+	mas_walk(mas);
+}
+
+/*
+ * A spanning store from one node's first slot to another node's last slot
+ * takes the node after the last as its right source and frees the two.
+ */
+static noinline void __init check_spanning_whole_nodes(struct maple_tree *mt)
+{
+	unsigned long l_min, r_max, n_index, n_last, index, last;
+	void *n_entry, *val = xa_mk_value(0xf00d);
+	MA_STATE(mas, mt, 0, 0);
+	MA_WR_STATE(wr_mas, &mas, val);
+	MA_WR_STATE(null_wr, &mas, NULL);
+
+	whole_node_bounds(mt, &mas, &l_min, &r_max);
+	n_entry = mas_walk(&mas);
+	n_index = mas.index;
+	n_last = mas.last;
+
+	mas_set_range(&mas, l_min, r_max);
+	/* The fill above burns NOWAIT credits; grant them after it. */
+	mt_set_non_kernel(1000);
+	mas_wr_preallocate(&wr_mas, val);
+	MT_BUG_ON(mt, mas_is_err(&mas));
+	MT_BUG_ON(mt, mas.store_type != wr_spanning_store);
+	MT_BUG_ON(mt, wr_mas.span_nodes != 2);
+	mas_store_prealloc(&mas, val);
+	MT_BUG_ON(mt, mas.index != l_min || mas.last != r_max);
+	mt_validate(mt);
+	mas_set(&mas, r_max);
+	MT_BUG_ON(mt, mas_walk(&mas) != val || mas.index != l_min);
+	mas_set(&mas, r_max + 1);
+	MT_BUG_ON(mt, mas_walk(&mas) != n_entry);
+	MT_BUG_ON(mt, mas.index != n_index || mas.last != n_last);
+	mtree_unlock(mt);
+	mtree_destroy(mt);
+
+	/* A NULL over the same grows over the NULLs beside the two nodes. */
+	mt_init_flags(mt, mt_attr(mt));
+	whole_node_bounds(mt, &mas, &l_min, &r_max);
+	last = mas_walk(&mas) ? r_max : mas.last;
+	mas_set(&mas, l_min - 1);
+	index = mas_walk(&mas) ? l_min : mas.index;
+
+	mas_set_range(&mas, l_min, r_max);
+	mt_set_non_kernel(1000);
+	mas_wr_preallocate(&null_wr, NULL);
+	MT_BUG_ON(mt, mas_is_err(&mas));
+	MT_BUG_ON(mt, mas.store_type != wr_spanning_store);
+	MT_BUG_ON(mt, null_wr.span_nodes != 2);
+	MT_BUG_ON(mt, mas.index != index || mas.last != last);
+	mas_store_prealloc(&mas, NULL);
+	MT_BUG_ON(mt, mas.index != index || mas.last != last);
+	mt_validate(mt);
+	mas_set(&mas, index);
+	MT_BUG_ON(mt, mas_walk(&mas) || mas.index != index || mas.last != last);
+	mas_set(&mas, last + 1);
+	MT_BUG_ON(mt, !mas_walk(&mas));
+	if (index) {
+		mas_set(&mas, index - 1);
+		MT_BUG_ON(mt, !mas_walk(&mas));
+	}
+	mtree_unlock(mt);
+	mt_set_non_kernel(0);
+}
+
 /* next/prev across adjacent leaves with different parents. */
 static noinline void __init check_next_prev_two_level(struct maple_tree *mt)
 {
@@ -37907,6 +38125,10 @@ void farmer_tests(void)
 
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
 	check_spanning_write(&tree);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_spanning_whole_nodes(&tree);
 	mtree_destroy(&tree);
 
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);

@@ -658,6 +658,7 @@ struct ma_wr_state {
 	void *content;			/* The existing entry that is being overwritten */
 	unsigned char vacant_height;	/* Height of lowest node with free space */
 	unsigned char sufficient_height;/* Height of lowest node with min sufficiency + 1 nodes */
+	unsigned char span_nodes;	/* New nodes per level of a spanning store, 0 if unknown */
 };
 
 #define mas_lock(mas)           spin_lock(&((mas)->tree->ma_lock))
