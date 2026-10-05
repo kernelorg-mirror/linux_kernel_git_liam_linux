@@ -35394,19 +35394,20 @@ static void check_dfs_preorder(struct maple_tree *mt)
 	unsigned long count, max = 1000;
 	u64 hi = (u64)U32_MAX + 1;
 
+	/* Single indexes end up in dense leaves, so there are fewer nodes. */
 	if (!MAPLE_32BIT) {
 		/* Plain tree, 64-bit nodes (above UINT_MAX). */
 		mt_init_flags(mt, 0);
 		check_dfs_fill(mt, hi, max);
 		count = check_dfs_count(mt);
-		MT_BUG_ON(mt, count != 74);
+		MT_BUG_ON(mt, count != 62);
 		mtree_destroy(mt);
 
 		/* Alloc tree, 64-bit nodes. */
 		mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
 		check_dfs_fill(mt, hi, max);
 		count = check_dfs_count(mt);
-		MT_BUG_ON(mt, count != 77);
+		MT_BUG_ON(mt, count != 65);
 		mtree_destroy(mt);
 	}
 
@@ -35414,13 +35415,13 @@ static void check_dfs_preorder(struct maple_tree *mt)
 	mt_init_flags(mt, 0);
 	check_dfs_fill(mt, 0, max);
 	count = check_dfs_count(mt);
-	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 37 : 56));
+	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 32 : 49));
 	mtree_destroy(mt);
 
 	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
 	check_dfs_fill(mt, 0, max);
 	count = check_dfs_count(mt);
-	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 37 : 57));
+	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 34 : 50));
 	mtree_destroy(mt);
 
 	rcu_barrier();
@@ -35437,9 +35438,12 @@ static void count_node_widths(struct maple_tree *mt, unsigned int *n32,
 	mas_dfs_preorder(&mas);
 	*root32 = node_is_32b(mte_node_type(mas.node));
 	while (!mas_is_none(&mas)) {
-		if (node_is_32b(mte_node_type(mas.node)))
+		enum maple_type type = mte_node_type(mas.node);
+
+		/* A dense leaf has no pivots to be either width. */
+		if (node_is_32b(type))
 			(*n32)++;
-		else
+		else if (!ma_is_dense(type))
 			(*n64)++;
 		mas_dfs_preorder(&mas);
 	}
@@ -35480,8 +35484,8 @@ static enum maple_type leaf_type_at(struct maple_tree *mt, u64 index)
 }
 
 /*
- * Append pairs from @next until the right-most leaf has just split, leaving
- * room for a promotion to widen it in place.
+ * Append three-index ranges from @next until the right-most leaf has just
+ * split, leaving room for a promotion to widen it in place.
  */
 static u64 append_until_small(struct maple_tree *mt, u64 next)
 {
@@ -35500,13 +35504,16 @@ static u64 append_until_small(struct maple_tree *mt, u64 next)
 		mas_unlock(&mas);
 		if (small)
 			return next;
-		MT_BUG_ON(mt, mtree_store_range_u64(mt, next, next + 1,
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, next, next + 2,
 						    xa_mk_value(next), GFP_KERNEL));
-		next += 2;
+		next += 3;
 	}
 }
 
-/* Split pair ranges in the leaf holding @index until that leaf is full. */
+/*
+ * Split three-index ranges in the leaf holding @index until that leaf is full.
+ * Each leaves a single index and a pair, so the leaf never goes dense.
+ */
 static void split_pairs_until_full(struct maple_tree *mt, u64 index)
 {
 	MA_STATE(mas, mt, 0, 0);
@@ -35530,7 +35537,7 @@ static void split_pairs_until_full(struct maple_tree *mt, u64 index)
 		for (off = 0; off <= end; off++) {
 			lo = mas_safe_min(&mas, node, type, off);
 			up = mas_safe_pivot(&mas, node, type, off);
-			if (mas_get_slot(&mas, off) && up == lo + 1)
+			if (mas_get_slot(&mas, off) && up == lo + 2)
 				break;
 		}
 		mas_unlock(&mas);
@@ -35552,7 +35559,8 @@ static void check_born32_split(struct maple_tree *mt, unsigned int flags)
 	count_node_widths(mt, &n32, &n64, &root32);
 	MT_BUG_ON(mt, !root32);
 	MT_BUG_ON(mt, n64);
-	MT_BUG_ON(mt, n32 < 3);
+	/* The leaves are dense; the 32-bit nodes are the ones above them. */
+	MT_BUG_ON(mt, n32 < mt_height(mt) - 1);
 	mt_validate(mt);
 	mtree_destroy(mt);
 }
@@ -35579,7 +35587,8 @@ static void check_born32_promote_split(struct maple_tree *mt,
 	count_node_widths(mt, &n32, &n64, &root32);
 	MT_BUG_ON(mt, root32);
 	MT_BUG_ON(mt, n64 < 3);
-	MT_BUG_ON(mt, !n32);
+	/* With dense leaves, only a tree of three levels keeps 32-bit nodes. */
+	MT_BUG_ON(mt, mt_height(mt) > 2 && !n32);
 	for (i = 0; i < next; i++)
 		MT_BUG_ON(mt, mtree_load_u64(mt, i) != xa_mk_value(i));
 	MT_BUG_ON(mt, mtree_load_u64(mt, hi - 1) != NULL);
@@ -35646,7 +35655,8 @@ static void check_born32_promote_rebalance(struct maple_tree *mt,
 	MT_BUG_ON(mt, mtree_store_range_u64(mt, first, last, v, GFP_KERNEL));
 	count_node_widths(mt, &n32, &n64, &root32);
 	MT_BUG_ON(mt, root32);
-	MT_BUG_ON(mt, !n32);
+	/* With dense leaves, only a tree of three levels keeps 32-bit nodes. */
+	MT_BUG_ON(mt, mt_height(mt) > 2 && !n32);
 	for (i = 0; i < first; i++)
 		MT_BUG_ON(mt, mtree_load_u64(mt, i) != xa_mk_value(i));
 	MT_BUG_ON(mt, mtree_load_u64(mt, first) != v);
@@ -35761,9 +35771,9 @@ static void check_born32_seam(struct maple_tree *mt, unsigned int flags)
 
 	mt_init_flags(mt, flags);
 	for (i = 0; i < 600; i++)
-		MT_BUG_ON(mt, mtree_store_range_u64(mt, i * 2, i * 2 + 1,
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, i * 3, i * 3 + 2,
 						    xa_mk_value(i), GFP_KERNEL));
-	next = append_until_small(mt, 1200);
+	next = append_until_small(mt, 1800);
 	MT_BUG_ON(mt, mt_height(mt) < 2);
 
 	/* Promote; the right-most leaf widens in place to the only 64-bit leaf. */
@@ -37412,7 +37422,7 @@ extern void test_kmem_cache_bulk(void);
 static inline void check_spanning_store_height(struct maple_tree *mt)
 {
 	int index = 0;
-	int last = 140;
+	int last;
 	MA_STATE(mas, mt, 0, 0);
 	mas_lock(&mas);
 	while (mt_height(mt) != 3) {
@@ -37420,9 +37430,8 @@ static inline void check_spanning_store_height(struct maple_tree *mt)
 		mas_set(&mas, ++index);
 	}
 
-	if (MAPLE_32BIT)
-		last = 155; /* 32 bit higher branching factor. */
-
+	/* Dense leaves hold more, so keep 90 entries at each end. */
+	last = index - 90;
 	mas_set_range(&mas, 90, last);
 	mas_store_gfp(&mas, xa_mk_value(index), GFP_KERNEL);
 	MT_BUG_ON(mt, mas_mt_height(&mas) != 2);
@@ -37840,6 +37849,22 @@ static noinline void __init check_next_prev_two_level(struct maple_tree *mt)
 	mas_unlock(&mas);
 }
 
+/*
+ * Can the leaf of @mas lose @n interior single indexes without rebalancing?
+ * In a dense leaf they become one run of NULLs, which must leave it over the
+ * range leaf it would collapse to.
+ */
+static bool __init leaf_can_lose(struct ma_state *mas, unsigned long n)
+{
+	enum maple_type type = mte_node_type(mas->node);
+
+	if (ma_is_dense(type))
+		return ma_dense_cnt_ranges(mas->tree, mas_mn(mas), type, mas->max) -
+		       n + 1 > mt_slots[mt_leaf_type(mas->tree, mas->max)] - 1;
+
+	return mas_data_end(mas) >= mt_min_slot_count(mas->node) + n;
+}
+
 static bool __init mt_find_gap_boundary_index(struct maple_tree *mt,
 		unsigned long min, unsigned long max,
 		unsigned long distance,
@@ -37888,8 +37913,7 @@ static bool __init mt_find_gap_boundary_index(struct maple_tree *mt,
 
 				if (mas_walk(&emas) != xa_mk_value(e) ||
 				    emas.max == e ||
-				    mas_data_end(&emas) <
-				    mt_min_slot_count(emas.node) + (distance - 2)) {
+				    !leaf_can_lose(&emas, distance - 2)) {
 					usable = false;
 					break;
 				}

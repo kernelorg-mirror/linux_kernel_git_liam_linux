@@ -27,6 +27,8 @@
 #if defined(CONFIG_64BIT) || defined(BUILD_VDSO32_64)
 /* 64bit sizes */
 #define MAPLE_NODE_SLOTS	31	/* 256 bytes including ->parent */
+#define MAPLE_DENSE_SLOTS	30	/* 256 bytes with metadata */
+#define MAPLE_MDENSE_SLOTS	26	/* 250 bytes with marks and metadata */
 #define MAPLE_RANGE64_SLOTS	16	/* 256 bytes */
 #define MAPLE_ARANGE64_SLOTS	10	/* 240 bytes */
 #define MAPLE_MRANGE64_SLOTS	15
@@ -37,6 +39,8 @@
 #else
 /* 32bit sizes */
 #define MAPLE_NODE_SLOTS	63	/* 256 bytes including ->parent */
+#define MAPLE_DENSE_SLOTS	62	/* 256 bytes with metadata */
+#define MAPLE_MDENSE_SLOTS	49	/* 253 bytes with marks and metadata */
 #define MAPLE_RANGE64_SLOTS	21	/* 256 bytes, 64-bit pivots */
 #define MAPLE_ARANGE64_SLOTS	12	/* 248 bytes, 64-bit pivots */
 #define MAPLE_MRANGE64_SLOTS	19	/* 248 bytes, 64-bit pivots */
@@ -195,6 +199,26 @@ struct maple_mrange_32 {
 	uint8_t mark[MAPLE_MRANGE32_SLOTS];
 };
 
+/*
+ * A dense leaf has no pivots: slot i holds the entry for index min + i, so every
+ * entry is a single index or part of a run of NULLs.  The metadata end byte
+ * holds the excess: the entries over what the range leaf it would collapse to
+ * can hold.
+ */
+struct maple_dense {
+	struct maple_pnode *parent;
+	void __rcu *slot[MAPLE_DENSE_SLOTS];
+	struct maple_metadata meta;
+};
+
+/* A dense leaf with a mark per slot.  See maple_dense. */
+struct maple_mdense {
+	struct maple_pnode *parent;
+	void __rcu *slot[MAPLE_MDENSE_SLOTS];
+	uint8_t mark[MAPLE_MDENSE_SLOTS];
+	struct maple_metadata meta;
+};
+
 struct maple_topiary {
 	struct maple_pnode *parent;
 	struct maple_enode *next; /* Overlaps the pivot */
@@ -207,6 +231,7 @@ enum maple_type {
 	maple_leaf_64,
 	maple_leaf_32,
 	maple_dense,
+	maple_mdense,
 	maple_range_64,
 	maple_range_32,
 	maple_arange_64,
@@ -413,25 +438,25 @@ struct maple_tree {
  * we don't know what bits are unused on any given architecture.
  *
  * Nodes are 256 bytes in size and are also aligned to 256 bytes, giving us 8
- * low bits for our own purposes.  Nodes are currently of 4 types:
+ * low bits for our own purposes.  Nodes are currently of 5 types:
  * 1. Single pointer (Range is 0-0)
  * 2. Non-leaf Allocation Range nodes
  * 3. Non-leaf Range nodes
- * 4. Leaf Range nodes All nodes consist of a number of node slots,
- *    pivots, and a parent pointer.
+ * 4. Leaf Range nodes
+ * 5. Dense leaf nodes, which hold one index per slot and have no pivots
+ *
+ * The range and leaf range nodes come in a marks variant, which has a byte of
+ * marks per slot, and in a 32-bit pivot variant for trees within U32_MAX.  All
+ * nodes consist of a number of node slots, pivots, and a parent pointer.
+ *
+ * maple_copy is never in the tree, it's an internal type for writes.
  */
 
 struct maple_node {
 	union {
 		struct {
 			struct maple_pnode *parent;
-			union {
-				void __rcu *slot[MAPLE_NODE_SLOTS];
-				struct {
-					void __rcu *dense_pad[MAPLE_NODE_SLOTS - 1];
-					struct maple_metadata meta;
-				} dense;
-			};
+			void __rcu *slot[MAPLE_NODE_SLOTS];
 		};
 		struct {
 			void *pad;
@@ -448,6 +473,8 @@ struct maple_node {
 		struct maple_range_32 mr32;
 		struct maple_arange_32 ma32;
 		struct maple_mrange_32 mm32;
+		struct maple_dense dense;
+		struct maple_mdense mdense;
 		struct maple_copy cp;
 	};
 };
