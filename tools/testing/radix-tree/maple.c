@@ -37807,6 +37807,7 @@ static noinline void __init check_gap_combining(struct maple_tree *mt)
 	};
 	unsigned long index;
 	unsigned long index2;
+	unsigned long gap1, g;
 
 	MA_STATE(mas, mt, 0, 0);
 
@@ -37847,6 +37848,7 @@ static noinline void __init check_gap_combining(struct maple_tree *mt)
 	MT_BUG_ON(mt, mas.index != index + 1);
 	rcu_read_unlock();
 
+	gap1 = index;
 	index = index2;
 	mtree_test_erase(mt, index + 1);
 	check_load(mt, index + 1, NULL);
@@ -37875,18 +37877,26 @@ static noinline void __init check_gap_combining(struct maple_tree *mt)
 	MT_BUG_ON(mt, mas.index != index + 1);
 	rcu_read_unlock();
 
+	/* Ten entries clear of the two gaps made above. */
+	for (g = 80; g > 10; g -= 10) {
+		if ((g + 5 < gap1 || g - 4 > gap1 + 4) &&
+		    (g + 5 < index2 || g - 4 > index2 + 4))
+			break;
+	}
+	MT_BUG_ON(mt, g <= 10);
+
 	mt_set_non_kernel(1);
-	mtree_store(mt, 80, NULL, GFP_KERNEL);
-	check_load(mt, 80, NULL);
-	check_load(mt, 81, xa_mk_value(81));
-	mtree_store(mt, 81, NULL, GFP_KERNEL);
-	check_load(mt, 80, NULL);
-	check_load(mt, 81, NULL);
+	mtree_store(mt, g, NULL, GFP_KERNEL);
+	check_load(mt, g, NULL);
+	check_load(mt, g + 1, xa_mk_value(g + 1));
+	mtree_store(mt, g + 1, NULL, GFP_KERNEL);
+	check_load(mt, g, NULL);
+	check_load(mt, g + 1, NULL);
 
 	mas_reset(&mas);
 	rcu_read_lock();
-	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 76, 82, 2));
-	MT_BUG_ON(mt, mas.index != 80);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, g - 4, g + 2, 2));
+	MT_BUG_ON(mt, mas.index != g);
 	mt_validate(mt);
 	rcu_read_unlock();
 
@@ -37895,13 +37905,13 @@ static noinline void __init check_gap_combining(struct maple_tree *mt)
 	 * gap.
 	 */
 	mt_set_non_kernel(2);
-	mtree_test_store_range(mt, 79, 81, NULL);
-	mtree_test_erase(mt, 82);
+	mtree_test_store_range(mt, g - 1, g + 1, NULL);
+	mtree_test_erase(mt, g + 2);
 	mas_reset(&mas);
 	rcu_read_lock();
-	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 76, 85, 4));
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, g - 4, g + 5, 4));
 	rcu_read_unlock();
-	MT_BUG_ON(mt, mas.index != 79);
+	MT_BUG_ON(mt, mas.index != g - 1);
 	mt_validate(mt);
 	mtree_destroy(mt);
 
