@@ -35394,20 +35394,20 @@ static void check_dfs_preorder(struct maple_tree *mt)
 	unsigned long count, max = 1000;
 	u64 hi = (u64)U32_MAX + 1;
 
-	/* Single indexes end up in dense leaves, so there are fewer nodes. */
+	/* Single indexes fill dense leaves, so there are fewer nodes. */
 	if (!MAPLE_32BIT) {
 		/* Plain tree, 64-bit nodes (above UINT_MAX). */
 		mt_init_flags(mt, 0);
 		check_dfs_fill(mt, hi, max);
 		count = check_dfs_count(mt);
-		MT_BUG_ON(mt, count != 62);
+		MT_BUG_ON(mt, count != 40);
 		mtree_destroy(mt);
 
 		/* Alloc tree, 64-bit nodes. */
 		mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
 		check_dfs_fill(mt, hi, max);
 		count = check_dfs_count(mt);
-		MT_BUG_ON(mt, count != 65);
+		MT_BUG_ON(mt, count != 41);
 		mtree_destroy(mt);
 	}
 
@@ -35415,13 +35415,13 @@ static void check_dfs_preorder(struct maple_tree *mt)
 	mt_init_flags(mt, 0);
 	check_dfs_fill(mt, 0, max);
 	count = check_dfs_count(mt);
-	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 32 : 49));
+	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 19 : 38));
 	mtree_destroy(mt);
 
 	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
 	check_dfs_fill(mt, 0, max);
 	count = check_dfs_count(mt);
-	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 34 : 50));
+	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 19 : 39));
 	mtree_destroy(mt);
 
 	rcu_barrier();

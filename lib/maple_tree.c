@@ -5630,6 +5630,106 @@ static bool cp_fits_dense(struct maple_copy *cp, struct ma_wr_state *wr_mas,
 }
 
 /*
+ * push_dense_left() - Can a leaf that is being split push into a dense leaf on
+ * its left?
+ * @cp: The maple copy node
+ * @wr_mas: The maple write state of the leaf
+ * @sib: Set to the dense leaf if it can be used
+ * @parent: The parent of the leaf
+ *
+ * The entries over what the leaf holds must be single indexes or NULLs within
+ * the slots of the dense leaf, which then takes them and as many more as fit.
+ * The two together must not fit one dense leaf, as a split cannot drop a node.
+ */
+static bool push_dense_left(struct maple_copy *cp, struct ma_wr_state *wr_mas,
+		struct ma_state *sib, struct ma_state *parent)
+{
+	struct ma_state *mas = wr_mas->mas;
+	struct cp_iter it = { .next = mas->min };
+	unsigned char need, slots;
+	u64 first, last;
+	bool null;
+
+	if (mte_is_root(mas->node) || !parent->offset)
+		return false;
+
+	*sib = *parent;
+	sib->offset--;
+	mas_descend(sib);
+	sib->end = 0;
+	if (!ma_is_dense(mte_node_type(sib->node)))
+		return false;
+
+	slots = mt_slots[mte_node_type(sib->node)];
+	if (mas->max - sib->min < slots)
+		return false;
+
+	multi_src_setup(cp, wr_mas, wr_mas, sib);
+	it.offset = cp->src[0].start;
+	for (need = cp->data - mt_slots[wr_mas->type]; need; need--) {
+		first = it.next;
+		last = cp_iter_next(cp, mas->tree, &it, &null);
+		if ((!null && first != last) || last - sib->min >= slots)
+			return false;
+	}
+
+	sib->end = mas_data_end(sib);
+	return true;
+}
+
+/*
+ * push_dense_right() - Can a leaf that is being split push into a dense leaf
+ * on its right?
+ * @cp: The maple copy node
+ * @wr_mas: The maple write state of the leaf
+ * @sib: Set to the dense leaf if it can be used
+ * @parent: The parent of the leaf
+ *
+ * As push_dense_left(), for the last entries of the leaf: the dense leaf starts
+ * that much earlier.  The data ends in the dense leaf, so the leaf type of its
+ * max sizes what stays behind.
+ */
+static bool push_dense_right(struct maple_copy *cp, struct ma_wr_state *wr_mas,
+		struct ma_state *sib, struct ma_state *parent)
+{
+	struct ma_state *mas = wr_mas->mas;
+	struct cp_iter it = { .next = mas->min };
+	unsigned char slots, cap, k;
+	u64 first, last;
+	bool null;
+
+	if (mte_is_root(mas->node) || parent->offset >= parent->end)
+		return false;
+
+	*sib = *parent;
+	sib->offset++;
+	mas_descend(sib);
+	sib->end = 0;
+	if (!ma_is_dense(mte_node_type(sib->node)))
+		return false;
+
+	slots = mt_slots[mte_node_type(sib->node)];
+	cap = mt_slots[mt_leaf_type(mas->tree, sib->max)];
+	if (sib->max - mas->min < slots || cp->data <= cap)
+		return false;
+
+	multi_src_setup(cp, wr_mas, wr_mas, sib);
+	it.offset = cp->src[0].start;
+	for (k = 0; k < cp->data; k++) {
+		first = it.next;
+		last = cp_iter_next(cp, mas->tree, &it, &null);
+		if (k < cap)
+			continue;
+
+		if ((!null && first != last) || sib->max - first >= slots)
+			return false;
+	}
+
+	sib->end = mas_data_end(sib);
+	return true;
+}
+
+/*
  * split_data() - Calculate the @cp data, populate @sib if the data can be
  * pushed into a sibling.
  * @cp: The maple copy node
@@ -5650,13 +5750,25 @@ static inline void split_data(struct maple_copy *cp,
 		return;
 	}
 
-	/* A leaf that can turn into one dense leaf needs no sibling. */
-	if (ma_is_leaf(wr_mas->type) && cp_fits_dense(cp, wr_mas, sib))
-		return;
+	if (ma_is_leaf(wr_mas->type)) {
+		/* A leaf that can turn into one dense leaf needs no sibling. */
+		if (cp_fits_dense(cp, wr_mas, sib))
+			return;
+
+		/* A dense leaf beside it takes what it has room for. */
+		if (push_dense_left(cp, wr_mas, sib, parent))
+			goto use_sib;
+
+		if (push_dense_right(cp, wr_mas, sib, parent))
+			goto use_sib;
+	}
 
 	push_data_sib(cp, wr_mas->mas, sib, parent);
-	if (sib->end)
-		cp->data = cp->data + mas_data_count(sib);
+	if (!sib->end)
+		return;
+
+use_sib:
+	cp->data = cp->data + mas_data_count(sib);
 }
 
 /*
