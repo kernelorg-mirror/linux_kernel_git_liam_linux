@@ -3693,42 +3693,6 @@ no_push:
 }
 
 /*
- * rebalance_data() - Calculate the @cp data, populate @sib if insufficient or
- * if the data can be pushed into a sibling.
- * @cp: The maple copy node
- * @wr_mas: The left write maple state
- * @sib: The maple state of the sibling.
- *
- * Note: @cp->data is a size and not indexed by 0. @sib->end may be set to 0 to
- * indicate it will not be used.
- *
- */
-static inline void rebalance_data(struct maple_copy *cp,
-		struct ma_wr_state *wr_mas, struct ma_state *sib,
-		struct ma_state *parent)
-{
-	cp_data_calc(cp, wr_mas, wr_mas);
-	sib->end = 0;
-	if (cp->data > mt_slots[wr_mas->type]) {
-		push_data_sib(cp, wr_mas->mas, sib, parent);
-		if (sib->end)
-			goto use_sib;
-	} else if (cp->data <= mt_min_slots[wr_mas->type]) {
-		if ((wr_mas->mas->min != 0) ||
-		    (wr_mas->mas->max != mas_tree_max(wr_mas->mas))) {
-			rebalance_sib(parent, sib);
-			goto use_sib;
-		}
-	}
-
-	return;
-
-use_sib:
-
-	cp->data += mas_data_count(sib);
-}
-
-/*
  * spanning_data() - Calculate the @cp data and populate @sib if insufficient
  * @cp: The maple copy node
  * @l_wr_mas: The left write maple state
@@ -4758,6 +4722,7 @@ static inline bool rebalance_ascend(struct maple_copy *cp,
 	if (!sib->end) {
 		min = mas->min;
 		max = mas->max;
+		wr_mas->offset_end = parent->offset;
 	} else if (sib->min > mas->max) { /* Move right succeeded */
 		min = mas->min;
 		max = sib->max;
@@ -5981,6 +5946,24 @@ static inline bool split_ascend(struct maple_copy *cp,
 	return true;
 }
 
+/* Are the first @count entries of the sources single indexes or NULLs? */
+static bool cp_singles(struct maple_copy *cp, struct maple_tree *mt, u64 min,
+		unsigned char count)
+{
+	struct cp_iter it;
+	u64 first;
+	bool null;
+
+	cp_iter_start(&it, cp, min);
+	while (count--) {
+		first = it.next;
+		if (cp_iter_next(cp, mt, &it, &null) != first && !null)
+			return false;
+	}
+
+	return true;
+}
+
 /*
  * cp_fits_dense() - Does the data of a leaf that is being split fit one dense
  * leaf?
@@ -5995,24 +5978,13 @@ static bool cp_fits_dense(struct maple_copy *cp, struct ma_wr_state *wr_mas,
 		struct ma_state *sib)
 {
 	struct ma_state *mas = wr_mas->mas;
-	struct cp_iter it;
-	unsigned char k;
-	u64 first;
-	bool null;
 
 	if (mas->max - mas->min >= mt_slots[mt_dense_type(mas->tree)])
 		return false;
 
 	sib->end = 0;
 	multi_src_setup(cp, wr_mas, wr_mas, sib);
-	cp_iter_start(&it, cp, mas->min);
-	for (k = 0; k < cp->data; k++) {
-		first = it.next;
-		if (cp_iter_next(cp, mas->tree, &it, &null) != first && !null)
-			return false;
-	}
-
-	return true;
+	return cp_singles(cp, mas->tree, mas->min, cp->data);
 }
 
 /* Is the child at @offset of @parent a dense leaf?  Its slot says the type. */
@@ -6119,6 +6091,99 @@ static bool push_dense_right(struct maple_copy *cp, struct ma_wr_state *wr_mas,
 
 	sib->end = mas_data_end(sib);
 	return true;
+}
+
+/*
+ * merge_dense() - Check if two nodes can be merged into a dense node.
+ * @cp: The maple copy node
+ * @wr_mas: The maple write state of the leaf
+ * @sib: Set to the sibling if it can
+ * @parent: The parent of the leaf
+ */
+static bool merge_dense(struct maple_copy *cp, struct ma_wr_state *wr_mas,
+		struct ma_state *sib, struct ma_state *parent)
+{
+	struct ma_state *mas = wr_mas->mas;
+	unsigned char slots = mt_slots[mt_dense_type(mas->tree)];
+
+	if (mte_is_root(mas->node) || mas->max - mas->min >= slots)
+		return false;
+
+	if (parent->offset) {
+		*sib = *parent;
+		sib->offset--;
+		mas_descend(sib);
+		sib->end = mas_data_end(sib);
+		if (mas->max - sib->min < slots) {
+			multi_src_setup(cp, wr_mas, wr_mas, sib);
+			if (cp_singles(cp, mas->tree, sib->min,
+				       cp->data + mas_data_count(sib)))
+				return true;
+		}
+	}
+
+	if (parent->offset < parent->end) {
+		*sib = *parent;
+		sib->offset++;
+		mas_descend(sib);
+		sib->end = mas_data_end(sib);
+		if (sib->max - mas->min < slots) {
+			multi_src_setup(cp, wr_mas, wr_mas, sib);
+			if (cp_singles(cp, mas->tree, mas->min,
+				       cp->data + mas_data_count(sib)))
+				return true;
+		}
+	}
+
+	sib->end = 0;
+	return false;
+}
+
+/*
+ * rebalance_data() - Calculate the @cp data, populate @sib if insufficient or
+ * if the data can be pushed into a sibling.
+ * @cp: The maple copy node
+ * @wr_mas: The left write maple state
+ * @sib: The maple state of the sibling.
+ *
+ * Note: @cp->data is a size and not indexed by 0. @sib->end may be set to 0 to
+ * indicate it will not be used.
+ *
+ */
+static inline void rebalance_data(struct maple_copy *cp,
+		struct ma_wr_state *wr_mas, struct ma_state *sib,
+		struct ma_state *parent)
+{
+	cp_data_calc(cp, wr_mas, wr_mas);
+	sib->end = 0;
+	if (cp->data > mt_slots[wr_mas->type]) {
+		if (ma_is_leaf(wr_mas->type)) {
+			if (merge_dense(cp, wr_mas, sib, parent))
+				goto use_sib;
+
+			if (cp_fits_dense(cp, wr_mas, sib))
+				return;
+
+			if (push_dense_left(cp, wr_mas, sib, parent) ||
+			    push_dense_right(cp, wr_mas, sib, parent))
+				goto use_sib;
+		}
+
+		push_data_sib(cp, wr_mas->mas, sib, parent);
+		if (sib->end)
+			goto use_sib;
+	} else if (cp->data <= mt_min_slots[wr_mas->type]) {
+		if ((wr_mas->mas->min != 0) ||
+		    (wr_mas->mas->max != mas_tree_max(wr_mas->mas))) {
+			rebalance_sib(parent, sib);
+			goto use_sib;
+		}
+	}
+
+	return;
+
+use_sib:
+	cp->data += mas_data_count(sib);
 }
 
 /*
@@ -6498,6 +6563,44 @@ walk:
 }
 
 /*
+ * mas_wr_dense_merge() - Is the range of the node and sibling of a splitting
+ * node within the limit of a dense leaf?
+ * @wr_mas: The maple write state, at the leaf
+ *
+ * Before checking the data more closely (in the merge path), see if the
+ * combined limits of a sibling and the splitting node could be a dense leaf.
+ * noinline so the parent state it climbs with is not in the frame of every
+ * store.
+ */
+static noinline bool mas_wr_dense_merge(struct ma_wr_state *wr_mas)
+{
+	struct ma_state *mas = wr_mas->mas;
+	unsigned char slots = mt_slots[mt_dense_type(mas->tree)];
+	struct ma_state parent;
+	struct maple_node *node;
+	enum maple_type type;
+
+	if (mte_is_root(mas->node))
+		return false;
+
+	parent = *mas;
+	mas_ascend(&parent);
+	node = mas_mn(&parent);
+	type = mte_node_type(parent.node);
+	if (parent.offset &&
+	    mas->max - mas_safe_min(&parent, node, type, parent.offset - 1) <
+	    slots)
+		return true;
+
+	if (parent.offset < mas_data_end(&parent) &&
+	    mas_safe_pivot(&parent, node, type, parent.offset + 1) - mas->min <
+	    slots)
+		return true;
+
+	return false;
+}
+
+/*
  * mas_wr_store_type() - Determine the store type for a given
  * store operation.
  * @wr_mas: The maple write state
@@ -6553,8 +6656,14 @@ static inline enum store_type mas_wr_store_type(struct ma_wr_state *wr_mas)
 		return wr_node_store;
 	}
 
-	if (new_end >= mt_slots[wr_mas->type])
+	if (new_end >= mt_slots[wr_mas->type]) {
+		/* Two leaves that fit one dense leaf become one: a rebalance. */
+		if (mas->max - mas->min < mt_slots[mt_dense_type(mas->tree)] &&
+		    mas_wr_dense_merge(wr_mas))
+			return wr_rebalance;
+
 		return wr_split_store;
+	}
 
 	if (!in_rcu && appending)
 		return wr_append;
