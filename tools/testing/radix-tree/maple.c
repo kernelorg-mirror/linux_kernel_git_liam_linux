@@ -35365,14 +35365,27 @@ done:
 }
 
 
+/*
+ * Insert max+1 sequential entries based at u64 @base, each @range + 1 indexes.
+ * A range of 0 is single indexes, which end up in dense leaves.
+ */
+static void check_dfs_fill_range(struct maple_tree *mt, u64 base,
+		unsigned long max, unsigned long range)
+{
+	unsigned long i;
+	u64 index;
+
+	for (i = 0; i <= max; i++) {
+		index = base + i * (range + 1);
+		MT_BUG_ON(mt, mtree_insert_range_u64(mt, index, index + range,
+						     xa_mk_value(i), GFP_KERNEL));
+	}
+}
+
 /* Insert max+1 sequential singletons based at u64 @base. */
 static void check_dfs_fill(struct maple_tree *mt, u64 base, unsigned long max)
 {
-	unsigned long i;
-
-	for (i = 0; i <= max; i++)
-		MT_BUG_ON(mt, mtree_insert_u64(mt, base + i,
-					       xa_mk_value(i), GFP_KERNEL));
+	check_dfs_fill_range(mt, base, max, 0);
 }
 
 /* Count the DFS pre-order nodes of @mt. */
@@ -35389,40 +35402,70 @@ static unsigned long check_dfs_count(struct maple_tree *mt)
 	return count;
 }
 
+/* The nodes of a tree of @flags filled by check_dfs_fill_range(). */
+static unsigned long check_dfs_nodes(struct maple_tree *mt, unsigned int flags,
+		u64 base, unsigned long max, unsigned long range)
+{
+	unsigned long count;
+
+	mt_init_flags(mt, flags);
+	check_dfs_fill_range(mt, base, max, range);
+	mt_validate(mt);
+	count = check_dfs_count(mt);
+	mtree_destroy(mt);
+	return count;
+}
+
+/*
+ * Two-index entries stay in range leaves and keep the node counts.  Single
+ * indexes go dense and take fewer nodes.
+ */
 static void check_dfs_preorder(struct maple_tree *mt)
 {
+	/* Nodes for 64-bit pivots: range leaves, then dense. */
+	const unsigned long plain64 = 74, plain64_dense = 40;
+	const unsigned long alloc64 = 77, alloc64_dense = 41;
+	/* Nodes for born-32 trees, which depend on the build. */
+	unsigned long plain32, plain32_dense, alloc32, alloc32_dense;
 	unsigned long count, max = 1000;
 	u64 hi = (u64)U32_MAX + 1;
 
-	/* Single indexes fill dense leaves, so there are fewer nodes. */
+	if (MAPLE_32BIT) {
+		plain32 = 37;
+		plain32_dense = 19;
+		alloc32 = 37;
+		alloc32_dense = 19;
+	} else {
+		plain32 = 56;
+		plain32_dense = 38;
+		alloc32 = 57;
+		alloc32_dense = 39;
+	}
+
 	if (!MAPLE_32BIT) {
 		/* Plain tree, 64-bit nodes (above UINT_MAX). */
-		mt_init_flags(mt, 0);
-		check_dfs_fill(mt, hi, max);
-		count = check_dfs_count(mt);
-		MT_BUG_ON(mt, count != 40);
-		mtree_destroy(mt);
+		count = check_dfs_nodes(mt, 0, hi, max, 1);
+		MT_BUG_ON(mt, count != plain64);
+		count = check_dfs_nodes(mt, 0, hi, max, 0);
+		MT_BUG_ON(mt, count != plain64_dense);
 
 		/* Alloc tree, 64-bit nodes. */
-		mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
-		check_dfs_fill(mt, hi, max);
-		count = check_dfs_count(mt);
-		MT_BUG_ON(mt, count != 41);
-		mtree_destroy(mt);
+		count = check_dfs_nodes(mt, MT_FLAGS_ALLOC_RANGE, hi, max, 1);
+		MT_BUG_ON(mt, count != alloc64);
+		count = check_dfs_nodes(mt, MT_FLAGS_ALLOC_RANGE, hi, max, 0);
+		MT_BUG_ON(mt, count != alloc64_dense);
 	}
 
 	/* Plain tree, 32-bit nodes (born-32 at 0-max). */
-	mt_init_flags(mt, 0);
-	check_dfs_fill(mt, 0, max);
-	count = check_dfs_count(mt);
-	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 19 : 38));
-	mtree_destroy(mt);
+	count = check_dfs_nodes(mt, 0, 0, max, 1);
+	MT_BUG_ON(mt, count != plain32);
+	count = check_dfs_nodes(mt, 0, 0, max, 0);
+	MT_BUG_ON(mt, count != plain32_dense);
 
-	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
-	check_dfs_fill(mt, 0, max);
-	count = check_dfs_count(mt);
-	MT_BUG_ON(mt, count != (MAPLE_32BIT ? 19 : 39));
-	mtree_destroy(mt);
+	count = check_dfs_nodes(mt, MT_FLAGS_ALLOC_RANGE, 0, max, 1);
+	MT_BUG_ON(mt, count != alloc32);
+	count = check_dfs_nodes(mt, MT_FLAGS_ALLOC_RANGE, 0, max, 0);
+	MT_BUG_ON(mt, count != alloc32_dense);
 
 	rcu_barrier();
 }
@@ -35447,6 +35490,39 @@ static void count_node_widths(struct maple_tree *mt, unsigned int *n32,
 			(*n64)++;
 		mas_dfs_preorder(&mas);
 	}
+}
+
+static unsigned int count_dense_leaves(struct maple_tree *mt)
+{
+	unsigned int count = 0;
+	MA_STATE(mas, mt, 0, 0);
+
+	mas_dfs_preorder(&mas);
+	while (!mas_is_none(&mas)) {
+		if (ma_is_dense(mte_node_type(mas.node)))
+			count++;
+		mas_dfs_preorder(&mas);
+	}
+
+	return count;
+}
+
+/* Dense leaves of @mt with a slot to spare. */
+static unsigned int count_dense_partial(struct maple_tree *mt)
+{
+	unsigned int count = 0;
+	MA_STATE(mas, mt, 0, 0);
+
+	mas_dfs_preorder(&mas);
+	while (!mas_is_none(&mas)) {
+		enum maple_type type = mte_node_type(mas.node);
+
+		if (ma_is_dense(type) && mas.max - mas.min + 1 < mt_slots[type])
+			count++;
+		mas_dfs_preorder(&mas);
+	}
+
+	return count;
 }
 
 /* Append singletons from @next until the leaf holding the last value is full. */
@@ -35484,10 +35560,10 @@ static enum maple_type leaf_type_at(struct maple_tree *mt, u64 index)
 }
 
 /*
- * Append three-index ranges from @next until the right-most leaf has just
- * split, leaving room for a promotion to widen it in place.
+ * Append entries of @width indexes from @next until the right-most leaf has
+ * just split, leaving room for a promotion to widen it in place.
  */
-static u64 append_until_small(struct maple_tree *mt, u64 next)
+static u64 fill_to_split(struct maple_tree *mt, u64 next, unsigned long width)
 {
 	MA_STATE(mas, mt, 0, 0);
 
@@ -35504,17 +35580,17 @@ static u64 append_until_small(struct maple_tree *mt, u64 next)
 		mas_unlock(&mas);
 		if (small)
 			return next;
-		MT_BUG_ON(mt, mtree_store_range_u64(mt, next, next + 2,
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, next, next + width - 1,
 						    xa_mk_value(next), GFP_KERNEL));
-		next += 3;
+		next += width;
 	}
 }
 
 /*
- * Split three-index ranges in the leaf holding @index until that leaf is full.
- * Each leaves a single index and a pair, so the leaf never goes dense.
+ * Halve entries of @width indexes in the leaf holding @index until that leaf
+ * is full.  A width of 4 leaves pairs, which keep the leaf out of a dense leaf.
  */
-static void split_pairs_until_full(struct maple_tree *mt, u64 index)
+static void fill_leaf(struct maple_tree *mt, u64 index, unsigned long width)
 {
 	MA_STATE(mas, mt, 0, 0);
 
@@ -35537,39 +35613,50 @@ static void split_pairs_until_full(struct maple_tree *mt, u64 index)
 		for (off = 0; off <= end; off++) {
 			lo = mas_safe_min(&mas, node, type, off);
 			up = mas_safe_pivot(&mas, node, type, off);
-			if (mas_get_slot(&mas, off) && up == lo + 2)
+			if (mas_get_slot(&mas, off) && up == lo + width - 1)
 				break;
 		}
 		mas_unlock(&mas);
 		MT_BUG_ON(mt, off > end);
-		MT_BUG_ON(mt, mtree_store_range_u64(mt, lo, lo, xa_mk_value(0x5eed),
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, lo, lo + width / 2 - 1,
+						    xa_mk_value(0x5eed),
 						    GFP_KERNEL));
 	}
 }
 
-/* Stores below U32_MAX split 32-bit leaves into 32-bit leaves. */
-static void check_born32_split(struct maple_tree *mt, unsigned int flags)
+/*
+ * Stores below U32_MAX split 32-bit leaves into 32-bit leaves, or with a
+ * @range of 0 into dense leaves under 32-bit nodes.
+ */
+static void check_born32_split(struct maple_tree *mt, unsigned int flags,
+		unsigned long range)
 {
 	unsigned int n32, n64;
 	bool root32;
 
 	mt_init_flags(mt, flags);
-	check_dfs_fill(mt, 0, 1000);
+	check_dfs_fill_range(mt, 0, 1000, range);
 	MT_BUG_ON(mt, mt_height(mt) < 2);
 	count_node_widths(mt, &n32, &n64, &root32);
 	MT_BUG_ON(mt, !root32);
 	MT_BUG_ON(mt, n64);
-	/* The leaves are dense; the 32-bit nodes are the ones above them. */
-	MT_BUG_ON(mt, n32 < mt_height(mt) - 1);
+	if (range)
+		MT_BUG_ON(mt, n32 < 3);
+	else
+		MT_BUG_ON(mt, !count_dense_leaves(mt));
 	mt_validate(mt);
 	mtree_destroy(mt);
 }
 
-/* A full 32-bit leaf promoted by a store above U32_MAX splits into 64-bit. */
+/*
+ * A full 32-bit leaf promoted by a store above U32_MAX splits into 64-bit.
+ * With a @range of 0 the entries before it are in dense leaves, which take
+ * some of what the split would put in 64-bit leaves.
+ */
 static void check_born32_promote_split(struct maple_tree *mt,
-				       unsigned int flags)
+		unsigned int flags, unsigned long range)
 {
-	u64 hi = (u64)U32_MAX + 1;
+	u64 hi = (u64)U32_MAX + 1, top = 1001 * (range + 1);
 	unsigned int n32, n64;
 	unsigned long i;
 	enum maple_type t;
@@ -35577,8 +35664,8 @@ static void check_born32_promote_split(struct maple_tree *mt,
 	u64 next;
 
 	mt_init_flags(mt, flags);
-	check_dfs_fill(mt, 0, 1000);
-	next = fill_last_leaf(mt, 1001);
+	check_dfs_fill_range(mt, 0, 1000, range);
+	next = fill_last_leaf(mt, top);
 	/* A full 32-bit leaf holds more than a 64-bit leaf can. */
 	t = leaf_type_at(mt, next - 1);
 	MT_BUG_ON(mt, mt_slots[t] <= mt_slots[node_transition_type(t)]);
@@ -35586,11 +35673,13 @@ static void check_born32_promote_split(struct maple_tree *mt,
 					    GFP_KERNEL));
 	count_node_widths(mt, &n32, &n64, &root32);
 	MT_BUG_ON(mt, root32);
-	MT_BUG_ON(mt, n64 < 3);
-	/* With dense leaves, only a tree of three levels keeps 32-bit nodes. */
-	MT_BUG_ON(mt, mt_height(mt) > 2 && !n32);
+	if (range) {
+		MT_BUG_ON(mt, n64 < 3);
+		MT_BUG_ON(mt, !n32);
+	}
 	for (i = 0; i < next; i++)
-		MT_BUG_ON(mt, mtree_load_u64(mt, i) != xa_mk_value(i));
+		MT_BUG_ON(mt, mtree_load_u64(mt, i) !=
+			      xa_mk_value(i < top ? i / (range + 1) : i));
 	MT_BUG_ON(mt, mtree_load_u64(mt, hi - 1) != NULL);
 	MT_BUG_ON(mt, mtree_load_u64(mt, hi) != xa_mk_value(next));
 	MT_BUG_ON(mt, mtree_load_u64(mt, hi + 1) != NULL);
@@ -35627,11 +35716,15 @@ static void check_born32_deep_promote(struct maple_tree *mt,
 	mtree_destroy(mt);
 }
 
-/* A 64-bit spanning store leaves the promoted leaf below min: rebalance. */
-static void check_born32_promote_rebalance(struct maple_tree *mt,
-					   unsigned int flags)
+/*
+ * A 64-bit spanning store leaves the promoted leaf below min: rebalance.  With
+ * a @range of 0 the leaves before it are dense and have no width to count.
+ */
+static void check_born32_rebalance(struct maple_tree *mt, unsigned int flags,
+		unsigned long range)
 {
 	u64 hi = (u64)U32_MAX + 1, first, last = hi + 100, next;
+	u64 top = 1001 * (range + 1);
 	unsigned int n32, n64;
 	unsigned long i;
 	void *v = xa_mk_value(0x1234);
@@ -35640,25 +35733,26 @@ static void check_born32_promote_rebalance(struct maple_tree *mt,
 	MA_STATE(mas, mt, 0, 0);
 
 	mt_init_flags(mt, flags);
-	check_dfs_fill(mt, 0, 1000);
-	next = fill_last_leaf(mt, 1001);
+	check_dfs_fill_range(mt, 0, 1000, range);
+	next = fill_last_leaf(mt, top);
 
 	/* Keep two entries of the full right-most leaf, overwrite the rest. */
 	mas_lock(&mas);
 	mas_set_range(&mas, next - 1, next - 1);
 	MT_BUG_ON(mt, !mas_walk(&mas));
 	t = mte_node_type(mas.node);
-	first = mas.min + 2;
+	first = mas.min + 2 * (range + 1);
 	mas_unlock(&mas);
 	MT_BUG_ON(mt, 4 >= mt_min_slots[node_transition_type(t)]);
 
 	MT_BUG_ON(mt, mtree_store_range_u64(mt, first, last, v, GFP_KERNEL));
 	count_node_widths(mt, &n32, &n64, &root32);
 	MT_BUG_ON(mt, root32);
-	/* With dense leaves, only a tree of three levels keeps 32-bit nodes. */
-	MT_BUG_ON(mt, mt_height(mt) > 2 && !n32);
+	if (range)
+		MT_BUG_ON(mt, !n32);
 	for (i = 0; i < first; i++)
-		MT_BUG_ON(mt, mtree_load_u64(mt, i) != xa_mk_value(i));
+		MT_BUG_ON(mt, mtree_load_u64(mt, i) !=
+			      xa_mk_value(i < top ? i / (range + 1) : i));
 	MT_BUG_ON(mt, mtree_load_u64(mt, first) != v);
 	MT_BUG_ON(mt, mtree_load_u64(mt, next - 1) != v);
 	MT_BUG_ON(mt, mtree_load_u64(mt, hi) != v);
@@ -35722,11 +35816,12 @@ static void check_born32_seam(struct maple_tree *mt, unsigned int flags)
 	bool root32;
 	MA_STATE(mas, mt, 0, 0);
 
+	/* Four indexes an entry, so the left of the seam is never dense. */
 	mt_init_flags(mt, flags);
 	for (i = 0; i < 600; i++)
-		MT_BUG_ON(mt, mtree_store_range_u64(mt, i * 3, i * 3 + 2,
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, i * 4, i * 4 + 3,
 						    xa_mk_value(i), GFP_KERNEL));
-	next = append_until_small(mt, 1800);
+	next = fill_to_split(mt, 2400, 4);
 	MT_BUG_ON(mt, mt_height(mt) < 2);
 
 	/* Promote; the right-most leaf widens in place to the only 64-bit leaf. */
@@ -35744,7 +35839,7 @@ static void check_born32_seam(struct maple_tree *mt, unsigned int flags)
 
 	/* Fill both sides of the seam; together they overflow two 64-bit leaves. */
 	fill_last_leaf(mt, hi + 1);
-	split_pairs_until_full(mt, b_min - 1);
+	fill_leaf(mt, b_min - 1, 4);
 	MT_BUG_ON(mt, mt_slots[t32] <= mt_slots[t64]);
 
 	count_node_widths(mt, &n32, &n64, &root32);
@@ -35924,7 +36019,7 @@ static void check_born32_seam_sweep(struct maple_tree *mt, unsigned int flags)
 	for (i = 0; i < 2000; i++)
 		MT_BUG_ON(mt, mtree_store_range_u64(mt, i * 2, i * 2 + 1,
 						    xa_mk_value(i), GFP_KERNEL));
-	top32 = append_until_small(mt, 4000);
+	top32 = fill_to_split(mt, 4000, 2);
 	MT_BUG_ON(mt, mt_height(mt) < 3);
 	MT_BUG_ON(mt, mtree_store_range_u64(mt, hi, hi, v, GFP_KERNEL));
 	top64 = fill_last_leaf(mt, hi + 1);
@@ -36034,14 +36129,18 @@ static void check_born32(struct maple_tree *mt)
 	static const unsigned int flags[] = {
 		0, MT_FLAGS_ALLOC_RANGE, MT_FLAGS_MARKS, MT_FLAGS_USE_RCU,
 		MT_FLAGS_ALLOC_RANGE | MT_FLAGS_USE_RCU,
+		MT_FLAGS_MARKS | MT_FLAGS_USE_RCU,
 	};
 	unsigned int i;
 
 	for (i = 0; i < ARRAY_SIZE(flags); i++) {
-		check_born32_split(mt, flags[i]);
-		check_born32_promote_split(mt, flags[i]);
+		check_born32_split(mt, flags[i], 1);
+		check_born32_split(mt, flags[i], 0);
+		check_born32_promote_split(mt, flags[i], 1);
+		check_born32_promote_split(mt, flags[i], 0);
 		check_born32_deep_promote(mt, flags[i]);
-		check_born32_promote_rebalance(mt, flags[i]);
+		check_born32_rebalance(mt, flags[i], 1);
+		check_born32_rebalance(mt, flags[i], 0);
 		check_born32_walk(mt, flags[i]);
 		check_born32_seam(mt, flags[i]);
 		check_born32_seam_sweep(mt, flags[i]);
@@ -37371,20 +37470,36 @@ static noinline void __init check_mtree_dup(struct maple_tree *mt)
 
 extern void test_kmem_cache_bulk(void);
 
-static inline void check_spanning_store_height(struct maple_tree *mt)
+/*
+ * A spanning store that leaves few enough leaves drops a level.  Entries are
+ * @range + 1 indexes.  A @range of 0 fills dense leaves, which take more
+ * entries to reach three levels.
+ */
+static inline void check_spanning_store_height(struct maple_tree *mt,
+		unsigned long range)
 {
-	int index = 0;
-	int last;
+	unsigned long index = 0, first, last;
 	MA_STATE(mas, mt, 0, 0);
+
 	mas_lock(&mas);
 	while (mt_height(mt) != 3) {
+		mas_set_range(&mas, index * (range + 1),
+			      index * (range + 1) + range);
 		mas_store_gfp(&mas, xa_mk_value(index), GFP_KERNEL);
-		mas_set(&mas, ++index);
+		index++;
 	}
 
-	/* Dense leaves hold more, so keep 90 entries at each end. */
-	last = index - 90;
-	mas_set_range(&mas, 90, last);
+	if (range) {
+		/* 32 bit higher branching factor. */
+		first = 90 * (range + 1);
+		last = (MAPLE_32BIT ? 155 : 140) * (range + 1) + range;
+	} else {
+		/* Keep a few leaves at each end. */
+		first = 90;
+		last = index - 90;
+	}
+
+	mas_set_range(&mas, first, last);
 	mas_store_gfp(&mas, xa_mk_value(index), GFP_KERNEL);
 	MT_BUG_ON(mt, mas_mt_height(&mas) != 2);
 	mas_unlock(&mas);
@@ -37990,6 +38105,353 @@ static noinline void __init check_gap_combining(struct maple_tree *mt)
 	mtree_destroy(mt);
 }
 
+/* Single indexes end up in dense leaves, which collapse as they empty. */
+static noinline void __init check_dense(struct maple_tree *mt,
+		unsigned int flags)
+{
+	unsigned long i, max = 1000;
+	void *entry;
+	MA_STATE(mas, mt, 0, 0);
+
+	mt_init_flags(mt, flags);
+	for (i = 0; i <= max; i++)
+		MT_BUG_ON(mt, mtree_store(mt, i, xa_mk_value(i), GFP_KERNEL));
+
+	mt_validate(mt);
+	MT_BUG_ON(mt, !count_dense_leaves(mt));
+	/* The dense leaf on the left is topped up before a new one starts. */
+	MT_BUG_ON(mt, count_dense_partial(mt) > 2);
+	for (i = 0; i <= max; i++)
+		MT_BUG_ON(mt, mtree_load(mt, i) != xa_mk_value(i));
+	MT_BUG_ON(mt, mtree_load(mt, max + 1) != NULL);
+
+	i = 0;
+	rcu_read_lock();
+	mas_for_each(&mas, entry, ULONG_MAX) {
+		MT_BUG_ON(mt, entry != xa_mk_value(i));
+		MT_BUG_ON(mt, mas.index != i || mas.last != i);
+		i++;
+	}
+	rcu_read_unlock();
+	MT_BUG_ON(mt, i != max + 1);
+
+	/* A value over a value is one slot. */
+	for (i = 0; i <= max; i += 7)
+		MT_BUG_ON(mt, mtree_store(mt, i, xa_mk_value(i + 1), GFP_KERNEL));
+
+	mt_validate(mt);
+	for (i = 0; i <= max; i++)
+		MT_BUG_ON(mt, mtree_load(mt, i) != xa_mk_value(i + !(i % 7)));
+
+	/* A NULL with a value on each side leaves the leaf dense. */
+	for (i = 1; i <= max; i += 3)
+		MT_BUG_ON(mt, !mtree_erase(mt, i));
+
+	mt_validate(mt);
+	MT_BUG_ON(mt, !count_dense_leaves(mt));
+	for (i = 0; i <= max; i++)
+		MT_BUG_ON(mt, !mtree_load(mt, i) != (i % 3 == 1));
+
+	mas_set(&mas, 4);
+	rcu_read_lock();
+	MT_BUG_ON(mt, mas_walk(&mas) != NULL);
+	MT_BUG_ON(mt, mas.index != 4 || mas.last != 4);
+	rcu_read_unlock();
+
+	/* A range of a value cannot stay in a dense leaf. */
+	MT_BUG_ON(mt, mtree_store_range(mt, 500, 520, xa_mk_value(500),
+					GFP_KERNEL));
+	mt_validate(mt);
+	for (i = 500; i <= 520; i++)
+		MT_BUG_ON(mt, mtree_load(mt, i) != xa_mk_value(500));
+	MT_BUG_ON(mt, !mtree_load(mt, 498) || !mtree_load(mt, 521));
+
+	/* A NULL across dense leaves. */
+	MT_BUG_ON(mt, mtree_store_range(mt, 200, 400, NULL, GFP_KERNEL));
+	mt_validate(mt);
+	MT_BUG_ON(mt, mtree_load(mt, 200) || mtree_load(mt, 400));
+	MT_BUG_ON(mt, !mtree_load(mt, 198) || !mtree_load(mt, 402));
+
+	/* Runs of NULLs grow until each leaf collapses. */
+	for (i = 0; i <= max; i++) {
+		mtree_erase(mt, i);
+		MT_BUG_ON(mt, mtree_load(mt, i) != NULL);
+		if (!(i % 16))
+			mt_validate(mt);
+	}
+
+	mt_validate(mt);
+	MT_BUG_ON(mt, count_dense_leaves(mt));
+	mtree_destroy(mt);
+
+	/* Filling downwards tops up the dense leaf on the right. */
+	mt_init_flags(mt, flags);
+	for (i = max + 1; i-- > 0; )
+		MT_BUG_ON(mt, mtree_store(mt, i, xa_mk_value(i), GFP_KERNEL));
+
+	mt_validate(mt);
+	MT_BUG_ON(mt, !count_dense_leaves(mt));
+	MT_BUG_ON(mt, count_dense_partial(mt) > 2);
+	for (i = 0; i <= max; i++)
+		MT_BUG_ON(mt, mtree_load(mt, i) != xa_mk_value(i));
+	MT_BUG_ON(mt, mtree_load(mt, max + 1) != NULL);
+
+	i = max + 1;
+	mas_set(&mas, max);
+	rcu_read_lock();
+	while ((entry = mas_find_rev(&mas, 0))) {
+		i--;
+		MT_BUG_ON(mt, entry != xa_mk_value(i));
+		MT_BUG_ON(mt, mas.index != i || mas.last != i);
+	}
+	rcu_read_unlock();
+	MT_BUG_ON(mt, i != 0);
+	mtree_destroy(mt);
+}
+
+/*
+ * A run of NULLs may end or start a dense leaf, as one range, and a NULL on the
+ * other side of the edge joins it.
+ */
+static noinline void __init check_dense_edge(struct maple_tree *mt,
+		unsigned int flags)
+{
+	unsigned long i, max = 1000, l_max, r_min;
+	struct maple_enode *enode;
+	MA_STATE(mas, mt, 0, 0);
+
+	mt_init_flags(mt, flags);
+	for (i = 0; i <= max; i++)
+		MT_BUG_ON(mt, mtree_store(mt, i, xa_mk_value(i), GFP_KERNEL));
+
+	rcu_read_lock();
+	mas_set(&mas, 500);
+	MT_BUG_ON(mt, mas_walk(&mas) == NULL);
+	MT_BUG_ON(mt, !ma_is_dense(mte_node_type(mas.node)));
+	l_max = mas.max;
+	mas_set(&mas, l_max + 1);
+	MT_BUG_ON(mt, mas_walk(&mas) == NULL);
+	MT_BUG_ON(mt, !ma_is_dense(mte_node_type(mas.node)));
+	MT_BUG_ON(mt, mas.min != l_max + 1);
+	rcu_read_unlock();
+
+	/* A run at the end of the leaf. */
+	for (i = l_max - 2; i <= l_max; i++)
+		MT_BUG_ON(mt, !mtree_erase(mt, i));
+
+	mt_validate(mt);
+	rcu_read_lock();
+	mas_set(&mas, l_max);
+	MT_BUG_ON(mt, mas_walk(&mas) != NULL);
+	MT_BUG_ON(mt, mas.index != l_max - 2 || mas.last != l_max);
+	MT_BUG_ON(mt, !ma_is_dense(mte_node_type(mas.node)));
+	MT_BUG_ON(mt, mas.max != l_max);
+	rcu_read_unlock();
+
+	/* A NULL in the first slot of the next leaf joins the run. */
+	MT_BUG_ON(mt, !mtree_erase(mt, l_max + 1));
+	mt_validate(mt);
+	rcu_read_lock();
+	mas_set(&mas, l_max - 2);
+	MT_BUG_ON(mt, mas_walk(&mas) != NULL);
+	MT_BUG_ON(mt, mas.index != l_max - 2 || mas.last != l_max + 1);
+	enode = mas.node;
+	mas_set(&mas, l_max + 1);
+	MT_BUG_ON(mt, mas_walk(&mas) != NULL);
+	MT_BUG_ON(mt, mas.index != l_max - 2 || mas.last != l_max + 1);
+	MT_BUG_ON(mt, mas.node != enode);
+
+	/* Iterating over the run in both directions. */
+	mas_set(&mas, l_max - 3);
+	MT_BUG_ON(mt, mas_find(&mas, ULONG_MAX) != xa_mk_value(l_max - 3));
+	MT_BUG_ON(mt, mas_find(&mas, ULONG_MAX) != xa_mk_value(l_max + 2));
+	MT_BUG_ON(mt, mas.index != l_max + 2);
+	mas_set(&mas, l_max + 2);
+	MT_BUG_ON(mt, mas_find_rev(&mas, 0) != xa_mk_value(l_max + 2));
+	MT_BUG_ON(mt, mas_find_rev(&mas, 0) != xa_mk_value(l_max - 3));
+	MT_BUG_ON(mt, mas.index != l_max - 3);
+	rcu_read_unlock();
+
+	/* The same from the other side: a run at the start of a leaf. */
+	rcu_read_lock();
+	mas_set(&mas, 800);
+	MT_BUG_ON(mt, mas_walk(&mas) == NULL);
+	MT_BUG_ON(mt, !ma_is_dense(mte_node_type(mas.node)));
+	r_min = mas.min;
+	rcu_read_unlock();
+	for (i = r_min; i <= r_min + 2; i++)
+		MT_BUG_ON(mt, !mtree_erase(mt, i));
+
+	mt_validate(mt);
+	rcu_read_lock();
+	mas_set(&mas, r_min);
+	MT_BUG_ON(mt, mas_walk(&mas) != NULL);
+	MT_BUG_ON(mt, mas.index != r_min || mas.last != r_min + 2);
+	MT_BUG_ON(mt, !ma_is_dense(mte_node_type(mas.node)));
+	MT_BUG_ON(mt, mas.min != r_min);
+	rcu_read_unlock();
+
+	MT_BUG_ON(mt, !mtree_erase(mt, r_min - 1));
+	mt_validate(mt);
+	rcu_read_lock();
+	mas_set(&mas, r_min - 1);
+	MT_BUG_ON(mt, mas_walk(&mas) != NULL);
+	MT_BUG_ON(mt, mas.index != r_min - 1 || mas.last != r_min + 2);
+	enode = mas.node;
+	mas_set(&mas, r_min + 2);
+	MT_BUG_ON(mt, mas_walk(&mas) != NULL);
+	MT_BUG_ON(mt, mas.node != enode);
+	rcu_read_unlock();
+	mtree_destroy(mt);
+}
+
+/*
+ * Two leaves that together fit one dense leaf become one when the second
+ * overflows.  A range of a value keeps the fill from going dense, so it leaves
+ * narrow leaves of single indexes behind; erasing it then leaves a run to grow
+ * the leaf with.
+ */
+static noinline void __init check_dense_merge(struct maple_tree *mt,
+		unsigned int flags)
+{
+	u64 hi = (u64)U32_MAX + 1, i, j, v_first, v_last, b_min;
+	u64 b_max = U64_MAX, a_max = U64_MAX;
+	void *v = xa_mk_value(0x5eed);
+	bool merged = false;
+	unsigned char slots;
+	MA_STATE(mas, mt, 0, 0);
+
+	mt_init_flags(mt, flags);
+	slots = mt_slots[mt_dense_type(mt)];
+	/* Fill until a leaf of single indexes sits between the first and the last. */
+	for (i = hi; i < hi + 1000; i++) {
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, i, i, xa_mk_value(i - hi),
+						    GFP_KERNEL));
+		mas_lock(&mas);
+		mas_set_range(&mas, i, i);
+		MT_BUG_ON(mt, !mas_walk(&mas));
+		b_min = mas.min;
+		/* Before the first leaf, or the tail, this is a NULL. */
+		mas_set_range(&mas, b_min - 1, b_min - 1);
+		mas_walk(&mas);
+		v_first = mas.min;
+		v_last = mas.max;
+		mas_unlock(&mas);
+		if (v_first > hi)
+			break;
+	}
+	MT_BUG_ON(mt, v_first <= hi);
+
+	/* A value across that leaf and the last keeps both from going dense. */
+	v_first = v_last - 2;
+	v_last += 2;
+	MT_BUG_ON(mt, v_last > i);
+	MT_BUG_ON(mt, mtree_store_range_u64(mt, v_first, v_last, v, GFP_KERNEL));
+
+	/* Fill on until a leaf of single indexes follows the one with the value. */
+	for (i++; i < hi + 1000; i++) {
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, i, i, xa_mk_value(i - hi),
+						    GFP_KERNEL));
+		mas_lock(&mas);
+		mas_set_range(&mas, v_first, v_first);
+		MT_BUG_ON(mt, mas_walk(&mas) != v);
+		b_min = mas.min;
+		b_max = mas.max;
+		/* Past the tail this wraps to the leading NULL. */
+		mas_set_range(&mas, b_max + 1, b_max + 1);
+		mas_walk(&mas);
+		a_max = mas.max;
+		mas_unlock(&mas);
+		if (b_max < i && a_max < i)
+			break;
+	}
+	MT_BUG_ON(mt, b_max >= i || a_max >= i);
+	/* The two fit one dense leaf; the second cannot grow on its own. */
+	MT_BUG_ON(mt, a_max - b_min >= slots);
+	mt_validate(mt);
+
+	/* Erase the value and grow its leaf out of the run until it overflows. */
+	MT_BUG_ON(mt, mtree_store_range_u64(mt, v_first, v_last, NULL,
+					    GFP_KERNEL));
+	for (j = v_first + 1; j < v_last; j++) {
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, j, j, xa_mk_value(j - hi),
+						    GFP_KERNEL));
+		mas_lock(&mas);
+		mas_set_range(&mas, b_min, b_min);
+		MT_BUG_ON(mt, !mas_walk(&mas));
+		if (mas.max >= a_max) {
+			merged = true;
+			MT_BUG_ON(mt, !ma_is_dense(mte_node_type(mas.node)));
+			MT_BUG_ON(mt, mas.min != b_min || mas.max != a_max);
+		}
+		mas_unlock(&mas);
+		if (merged)
+			break;
+	}
+	MT_BUG_ON(mt, !merged);
+	mt_validate(mt);
+
+	for (i = hi; i < hi + 1000; i++) {
+		void *entry = mtree_load_u64(mt, i);
+
+		if (i == v_first || (i > j && i <= v_last))
+			MT_BUG_ON(mt, entry != NULL);
+		else if (entry)
+			MT_BUG_ON(mt, entry != xa_mk_value(i - hi));
+		else
+			break;
+	}
+	mtree_destroy(mt);
+}
+
+/* Marks sit beside the slots of a dense leaf and follow their entries. */
+static noinline void __init check_dense_marks(struct maple_tree *mt,
+		unsigned int flags)
+{
+	unsigned long i, max = 1000;
+	unsigned int n = 0;
+	MA_STATE(mas, mt, 0, 0);
+
+	mt_init_flags(mt, flags);
+	for (i = 0; i <= max; i++)
+		MT_BUG_ON(mt, mtree_store(mt, i, xa_mk_value(i), GFP_KERNEL));
+
+	MT_BUG_ON(mt, !count_dense_leaves(mt));
+	for (i = 0; i <= max; i += 10)
+		mtree_set_mark(mt, i, MT_MARK_1);
+
+	mt_validate(mt);
+	for (i = 0; i <= max; i++)
+		MT_BUG_ON(mt, mtree_get_mark(mt, i, MT_MARK_1) != !(i % 10));
+
+	mas_lock(&mas);
+	while (mas_find_marked(&mas, ULONG_MAX, MT_MARK_1)) {
+		MT_BUG_ON(mt, mas.index != n * 10 || mas.last != n * 10);
+		n++;
+	}
+	mas_unlock(&mas);
+	MT_BUG_ON(mt, n != max / 10 + 1);
+
+	/* A value over a marked value keeps the mark, a NULL drops it. */
+	MT_BUG_ON(mt, mtree_store(mt, 20, xa_mk_value(21), GFP_KERNEL));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 20, MT_MARK_1));
+	MT_BUG_ON(mt, !mtree_erase(mt, 30));
+	MT_BUG_ON(mt, mtree_get_mark(mt, 30, MT_MARK_1));
+	mt_validate(mt);
+
+	/* The marks go with their entries when the leaf collapses. */
+	for (i = 41; i < 70; i++) {
+		if (i % 10)
+			MT_BUG_ON(mt, !mtree_erase(mt, i));
+	}
+
+	mt_validate(mt);
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 50, MT_MARK_1));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 60, MT_MARK_1));
+	MT_BUG_ON(mt, mtree_get_mark(mt, 51, MT_MARK_1));
+	mtree_destroy(mt);
+}
+
 void farmer_tests(void)
 {
 	struct maple_node *node;
@@ -38025,6 +38487,27 @@ void farmer_tests(void)
 	mtree_destroy(&tree);
 	test_kmem_cache_bulk();
 
+	check_dense(&tree, 0);
+	check_dense(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_dense(&tree, MT_FLAGS_MARKS);
+	check_dense(&tree, MT_FLAGS_USE_RCU);
+	check_dense(&tree, MT_FLAGS_ALLOC_RANGE | MT_FLAGS_USE_RCU);
+	check_dense(&tree, MT_FLAGS_MARKS | MT_FLAGS_USE_RCU);
+	check_dense_marks(&tree, MT_FLAGS_MARKS);
+	check_dense_marks(&tree, MT_FLAGS_MARKS | MT_FLAGS_USE_RCU);
+	check_dense_edge(&tree, 0);
+	check_dense_edge(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_dense_edge(&tree, MT_FLAGS_MARKS);
+	check_dense_edge(&tree, MT_FLAGS_USE_RCU);
+	check_dense_edge(&tree, MT_FLAGS_ALLOC_RANGE | MT_FLAGS_USE_RCU);
+	check_dense_edge(&tree, MT_FLAGS_MARKS | MT_FLAGS_USE_RCU);
+	check_dense_merge(&tree, 0);
+	check_dense_merge(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_dense_merge(&tree, MT_FLAGS_MARKS);
+	check_dense_merge(&tree, MT_FLAGS_USE_RCU);
+	check_dense_merge(&tree, MT_FLAGS_ALLOC_RANGE | MT_FLAGS_USE_RCU);
+	check_dense_merge(&tree, MT_FLAGS_MARKS | MT_FLAGS_USE_RCU);
+
 	mt_init_flags(&tree, 0);
 	check_dfs_preorder(&tree);
 	mtree_destroy(&tree);
@@ -38050,7 +38533,11 @@ void farmer_tests(void)
 	mtree_destroy(&tree);
 
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
-	check_spanning_store_height(&tree);
+	check_spanning_store_height(&tree, 1);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_spanning_store_height(&tree, 0);
 	mtree_destroy(&tree);
 
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
