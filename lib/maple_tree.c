@@ -96,7 +96,8 @@
 static struct kmem_cache *maple_node_cache;
 
 static const u64 mt_max[] = {
-	[maple_dense]		= MAPLE_NODE_SLOTS - 1,
+	[maple_dense]		= U64_MAX,
+	[maple_mdense]		= U64_MAX,
 	[maple_mleaf_64]	= U64_MAX,
 	[maple_leaf_64]		= U64_MAX,
 	[maple_range_64]	= U64_MAX,
@@ -112,7 +113,8 @@ static const u64 mt_max[] = {
 #define mt_node_max(x) mt_max[mte_node_type(x)]
 
 static const unsigned char mt_slots[] = {
-	[maple_dense]		= MAPLE_NODE_SLOTS - 1,
+	[maple_dense]		= MAPLE_DENSE_SLOTS,
+	[maple_mdense]		= MAPLE_MDENSE_SLOTS,
 	[maple_mleaf_64]	= MAPLE_MRANGE64_SLOTS,
 	[maple_leaf_64]		= MAPLE_RANGE64_SLOTS,
 	[maple_range_64]	= MAPLE_RANGE64_SLOTS,
@@ -129,6 +131,7 @@ static const unsigned char mt_slots[] = {
 
 static const unsigned char mt_pivots[] = {
 	[maple_dense]		= 0,
+	[maple_mdense]		= 0,
 	[maple_mleaf_64]	= MAPLE_MRANGE64_SLOTS - 1,
 	[maple_leaf_64]		= MAPLE_RANGE64_SLOTS - 1,
 	[maple_range_64]	= MAPLE_RANGE64_SLOTS - 1,
@@ -144,7 +147,8 @@ static const unsigned char mt_pivots[] = {
 #define mt_pivot_count(x) mt_pivots[mte_node_type(x)]
 
 static const unsigned char mt_min_slots[] = {
-	[maple_dense]		= (MAPLE_NODE_SLOTS - 1) / 2,
+	[maple_dense]		= MAPLE_DENSE_SLOTS / 2,
+	[maple_mdense]		= MAPLE_MDENSE_SLOTS / 2,
 	[maple_mleaf_64]	= (MAPLE_MRANGE64_SLOTS / 2) - 2,
 	[maple_leaf_64]		= (MAPLE_RANGE64_SLOTS / 2) - 2,
 	[maple_range_64]	= (MAPLE_RANGE64_SLOTS / 2) - 2,
@@ -224,7 +228,7 @@ static __always_inline enum maple_type mte_node_type(
 
 static __always_inline bool ma_is_dense(const enum maple_type type)
 {
-	return type == maple_dense;
+	return type == maple_dense || type == maple_mdense;
 }
 
 static __always_inline bool node_is_32b(const enum maple_type type)
@@ -663,6 +667,7 @@ u64 *ma_pivots(struct maple_node *node, enum maple_type type)
 	case maple_mrange_32:
 		return NULL; /* Use ma_pivots32() */
 	case maple_dense:
+	case maple_mdense:
 		return NULL;
 	default:
 	case maple_invalid:
@@ -724,6 +729,7 @@ static inline u64 *ma_gaps(struct maple_node *node,
 	case maple_leaf_64:
 	case maple_mrange_64:
 	case maple_dense:
+	case maple_mdense:
 	case maple_mleaf_32:
 	case maple_mrange_32:
 		return NULL;
@@ -863,39 +869,49 @@ void ma_set_pivot(struct maple_node *node, enum maple_type type,
 	}
 }
 
+struct ma_lookup {
+	u64 min;
+	unsigned char offset;
+};
+
 /*
- * ma_pivot_offset() - First offset in [0, @end] whose pivot is >= @index.
+ * ma_pivot_offset() - First offset in [0, @end] whose pivot is >= @index, and
+ * the minimum of that offset given the node's @min.
  *
  * Resolve the node's pivot width once so the scan loop is branch-free.  A
  * rebalance can leave a 64-bit node under a 32-bit parent, so the width is read
- * from @node, never assumed from the descent.  Returns @end when every pivot in
- * range is below @index.
+ * from @node, never assumed from the descent.  The offset is @end when every
+ * pivot in range is below @index.
  */
-static inline
-unsigned char ma_pivot_offset(struct maple_node *node,
-		enum maple_type type, unsigned char end, u64 index)
+static __always_inline
+struct ma_lookup ma_pivot_offset(struct maple_node *node,
+		enum maple_type type, unsigned char end, u64 index, u64 min)
 {
-	unsigned char offset;
+	struct ma_lookup l = { .min = min, .offset = 0 };
 
 	if (node_is_32b(type)) {
 		u32 *pivots = ma_pivots32(node, type);
 
 		if (pivots[0] >= index)
-			return 0;
-		for (offset = 1; offset < end; offset++)
-			if (pivots[offset] >= index)
-				break;
+			return l;
+
+		l.offset = 1;
+		while (l.offset < end && pivots[l.offset] < index)
+			l.offset++;
+		l.min = (u64)pivots[l.offset - 1] + 1;
 	} else {
 		u64 *pivots = ma_pivots(node, type);
 
 		if (pivots[0] >= index)
-			return 0;
-		for (offset = 1; offset < end; offset++)
-			if (pivots[offset] >= index)
-				break;
+			return l;
+
+		l.offset = 1;
+		while (l.offset < end && pivots[l.offset] < index)
+			l.offset++;
+		l.min = pivots[l.offset - 1] + 1;
 	}
 
-	return offset;
+	return l;
 }
 
 static inline u8 *ma_marks(struct maple_node *node, enum maple_type type)
@@ -907,6 +923,8 @@ static inline u8 *ma_marks(struct maple_node *node, enum maple_type type)
 	case maple_mleaf_32:
 	case maple_mrange_32:
 		return node->mm32.mark;
+	case maple_mdense:
+		return node->mdense.mark;
 	case maple_copy:
 		return node->cp.mark;
 	default:
@@ -1047,6 +1065,34 @@ u64 mas_safe_min(struct ma_state *mas, struct maple_node *node,
 }
 
 /*
+ * mas_leaf_pivot() - The last index of @offset in a leaf that may be dense.
+ * A dense leaf has no pivots: the slot is the node minimum plus the offset.
+ */
+static __always_inline
+u64 mas_leaf_pivot(const struct ma_state *mas, struct maple_node *node,
+		enum maple_type type, unsigned char offset)
+{
+	switch (type) {
+	case maple_dense:
+	case maple_mdense:
+		return mas->min + offset;
+	default:
+		return ma_pivot(node, type, offset);
+	}
+}
+
+/* mas_leaf_min() - The first index of @offset in a leaf that may be dense. */
+static __always_inline
+u64 mas_leaf_min(const struct ma_state *mas, struct maple_node *node,
+		enum maple_type type, unsigned char offset)
+{
+	if (likely(offset))
+		return mas_leaf_pivot(mas, node, type, offset - 1) + 1;
+
+	return mas->min;
+}
+
+/*
  * mte_set_pivot() - Set a pivot to a value in an encoded maple node.
  * @mn: The encoded maple node
  * @piv: The pivot offset
@@ -1092,7 +1138,9 @@ static inline void __rcu **ma_slots(struct maple_node *mn, enum maple_type mt)
 	case maple_mrange_32:
 		return mn->mm32.slot;
 	case maple_dense:
-		return mn->slot;
+		return mn->dense.slot;
+	case maple_mdense:
+		return mn->mdense.slot;
 	}
 
 	return NULL;
@@ -1184,6 +1232,8 @@ struct maple_metadata *ma_meta(struct maple_node *mn, enum maple_type mt)
 		return NULL;
 	case maple_dense:
 		return &mn->dense.meta;
+	case maple_mdense:
+		return &mn->mdense.meta;
 	case maple_arange_64:
 		return &mn->ma64.meta;
 	case maple_mleaf_64:
@@ -1844,7 +1894,7 @@ static inline unsigned char mas_data_end(struct ma_state *mas)
 	struct maple_node *node = mas_mn(mas);
 
 	if (unlikely(ma_is_dense(type)))
-		return mt_slots[type] - 1;
+		return mas->max - mas->min;
 
 	return ma_data_end(node, type, mas->max);
 }
@@ -1985,7 +2035,7 @@ static inline u64 ma_leaf_max_gap(struct maple_node *mn, enum maple_type mt,
 
 	if (unlikely(ma_is_dense(mt))) {
 		gap = max_gap = 0;
-		for (i = 0; i < mt_slots[mt]; i++) {
+		for (i = 0; i <= max - min; i++) {
 			if (slots[i]) {
 				if (gap > max_gap)
 					max_gap = gap;
@@ -2440,6 +2490,109 @@ static inline bool mas_next_sibling(struct ma_state *mas)
 	return true;
 }
 
+/* The range leaf type of @mt for a leaf with a maximum of @max. */
+static inline enum maple_type mt_leaf_type(struct maple_tree *mt, u64 max)
+{
+	if (mt_has_marks(mt))
+		return node_born_type(maple_mleaf_64, max);
+
+	return node_born_type(maple_leaf_64, max);
+}
+
+/* The dense leaf type of @mt. */
+static inline enum maple_type mt_dense_type(struct maple_tree *mt)
+{
+	return mt_has_marks(mt) ? maple_mdense : maple_dense;
+}
+
+/*
+ * ma_dense_count() - The entries that slots @start to @end of a dense leaf would
+ * be in a range leaf: one for each value and one for each run of NULLs.
+ */
+static unsigned char ma_dense_count(struct maple_tree *mt, void __rcu **slots,
+		unsigned char start, unsigned char end)
+{
+	unsigned char count = 0;
+	bool run = false;
+
+	for (; start <= end; start++) {
+		if (mt_slot_locked(mt, slots, start)) {
+			count++;
+			run = false;
+		} else if (!run) {
+			count++;
+			run = true;
+		}
+	}
+
+	return count;
+}
+
+/*
+ * mt_dense_excess() - The excess of a dense leaf with @count entries: how far
+ * they are from fitting the range leaf it collapses to with a slot to spare.
+ * A dense leaf with no excess becomes that range leaf.
+ */
+static inline unsigned char mt_dense_excess(struct maple_tree *mt, u64 max,
+		unsigned char count)
+{
+	unsigned char fit = mt_slots[mt_leaf_type(mt, max)] - 1;
+
+	return count > fit ? count - fit : 0;
+}
+
+/* A dense leaf has no data end to keep; its metadata end byte is the excess. */
+static inline unsigned char ma_excess(struct maple_node *node,
+		enum maple_type type)
+{
+	return ma_meta_end(node, type);
+}
+
+static inline void ma_set_excess(struct maple_node *node, enum maple_type type,
+		unsigned char excess)
+{
+	ma_set_meta(node, type, 0, excess);
+}
+
+/* The ranges in a dense leaf, a run of NULLs being one, from its excess. */
+static inline unsigned char ma_dense_cnt_ranges(struct maple_tree *mt,
+		struct maple_node *node, enum maple_type type, u64 max)
+{
+	return ma_excess(node, type) + mt_slots[mt_leaf_type(mt, max)] - 1;
+}
+
+/*
+ * mas_wr_dense_walk() - Find the entry holding @mas->index in a dense leaf.
+ * @wr_mas: The maple write state
+ *
+ * The offset is the first slot of the entry and offset_end its last: the same
+ * slot for a value, the run for a NULL.
+ */
+static void mas_wr_dense_walk(struct ma_wr_state *wr_mas)
+{
+	struct ma_state *mas = wr_mas->mas;
+	void __rcu **slots;
+	unsigned char offset, end;
+
+	wr_mas->node = mas_mn(mas);
+	slots = ma_slots(wr_mas->node, wr_mas->type);
+	end = mas->end = mas->max - mas->min;
+	offset = mas->index - mas->min;
+	wr_mas->offset_end = offset;
+	if (!mas_slot_locked(mas, slots, offset)) {
+		while (offset && !mas_slot_locked(mas, slots, offset - 1))
+			offset--;
+
+		while (wr_mas->offset_end < end &&
+		       !mas_slot_locked(mas, slots, wr_mas->offset_end + 1))
+			wr_mas->offset_end++;
+	}
+
+	wr_mas->r_min = mas->min + offset;
+	wr_mas->r_max = mas->min + wr_mas->offset_end;
+	mas->offset = offset;
+}
+
 /*
  * mas_wr_node_walk() - Find the correct offset for the index in the @mas.
  *                      If @mas->index cannot be found within the containing
@@ -2454,8 +2607,7 @@ static inline void mas_wr_node_walk(struct ma_wr_state *wr_mas)
 	unsigned char count, offset;
 
 	if (unlikely(ma_is_dense(wr_mas->type))) {
-		wr_mas->r_max = wr_mas->r_min = mas->index;
-		mas->offset = mas->index = mas->min;
+		mas_wr_dense_walk(wr_mas);
 		return;
 	}
 
@@ -2868,24 +3020,17 @@ struct ma_walk {
 /*
  * ma_walk_node() - Take one descend step through @node toward @index.
  *
- * The node layout (dense / 32-bit pivots / 64-bit pivots) is resolved once and
- * each arm reads through the correctly-typed pointer - never a u32 array viewed
- * as u64.  Returns the child slot offset, the node's data end, and [min, max]
- * narrowed to the child range.  A rebalance can leave a 64-bit node under a
- * 32-bit parent, so the width is read from @node, not assumed from the descent.
+ * The pivot width (32-bit / 64-bit) is resolved once and each arm reads through
+ * the correctly-typed pointer - never a u32 array viewed as u64.  Returns the
+ * child slot offset, the node's data end, and [min, max] narrowed to the child
+ * range.  A rebalance can leave a 64-bit node under a 32-bit parent, so the
+ * width is read from @node, not assumed from the descent.  Not for dense leaves.
  */
 static __always_inline
 struct ma_walk ma_walk_node(struct maple_node *node, enum maple_type type,
 		u64 index, u64 min, u64 max)
 {
 	struct ma_walk w = { .min = min, .max = max, .offset = 0 };
-
-	if (unlikely(ma_is_dense(type))) {
-		w.offset = index - min;
-		w.min = w.max = index;
-		w.end = mt_slots[type] - 1;
-		return w;
-	}
 
 	if (node_is_32b(type)) {
 		u32 *pivots = ma_pivots32(node, type);
@@ -2928,43 +3073,71 @@ static inline void *mtree_range_walk(struct ma_state *mas)
 {
 	unsigned char offset;
 	struct maple_node *node;
-	struct maple_enode *next, *last;
+	struct maple_enode *enode;
 	enum maple_type type;
 	void __rcu **slots;
 	unsigned char end;
 	u64 max, min;
-	u64 prev_max, prev_min;
+	u64 r_max, r_min;
 	struct ma_walk w;
+	void *entry;
 
-	next = mas->node;
+	enode = mas->node;
 	min = mas->min;
 	max = mas->max;
-	do {
-		last = next;
-		node = mte_to_node(next);
-		type = mte_node_type(next);
-		prev_min = min;
-		prev_max = max;
+	node = mte_to_node(enode);
+	type = mte_node_type(enode);
+	while (!ma_is_leaf(type)) {
 		w = ma_walk_node(node, type, mas->index, min, max);
 		min = w.min;
 		max = w.max;
-		offset = w.offset;
-		end = w.end;
-
 		slots = ma_slots(node, type);
-		next = mt_slot(mas->tree, slots, offset);
+		enode = mt_slot(mas->tree, slots, w.offset);
 		if (unlikely(ma_dead_node(node)))
 			goto dead_node;
-	} while (!ma_is_leaf(type));
+
+		node = mte_to_node(enode);
+		type = mte_node_type(enode);
+	}
+
+	slots = ma_slots(node, type);
+	if (unlikely(ma_is_dense(type))) {
+		end = max - min;
+		WARN_ON_ONCE(mas->index - min > end);
+		offset = mas->index - min;
+		/* The range comes from this one read of the slot. */
+		entry = mt_slot(mas->tree, slots, offset);
+		r_min = r_max = min + offset;
+		if (!entry) {
+			unsigned char i;
+
+			for (i = offset; i && !mt_slot(mas->tree, slots, i - 1); i--)
+				;
+			r_min = min + i;
+			for (i = offset; i < end && !mt_slot(mas->tree, slots, i + 1); i++)
+				;
+			r_max = min + i;
+		}
+	} else {
+		w = ma_walk_node(node, type, mas->index, min, max);
+		offset = w.offset;
+		end = w.end;
+		r_min = w.min;
+		r_max = w.max;
+		entry = mt_slot(mas->tree, slots, offset);
+	}
+
+	if (unlikely(ma_dead_node(node)))
+		goto dead_node;
 
 	mas->end = end;
 	mas->offset = offset;
-	mas->index = min;
-	mas->last = max;
-	mas->min = prev_min;
-	mas->max = prev_max;
-	mas->node = last;
-	return (void *)next;
+	mas->index = r_min;
+	mas->last = r_max;
+	mas->min = min;
+	mas->max = max;
+	mas->node = enode;
+	return entry;
 
 dead_node:
 	mas_reset(mas);
@@ -3130,12 +3303,46 @@ static inline void cp_data_calc(struct maple_copy *cp,
 		struct ma_wr_state *l_wr_mas, struct ma_wr_state *r_wr_mas)
 {
 
+	/* A dense leaf counts a run of NULLs once, as its range leaf would. */
+	if (unlikely(ma_is_dense(l_wr_mas->type)) && l_wr_mas == r_wr_mas) {
+		struct ma_state *mas = l_wr_mas->mas;
+
+		/* All its entries but those the write replaces. */
+		cp->data = ma_dense_cnt_ranges(mas->tree, l_wr_mas->node,
+					       l_wr_mas->type, mas->max);
+		cp->data -= ma_dense_count(mas->tree, l_wr_mas->slots,
+					   mas->offset, l_wr_mas->offset_end);
+		cp->data += cp->end + 1;
+		return;
+	}
+
 	/* Add 1 every time for the 0th element */
 	cp->data = l_wr_mas->mas->offset;
+	if (unlikely(ma_is_dense(l_wr_mas->type)) && cp->data)
+		cp->data = ma_dense_count(l_wr_mas->mas->tree, l_wr_mas->slots,
+					  0, l_wr_mas->mas->offset - 1);
+
 	/* Add the new data and any partial overwrites */
 	cp->data += cp->end + 1;
 	/* Data from right (offset + 1 to end), +1 for zero */
-	cp->data += r_wr_mas->mas->end - r_wr_mas->offset_end;
+	if (likely(!ma_is_dense(r_wr_mas->type)))
+		cp->data += r_wr_mas->mas->end - r_wr_mas->offset_end;
+	else if (r_wr_mas->offset_end < r_wr_mas->mas->end)
+		cp->data += ma_dense_count(r_wr_mas->mas->tree, r_wr_mas->slots,
+					   r_wr_mas->offset_end + 1,
+					   r_wr_mas->mas->end);
+}
+
+/* The entries in @mas->node, as a range node would count them. */
+static inline unsigned char mas_data_count(struct ma_state *mas)
+{
+	enum maple_type type = mte_node_type(mas->node);
+
+	if (unlikely(ma_is_dense(type)))
+		return ma_dense_cnt_ranges(mas->tree, mas_mn(mas), type,
+					   mas->max);
+
+	return mas->end + 1;
 }
 
 /* The 32-bit side of a mixed-width push, capped to what one node holds. */
@@ -3157,6 +3364,10 @@ static bool data_fits(struct ma_state *sib, struct ma_state *mas,
 	unsigned char end;
 
 	type = mte_node_type(mas->node);
+	/* Data is not pushed into or out of a dense leaf. */
+	if (ma_is_dense(type) || ma_is_dense(mte_node_type(sib->node)))
+		return false;
+
 	end = sib->end;
 	new_data = end + 1 + cp->data;
 
@@ -3249,7 +3460,7 @@ static inline void rebalance_data(struct maple_copy *cp,
 
 use_sib:
 
-	cp->data += sib->end + 1;
+	cp->data += mas_data_count(sib);
 }
 
 /*
@@ -3268,12 +3479,15 @@ static inline void spanning_data(struct maple_copy *cp,
 {
 	enum maple_type type = r_wr_mas->type;
 
+	if (unlikely(ma_is_dense(type)))
+		type = mt_leaf_type(r_wr_mas->mas->tree, r_wr_mas->mas->max);
+
 	cp_data_calc(cp, l_wr_mas, r_wr_mas);
 	if (((l_wr_mas->mas->min != 0) ||
 	     (r_wr_mas->mas->max != mas_tree_max(r_wr_mas->mas))) &&
 	    (cp->data <= mt_min_slots[type])) {
 		spanning_sib(l_wr_mas, r_wr_mas, sib);
-		cp->data += sib->end + 1;
+		cp->data += mas_data_count(sib);
 	} else {
 		sib->end = 0;
 	}
@@ -3309,20 +3523,296 @@ static inline unsigned char cp_data_32b(struct maple_copy *cp)
 	return n;
 }
 
-static inline
-void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt)
+/* A position in the entries of the sources, taken in order. */
+struct cp_iter {
+	u64 next;		/* The first index of the next entry */
+	unsigned char s;	/* The source */
+	unsigned char offset;	/* The offset in the source */
+};
+
+/*
+ * cp_iter_next() - Step over the next entry of the sources.
+ * @cp: The maple copy node
+ * @mt: The maple tree
+ * @it: The position
+ * @null: Set if the entry is a NULL
+ *
+ * A run of NULLs in a dense source is one entry.
+ *
+ * Return: The last index of the entry.
+ */
+static u64 cp_iter_next(struct maple_copy *cp, struct maple_tree *mt,
+		struct cp_iter *it, bool *null)
 {
-	enum maple_type mt64 = node_transition_type(mt);
-	enum maple_type mt32 = node_born_type(mt64, 0);
-	unsigned char n32 = cp_data_32b(cp);
+	struct maple_node *node = cp->src[it->s].node;
+	enum maple_type type = cp->src[it->s].mt;
+	void __rcu **slots = ma_slots(node, type);
+	unsigned char end = cp->src[it->s].end;
+	u64 last;
+
+	*null = !mt_slot_locked(mt, slots, it->offset);
+	if (ma_is_dense(type)) {
+		last = it->next;
+		while (*null && it->offset < end &&
+		       !mt_slot_locked(mt, slots, it->offset + 1)) {
+			it->offset++;
+			last++;
+		}
+	} else if (it->offset < end) {
+		last = ma_pivot(node, type, it->offset);
+	} else {
+		last = cp->src[it->s].max;
+	}
+
+	it->next = last + 1;
+	if (it->offset++ == end && ++it->s < cp->s_count)
+		it->offset = cp->src[it->s].start;
+
+	return last;
+}
+
+/* cp_data_32b() for sources that include a dense leaf. */
+static unsigned char cp_data_32b_dense(struct maple_copy *cp,
+		struct maple_tree *mt, u64 min)
+{
+	struct cp_iter it = { .next = min, .offset = cp->src[0].start };
+	unsigned char n;
+	bool null;
+
+	if (cp->src[cp->s_count - 1].max <= U32_MAX)
+		return cp->data;
+
+	for (n = 0; n < cp->data; n++) {
+		if (cp_iter_next(cp, mt, &it, &null) > U32_MAX)
+			break;
+	}
+
+	return n;
+}
+
+/*
+ * cp_dense_ends() - Could the leading or the trailing entries be dense?
+ * @cp: The maple copy node
+ * @min: The first index of the data
+ * @cap: The entries a range leaf holds; a dense leaf must hold more
+ * @slots: The slots of a dense leaf
+ *
+ * Either the entry @cap from the start ends within @slots of @min, or the entry
+ * @cap from the end starts within @slots of the max.  Looks at the ends of the
+ * sources instead of walking the entries, so most splits are ruled out at once.
+ */
+static bool cp_dense_ends(struct maple_copy *cp, u64 min, unsigned char cap,
+		unsigned char slots)
+{
+	typeof(cp->src[0]) *first = &cp->src[0];
+	typeof(cp->src[0]) *last = &cp->src[cp->s_count - 1];
+	unsigned char off;
+	u64 piv;
+
+	if (ma_is_dense(first->mt))
+		return true;
+
+	if (first->end - first->start >= cap) {
+		off = first->start + cap;
+		piv = off < mt_pivots[first->mt] ?
+		      ma_pivot(first->node, first->mt, off) : first->max;
+	} else {
+		piv = first->max;
+	}
+
+	if (piv - min < slots)
+		return true;
+
+	if (ma_is_dense(last->mt))
+		return true;
+
+	if (last->end - last->start > cap)
+		piv = ma_pivot(last->node, last->mt, last->end - cap - 1) + 1;
+	else if (cp->s_count > 1)
+		piv = cp->src[cp->s_count - 2].max + 1;
+	else
+		piv = min;
+
+	return last->max - piv < slots;
+}
+
+/*
+ * dst_setup_dense() - Size the leaves for data that is more than one range
+ * leaf holds, with dense leaves where the entries allow.
+ * @cp: The maple copy node
+ * @mas: The maple state
+ * @mt: The range leaf type
+ * @min: The first index of the data
+ *
+ * A dense leaf takes single indexes and NULLs that together cover no more than
+ * its slots, and only when they are more entries than the range leaf holds.
+ * The leading and the trailing entries are the candidates.  The layouts are
+ * tried from the fewest nodes, dense first.  A destination that is to be dense
+ * has its type set here.
+ *
+ * Return: true if the destinations are sized, false to size range leaves the
+ * usual way.
+ */
+static bool dst_setup_dense(struct maple_copy *cp, struct ma_state *mas,
+		enum maple_type mt, u64 min, unsigned char n32)
+{
+	struct cp_iter head = { .next = min, .offset = cp->src[0].start };
+	enum maple_type dense = mt_dense_type(mas->tree);
+	unsigned char slots = mt_slots[dense];
+	/* A range leaf is left with room to lose an entry. */
+	int low = mt_min_slots[mt] + 2;
+	int cap = mt_slots[mt];
+	/* Leading entries below 4G would collapse to a 32-bit leaf. */
+	int cap32 = mt_slots[node_born_type(node_transition_type(mt), 0)];
+	int data = cp->data;
+	int lead = 0, trail, a, b, r;
+	struct cp_iter tail = head;
+	unsigned char k, t = 0;
+	bool leading = true;
+	u64 first, last;
+	bool null;
+
+	if (!cp_dense_ends(cp, min, cap, slots))
+		return false;
+
+	for (k = 0; k < cp->data; k++) {
+		first = head.next;
+		last = cp_iter_next(cp, mas->tree, &head, &null);
+		if (!null && first != last) {
+			/* A range of a value ends both candidates. */
+			leading = false;
+			tail = head;
+			t = k + 1;
+			continue;
+		}
+
+		if (leading && last - min < slots)
+			lead = k + 1;
+		else
+			leading = false;
+
+		while (t <= k && last - tail.next >= slots) {
+			cp_iter_next(cp, mas->tree, &tail, &null);
+			t++;
+		}
+	}
+	trail = data - t;
+
+	/* One dense leaf. */
+	cp->d_count = 1;
+	if (lead == data) {
+		cp->dst[0].mt = dense;
+		cp->dst[0].size = data;
+		return true;
+	}
+
+	/* Dense then range. */
+	cp->d_count = 2;
+	a = min(lead, data - low);
+	if (a > (a <= n32 ? cap32 : cap) && data - a <= cap) {
+		cp->dst[0].mt = dense;
+		cp->dst[0].size = a;
+		cp->dst[1].size = data - a;
+		return true;
+	}
+
+	/* Range then dense. */
+	b = min(trail, data - low);
+	if (b > cap && data - b <= cap) {
+		cp->dst[1].mt = dense;
+		cp->dst[0].size = data - b;
+		cp->dst[1].size = b;
+		return true;
+	}
+
+	/* Two dense leaves. */
+	a = min(lead, data - cap - 1);
+	if (a > (a <= n32 ? cap32 : cap) && data - a <= trail) {
+		cp->dst[0].mt = dense;
+		cp->dst[1].mt = dense;
+		cp->dst[0].size = a;
+		cp->dst[1].size = data - a;
+		return true;
+	}
+
+	if (data <= 2 * cap)
+		return false;
+
+	/* Dense, range, dense. */
+	cp->d_count = 3;
+	a = min(lead, data - low - cap - 1);
+	b = min(trail, data - a - low);
+	r = data - a - b;
+	if (a > (a <= n32 ? cap32 : cap) && b > cap && r <= cap) {
+		cp->dst[0].mt = dense;
+		cp->dst[2].mt = dense;
+		cp->dst[0].size = a;
+		cp->dst[1].size = r;
+		cp->dst[2].size = b;
+		return true;
+	}
+
+	/* Dense then two range leaves. */
+	a = min(lead, data - 2 * low);
+	r = data - a;
+	if (a > (a <= n32 ? cap32 : cap) && r <= 2 * cap) {
+		cp->dst[0].mt = dense;
+		cp->dst[0].size = a;
+		cp->dst[1].size = (r + 1) / 2;
+		cp->dst[2].size = r / 2;
+		return true;
+	}
+
+	/* Two range leaves then dense. */
+	b = min(trail, data - 2 * low);
+	r = data - b;
+	if (b > cap && r <= 2 * cap) {
+		cp->dst[2].mt = dense;
+		cp->dst[0].size = (r + 1) / 2;
+		cp->dst[1].size = r / 2;
+		cp->dst[2].size = b;
+		return true;
+	}
+
+	/* Two full range leaves and the new entry split the usual way. */
+	if (data == 2 * cap + 1)
+		return false;
+
+	/* More than that only comes out of a dense leaf: three range leaves. */
+	WARN_ON_ONCE(data > 3 * cap);
+	cp->dst[0].size = (data + 2) / 3;
+	cp->dst[1].size = (data + 1) / 3;
+	cp->dst[2].size = data / 3;
+	return true;
+}
+
+static inline
+void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt,
+		u64 min)
+{
+	enum maple_type mt64, mt32;
+	unsigned char n32;
 	bool src32 = true;
 	unsigned char i, n;
 
+	/* A dense leaf is rebuilt from the range leaf type of the tree. */
+	if (unlikely(ma_is_dense(mt)))
+		mt = mt_leaf_type(mas->tree, U64_MAX);
+
+	/* Only dst_setup_dense() makes a destination dense. */
+	cp->dst[0].mt = cp->dst[1].mt = cp->dst[2].mt = mt;
+	mt64 = node_transition_type(mt);
+	mt32 = node_born_type(mt64, 0);
+	n32 = cp_data_32b(cp);
 	/* Data is 1 indexed, every src has +1 added.  */
 
-	for (i = 0; i < cp->s_count; i++)
+	for (i = 0; i < cp->s_count; i++) {
 		if (cp->src[i].mt != maple_copy && !node_is_32b(cp->src[i].mt))
 			src32 = false;
+
+		if (unlikely(ma_is_dense(cp->src[i].mt)))
+			n32 = cp_data_32b_dense(cp, mas->tree, min);
+	}
 	/* Widths only stay as they are when the whole write is 32-bit. */
 	src32 = src32 && n32 == cp->data;
 
@@ -3333,6 +3823,9 @@ void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt)
 		cp->d_count = 1;
 		goto node_setup;
 	}
+
+	if (ma_is_leaf(mt) && dst_setup_dense(cp, mas, mt, min, n32))
+		goto alloc;
 
 	cp->split = (cp->data - 1) / 2;
 	cp->d_count = 2;
@@ -3380,9 +3873,12 @@ alloc:
 	for (i = 0; i < cp->d_count; i++) {
 		n += cp->dst[i].size;
 		/* Otherwise a 32-bit node needs its own minimum. */
-		cp->dst[i].mt = (n <= n32 &&
-				 (src32 || cp->dst[i].size > mt_min_slots[mt32])) ?
-				mt32 : mt64;
+		if (likely(!ma_is_dense(cp->dst[i].mt)))
+			cp->dst[i].mt = (n <= n32 &&
+					 (src32 || cp->dst[i].size >
+						   mt_min_slots[mt32])) ?
+					mt32 : mt64;
+
 		cp->dst[i].node = ma_mnode_ptr(mas_pop_node(mas));
 	}
 }
@@ -3419,6 +3915,8 @@ static inline void append_wr_mas_cp(struct maple_copy *cp,
 	cp->src[count].mt = wr_mas->type;
 	if (wr_mas->mas->end <= end)
 		cp->src[count].max = wr_mas->mas->max;
+	else if (unlikely(ma_is_dense(wr_mas->type)))
+		cp->src[count].max = wr_mas->mas->min + end;
 	else
 		cp->src[count].max = wr_piv(wr_mas, end);
 
@@ -3473,15 +3971,185 @@ void multi_src_setup(struct maple_copy *cp, struct ma_wr_state *l_wr_mas,
 		append_mas_cp(cp, sib, 0, sib->end);
 }
 
+/*
+ * node_to_dense() - Copy entries from a node with pivots to a dense leaf.
+ * @mas: The maple state
+ * @src: The source node
+ * @start: The offset into the src to start copying
+ * @size: The number of entries to copy (non-zero)
+ * @s_max: The source node max
+ * @s_mt: The source maple node type
+ * @index: The first index of the entry at @start
+ * @dst: The dense leaf, with every slot NULL where nothing has been copied
+ * @d_mt: The dense leaf type
+ * @d_min: The dense leaf minimum
+ *
+ * Every entry is a single index or a NULL, which is left as it is.
+ *
+ * Return: The last index copied.
+ */
+static u64 node_to_dense(struct ma_state *mas, struct maple_node *src,
+		unsigned char start, unsigned char size, u64 s_max,
+		enum maple_type s_mt, u64 index, struct maple_node *dst,
+		enum maple_type d_mt, u64 d_min)
+{
+	void __rcu **s_slots = ma_slots(src, s_mt);
+	void __rcu **d_slots = ma_slots(dst, d_mt);
+	u8 *s_marks = ma_marks(src, s_mt);
+	u8 *d_marks = ma_marks(dst, d_mt);
+	u64 last = index;
+	void *entry;
+
+	for (; size; size--, start++) {
+		if (start < mt_pivots[s_mt])
+			last = ma_pivot(src, s_mt, start);
+		else
+			last = s_max;
+
+		entry = mas_slot_locked(mas, s_slots, start);
+		if (entry) {
+			RCU_INIT_POINTER(d_slots[index - d_min], entry);
+			if (d_marks && s_marks)
+				d_marks[index - d_min] = s_marks[start];
+		}
+
+		index = last + 1;
+	}
+
+	return last;
+}
+
+/* What a copy from a dense leaf made: a run of NULLs is one entry. */
+struct dense_copied {
+	u64 max;		/* The last index copied */
+	unsigned char size;	/* The entries */
+};
+
+/*
+ * dense_to_node() - Copy entries from a dense leaf to a leaf with pivots.
+ * @mas: The maple state
+ * @src: The dense leaf
+ * @start: The slot to start copying
+ * @room: The entries the destination has room for (non-zero)
+ * @s_end: The last slot of the source
+ * @s_mt: The dense leaf type
+ * @index: The index of @start
+ * @dst: The destination
+ * @d_start: The start location in the destination node
+ * @d_mt: The destination maple node type
+ *
+ * Copies to the end of the source or until the destination is full.
+ */
+static struct dense_copied dense_to_node(struct ma_state *mas,
+		struct maple_node *src, unsigned char start, unsigned char room,
+		unsigned char s_end, enum maple_type s_mt, u64 index,
+		struct maple_node *dst, unsigned char d_start, enum maple_type d_mt)
+{
+	void __rcu **s_slots = ma_slots(src, s_mt);
+	void __rcu **d_slots = ma_slots(dst, d_mt);
+	u8 *s_marks = ma_marks(src, s_mt);
+	u8 *d_marks = ma_marks(dst, d_mt);
+	struct dense_copied c = { .size = 0 };
+	void *entry;
+
+	for (; room && start <= s_end; room--, start++, d_start++, index++) {
+		entry = mas_slot_locked(mas, s_slots, start);
+		if (d_marks)
+			d_marks[d_start] = (entry && s_marks) ? s_marks[start] : 0;
+
+		while (!entry && start < s_end &&
+		       !mas_slot_locked(mas, s_slots, start + 1)) {
+			start++;
+			index++;
+		}
+
+		RCU_INIT_POINTER(d_slots[d_start], entry);
+		if (d_start < mt_pivots[d_mt])
+			ma_set_pivot(dst, d_mt, d_start, index);
+		c.size++;
+	}
+
+	c.max = index - 1;
+	return c;
+}
+
+/*
+ * dense_to_dense() - Copy entries from one dense leaf to another.
+ * @mas: The maple state
+ * @src: The source dense leaf
+ * @start: The slot to start copying
+ * @room: The entries the destination has room for (non-zero)
+ * @s_end: The last slot of the source
+ * @s_mt: The dense leaf type
+ * @index: The index of @start
+ * @dst: The dense leaf, with every slot NULL where nothing has been copied
+ * @d_min: The destination minimum
+ *
+ * Copies to the end of the source or until the destination is full.
+ */
+static struct dense_copied dense_to_dense(struct ma_state *mas,
+		struct maple_node *src, unsigned char start, unsigned char room,
+		unsigned char s_end, enum maple_type s_mt, u64 index,
+		struct maple_node *dst, u64 d_min)
+{
+	void __rcu **s_slots = ma_slots(src, s_mt);
+	void __rcu **d_slots = ma_slots(dst, s_mt);
+	u8 *s_marks = ma_marks(src, s_mt);
+	u8 *d_marks = ma_marks(dst, s_mt);
+	struct dense_copied c = { .size = 0 };
+	void *entry;
+
+	for (; room && start <= s_end; room--, start++, index++) {
+		entry = mas_slot_locked(mas, s_slots, start);
+		c.size++;
+		if (!entry) {
+			while (start < s_end &&
+			       !mas_slot_locked(mas, s_slots, start + 1)) {
+				start++;
+				index++;
+			}
+			continue;
+		}
+
+		RCU_INIT_POINTER(d_slots[index - d_min], entry);
+		if (s_marks)
+			d_marks[index - d_min] = s_marks[start];
+	}
+
+	c.max = index - 1;
+	return c;
+}
+
+/* Start a dense destination with every slot a NULL. */
+static inline void dense_init(struct maple_node *node, enum maple_type type)
+{
+	u8 *marks = ma_marks(node, type);
+
+	memset(ma_slots(node, type), 0, mt_slots[type] * sizeof(void *));
+	if (marks)
+		memset(marks, 0, mt_slots[type] * sizeof(u8));
+}
+
+/* Finish a destination that holds @count entries up to @max. */
+static inline void cp_dst_finalise(struct maple_tree *mt,
+		struct maple_node *dst, enum maple_type d_mt,
+		unsigned char count, u64 max)
+{
+	if (unlikely(ma_is_dense(d_mt)))
+		ma_set_excess(dst, d_mt, mt_dense_excess(mt, max, count));
+	else
+		node_finalise(dst, d_mt, count);
+}
+
 static inline
-void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
+void cp_data_write(struct maple_copy *cp, struct ma_state *mas, u64 min)
 {
 	struct maple_node *dst, *src;
 	unsigned char s, d;
 	unsigned char dst_offset;
 	unsigned char data_offset;
 	unsigned char src_end, s_offset;
-	u64 s_max, d_max;
+	u64 s_max, d_max, d_min;
 	unsigned char dst_size;
 	enum maple_type s_mt, d_mt;
 
@@ -3498,29 +4166,61 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 	do {
 		dst_offset = 0;
 		d_max = 0;
+		d_min = min;
 		dst = cp->dst[d].node;
 		d_mt = cp->dst[d].mt;
 		dst_size = cp->dst[d].size;
+		if (unlikely(ma_is_dense(d_mt)))
+			dense_init(dst, d_mt);
 
 		while (dst_size) {
-			unsigned char size;
+			unsigned char size, used;
 
-			if (src_end - s_offset + 1 < dst_size)
+			if (likely(!ma_is_dense(s_mt))) {
 				size = src_end - s_offset + 1;
-			else
-				size = dst_size;
+				if (size > dst_size)
+					size = dst_size;
 
-			d_max = node_copy(mas, src, s_offset, size, s_max, s_mt,
-					  dst, dst_offset, d_mt);
+				if (likely(!ma_is_dense(d_mt)))
+					d_max = node_copy(mas, src, s_offset,
+							  size, s_max, s_mt, dst,
+							  dst_offset, d_mt);
+				else
+					d_max = node_to_dense(mas, src, s_offset,
+							      size, s_max, s_mt,
+							      min, dst, d_mt,
+							      d_min);
 
+				used = size;
+			} else {
+				struct dense_copied c;
+
+				if (ma_is_dense(d_mt))
+					c = dense_to_dense(mas, src, s_offset,
+							   dst_size, src_end,
+							   s_mt, min, dst, d_min);
+				else
+					c = dense_to_node(mas, src, s_offset,
+							  dst_size, src_end, s_mt,
+							  min, dst, dst_offset,
+							  d_mt);
+
+				d_max = c.max;
+				size = c.size;
+				/* A dense source is one slot an index. */
+				used = d_max - min + 1;
+			}
+
+			min = d_max + 1;
 			dst_offset += size;
-			s_offset += size;
+			s_offset += used;
 			if (s_offset > src_end) {
 				/* This source is exhausted */
 				s++;
 				if (s >= cp->s_count) {
 					cp->dst[d].max = d_max;
-					node_finalise(dst, d_mt, dst_offset);
+					cp_dst_finalise(mas->tree, dst, d_mt,
+							dst_offset, d_max);
 					return;
 				}
 				/* Reset local src */
@@ -3536,7 +4236,7 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas)
 		}
 
 		cp->dst[d].max = d_max;
-		node_finalise(dst, d_mt, dst_offset);
+		cp_dst_finalise(mas->tree, dst, d_mt, dst_offset, d_max);
 		++d; /* Next destination */
 		if (d >= cp->d_count) {
 			WARN_ON(data_offset < cp->data);
@@ -3596,6 +4296,15 @@ static inline void cp_dst_to_slots(struct maple_copy *cp, u64 min,
 	cp->max = max;
 }
 
+/* The first index of the data: the left sibling's when it is used. */
+static inline u64 cp_data_min(struct ma_state *mas, struct ma_state *sib)
+{
+	if (sib->end && sib->max < mas->min)
+		return sib->min;
+
+	return mas->min;
+}
+
 static inline bool cp_is_new_root(struct maple_copy *cp, struct ma_state *mas)
 {
 	/* Whole tree = 0..physical ceiling; U64_MAX also = a promoting root. */
@@ -3611,7 +4320,7 @@ static inline bool cp_is_new_root(struct maple_copy *cp, struct ma_state *mas)
 		cp->s_count = 0;
 		init_cp_src(cp);
 		/* A new root is born to the width of its data. */
-		dst_setup(cp, mas, mt);
+		dst_setup(cp, mas, mt, cp->min);
 		mt = cp->dst[0].mt;
 		node_copy(mas, cp->src[0].node, 0, cp->data, cp->max, maple_copy,
 			  cp->dst[0].node, 0, mt);
@@ -3979,12 +4688,24 @@ static inline void mas_extend_spanning_null(struct ma_wr_state *l_wr_mas,
 	if ((l_mas->index == l_wr_mas->r_min) &&
 		 (l_slot &&
 		  !mas_slot_locked(l_mas, l_wr_mas->slots, l_slot - 1))) {
-		if (l_slot > 1)
-			l_mas->index = wr_piv(l_wr_mas, l_slot - 2) + 1;
-		else
-			l_mas->index = l_mas->min;
+		if (unlikely(ma_is_dense(l_wr_mas->type))) {
+			/* The NULL before is a run of slots, start at its first. */
+			l_slot--;
+			while (l_slot &&
+			       !mas_slot_locked(l_mas, l_wr_mas->slots, l_slot - 1))
+				l_slot--;
 
-		l_mas->offset = l_slot - 1;
+			l_mas->index = l_mas->min + l_slot;
+			l_mas->offset = l_slot;
+		} else {
+			if (l_slot > 1)
+				l_mas->index = wr_piv(l_wr_mas, l_slot - 2) + 1;
+			else
+				l_mas->index = l_mas->min;
+
+			l_mas->offset = l_slot - 1;
+		}
+
 		l_wr_mas->r_min = l_mas->index;
 	}
 
@@ -4033,25 +4754,39 @@ static inline void *mas_state_wr_walk(struct ma_state *mas)
  */
 static inline void *mtree_lookup_walk(struct ma_state *mas)
 {
-	unsigned char offset;
+	struct ma_lookup l = { .min = mas->min };
 	struct maple_node *node;
 	struct maple_enode *next;
 	enum maple_type type;
 	void __rcu **slots;
-	unsigned char end;
 
 	next = mas->node;
-	do {
-		node = mte_to_node(next);
-		type = mte_node_type(next);
-		end = mt_pivots[type];
-		offset = ma_pivot_offset(node, type, end, mas->index);
-
+	node = mte_to_node(next);
+	type = mte_node_type(next);
+	while (!ma_is_leaf(type)) {
+		l = ma_pivot_offset(node, type, mt_pivots[type], mas->index,
+				    l.min);
 		slots = ma_slots(node, type);
-		next = mt_slot(mas->tree, slots, offset);
+		next = mt_slot(mas->tree, slots, l.offset);
 		if (unlikely(ma_dead_node(node)))
 			goto dead_node;
-	} while (!ma_is_leaf(type));
+
+		node = mte_to_node(next);
+		type = mte_node_type(next);
+	}
+
+	if (unlikely(ma_is_dense(type))) {
+		WARN_ON_ONCE(mas->index - l.min >= mt_slots[type]);
+		l.offset = mas->index - l.min;
+	} else {
+		l = ma_pivot_offset(node, type, mt_pivots[type], mas->index,
+				    l.min);
+	}
+
+	slots = ma_slots(node, type);
+	next = mt_slot(mas->tree, slots, l.offset);
+	if (unlikely(ma_dead_node(node)))
+		goto dead_node;
 
 	return (void *)next;
 
@@ -4191,8 +4926,8 @@ static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
 	do {
 		spanning_data(&cp, wr_mas, &r_wr_mas, &sib);
 		multi_src_setup(&cp, wr_mas, &r_wr_mas, &sib);
-		dst_setup(&cp, mas, wr_mas->type);
-		cp_data_write(&cp, mas);
+		dst_setup(&cp, mas, wr_mas->type, cp_data_min(mas, &sib));
+		cp_data_write(&cp, mas, cp_data_min(mas, &sib));
 	} while (spanning_ascend(&cp, mas, wr_mas, &r_wr_mas, &sib));
 
 	mas_wmb_replace(mas, &cp);
@@ -4429,6 +5164,23 @@ static inline void mas_wr_slot_store(struct ma_wr_state *wr_mas)
 		mas_update_gap(mas);
 }
 
+static int mas_prev_node(struct ma_state *mas, u64 min);
+static int mas_next_node(struct ma_state *mas, struct maple_node *node, u64 max);
+
+/* Is the leaf before or the leaf after @mas->node dense? */
+static bool mas_dense_sib(struct ma_state *mas)
+{
+	struct ma_state tmp = *mas;
+
+	mas_next_node(&tmp, mas_mn(&tmp), U64_MAX);
+	if (!mas_is_overflow(&tmp) && ma_is_dense(mte_node_type(tmp.node)))
+		return true;
+
+	mas_prev_node(&tmp, 0);
+	mas_prev_node(&tmp, 0);
+	return !mas_is_underflow(&tmp) && ma_is_dense(mte_node_type(tmp.node));
+}
+
 /*
  * mas_wr_extend_null() - Extend a store of a %NULL over the %NULLs beside it.
  * @wr_mas: The maple write state
@@ -4483,6 +5235,10 @@ static inline bool mas_wr_extend_null(struct ma_wr_state *wr_mas)
 		/* NULL expansion cannot cause two inserts */
 		wr_mas->span_nodes = (node_is_32b(wr_mas->type) &&
 				      mas->root_64b) ? 3 : 2;
+		/* A dense leaf can hold three range leaves of entries. */
+		if (mas_dense_sib(mas))
+			wr_mas->span_nodes = 3;
+
 		wr_mas->sufficient_height = 0;
 		wr_mas->vacant_height = 0;
 		mas_reset(mas);
@@ -4493,8 +5249,48 @@ static inline bool mas_wr_extend_null(struct ma_wr_state *wr_mas)
 	return spanning;
 }
 
+/* mas_wr_dense_end_piv() - Find the entry holding @mas->last in a dense leaf. */
+static void mas_wr_dense_end_piv(struct ma_wr_state *wr_mas)
+{
+	struct ma_state *mas = wr_mas->mas;
+	void __rcu **slots = wr_mas->slots;
+	unsigned char offset = mas->end;
+
+	if (mas->last - mas->min < offset)
+		offset = mas->last - mas->min;
+
+	if (!mas_slot_locked(mas, slots, offset)) {
+		while (offset < mas->end &&
+		       !mas_slot_locked(mas, slots, offset + 1))
+			offset++;
+	}
+
+	wr_mas->offset_end = offset;
+	wr_mas->end_piv = mas->min + offset;
+}
+
+/* Put the write state on the one slot of a dense leaf that @mas->index is in. */
+static void mas_wr_dense_slot(struct ma_wr_state *wr_mas)
+{
+	struct ma_state *mas = wr_mas->mas;
+
+	mas->offset = mas->index - mas->min;
+	wr_mas->offset_end = mas->offset;
+	wr_mas->r_min = wr_mas->r_max = wr_mas->end_piv = mas->index;
+	wr_mas->content = mas_slot_locked(mas, wr_mas->slots, mas->offset);
+}
+
 static inline void mas_wr_end_piv(struct ma_wr_state *wr_mas)
 {
+	if (unlikely(ma_is_dense(wr_mas->type))) {
+		mas_wr_dense_end_piv(wr_mas);
+		/* An exact fit in a dense leaf is the slot of the index. */
+		if (wr_mas->mas->store_type == wr_exact_fit)
+			mas_wr_dense_slot(wr_mas);
+
+		return;
+	}
+
 	while ((wr_mas->offset_end < wr_mas->mas->end) &&
 	       (wr_mas->mas->last > wr_piv(wr_mas, wr_mas->offset_end)))
 		wr_mas->offset_end++;
@@ -4520,6 +5316,153 @@ static inline unsigned char mas_wr_new_end(struct ma_wr_state *wr_mas)
 	return new_end;
 }
 
+/*
+ * mas_wr_dense_type() - The store type for a write within a dense leaf.
+ * @wr_mas: The maple write state
+ *
+ * A write that changes one slot and leaves the leaf dense is an exact fit: a
+ * value at one index, or a NULL that clears no more than one value.  Any other
+ * write rebuilds the leaf, which settles its type again; into one node that is
+ * a node store.
+ */
+static enum store_type mas_wr_dense_type(struct ma_wr_state *wr_mas)
+{
+	struct ma_state *mas = wr_mas->mas;
+	enum maple_type leaf = mt_leaf_type(mas->tree, mas->max);
+	void __rcu **slots = wr_mas->slots;
+	unsigned char count, values = 0, i;
+	bool spanning = false;
+	unsigned char new_count;
+
+	mas_wr_dense_end_piv(wr_mas);
+	if (wr_mas->entry && mas->index == mas->last) {
+		mas_wr_dense_slot(wr_mas);
+		return wr_exact_fit;
+	}
+
+	if (!wr_mas->entry) {
+		/* A NULL takes in the NULLs beside it, as in a range leaf. */
+		if (!wr_mas->content) {
+			mas->index = wr_mas->r_min;
+		} else if (!mas->offset) {
+			if (mas->index)
+				spanning = mas_prev_is_null(mas);
+		} else if (!mas_slot_locked(mas, slots, mas->offset - 1)) {
+			while (mas->offset &&
+			       !mas_slot_locked(mas, slots, mas->offset - 1))
+				mas->offset--;
+
+			wr_mas->r_min = mas->index = mas->min + mas->offset;
+		}
+
+		if (!mas_slot_locked(mas, slots, wr_mas->offset_end)) {
+			mas->last = wr_mas->end_piv;
+		} else if (wr_mas->offset_end == mas->end) {
+			if (mas->max != mas_tree_max(mas))
+				spanning |= mas_next_is_null(mas,
+						wr_mas->offset_end);
+		} else if (!mas_slot_locked(mas, slots,
+					    wr_mas->offset_end + 1)) {
+			while (wr_mas->offset_end < mas->end &&
+			       !mas_slot_locked(mas, slots,
+						wr_mas->offset_end + 1))
+				wr_mas->offset_end++;
+
+			wr_mas->end_piv = mas->min + wr_mas->offset_end;
+			mas->last = wr_mas->end_piv;
+		}
+
+		if (spanning) {
+			wr_mas->span_nodes = 3;
+			wr_mas->sufficient_height = 0;
+			wr_mas->vacant_height = 0;
+			mas_reset(mas);
+			wr_mas->content = mas_start_wr(mas);
+			mas_wr_walk(wr_mas);
+			return wr_spanning_store;
+		}
+	}
+
+	/* The entries the write replaces, and how many of them are values. */
+	count = ma_dense_count(mas->tree, slots, mas->offset,
+			       wr_mas->offset_end);
+	for (i = mas->offset; i <= wr_mas->offset_end; i++) {
+		if (mas_slot_locked(mas, slots, i))
+			values++;
+	}
+
+	/* The ranges after the write: the new entry replaces @count of them. */
+	new_count = ma_dense_cnt_ranges(mas->tree, wr_mas->node, wr_mas->type,
+					mas->max) + 1 - count;
+	if (wr_mas->r_min < mas->index)
+		new_count++;
+
+	if (wr_mas->end_piv > mas->last)
+		new_count++;
+
+	if (!wr_mas->entry && new_count >= mt_slots[leaf] && values <= 1) {
+		/* The one slot that changes is the value, if there is one. */
+		for (i = mas->offset; values && i <= wr_mas->offset_end; i++) {
+			if (mas_slot_locked(mas, slots, i)) {
+				mas->index = mas->last = mas->min + i;
+				break;
+			}
+		}
+
+		mas_wr_dense_slot(wr_mas);
+		return wr_exact_fit;
+	}
+
+	if (new_count <= mt_min_slots[leaf])
+		return wr_rebalance;
+
+	if (wr_mas->entry && new_count > mt_slots[leaf])
+		return wr_split_store;
+
+	return wr_node_store;
+}
+
+/*
+ * mas_wr_dense_excess() - Keep the excess of a dense leaf current after the
+ * slot at @mas->offset went between a value and a NULL.
+ * @wr_mas: The maple write state
+ *
+ * A value splits the run of NULLs it lands in and a NULL joins the runs beside
+ * it, so each NULL neighbour is an entry gained or lost.  A NULL is then the
+ * whole run.
+ */
+static void mas_wr_dense_excess(struct ma_wr_state *wr_mas)
+{
+	struct ma_state *mas = wr_mas->mas;
+	struct maple_node *node = wr_mas->node;
+	enum maple_type type = wr_mas->type;
+	void __rcu **slots = wr_mas->slots;
+	unsigned char i = mas->offset;
+	unsigned char delta = 0;
+
+	if (i && !mas_slot_locked(mas, slots, i - 1))
+		delta++;
+
+	if (i < mas->end && !mas_slot_locked(mas, slots, i + 1))
+		delta++;
+
+	if (wr_mas->entry) {
+		ma_set_excess(node, type, ma_excess(node, type) + delta);
+		return;
+	}
+
+	ma_set_excess(node, type, ma_excess(node, type) - delta);
+	while (i && !mas_slot_locked(mas, slots, i - 1))
+		i--;
+
+	mas->index = mas->min + i;
+	i = mas->offset;
+	while (i < mas->end && !mas_slot_locked(mas, slots, i + 1))
+		i++;
+
+	mas->last = mas->min + i;
+}
+
 static inline void mas_wr_exact_fit(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
@@ -4528,6 +5471,9 @@ static inline void mas_wr_exact_fit(struct ma_wr_state *wr_mas)
 	rcu_assign_pointer(wr_mas->slots[mas->offset], wr_mas->entry);
 	if (!null_changed)
 		return;
+
+	if (unlikely(ma_is_dense(wr_mas->type)))
+		mas_wr_dense_excess(wr_mas);
 
 	if (!wr_mas->entry)
 		mas_wr_clear_marks(wr_mas);
@@ -4650,6 +5596,40 @@ static inline bool split_ascend(struct maple_copy *cp,
 }
 
 /*
+ * cp_fits_dense() - Does the data of a leaf that is being split fit one dense
+ * leaf?
+ * @cp: The maple copy node
+ * @wr_mas: The maple write state of the leaf
+ * @sib: The sibling, which is not used
+ *
+ * The range of the leaf must fit the slots of a dense leaf and every entry must
+ * be a single index or a NULL.  The range rules most leaves out at once.
+ */
+static bool cp_fits_dense(struct maple_copy *cp, struct ma_wr_state *wr_mas,
+		struct ma_state *sib)
+{
+	struct ma_state *mas = wr_mas->mas;
+	struct cp_iter it = { .next = mas->min };
+	unsigned char k;
+	u64 first;
+	bool null;
+
+	if (mas->max - mas->min >= mt_slots[mt_dense_type(mas->tree)])
+		return false;
+
+	sib->end = 0;
+	multi_src_setup(cp, wr_mas, wr_mas, sib);
+	it.offset = cp->src[0].start;
+	for (k = 0; k < cp->data; k++) {
+		first = it.next;
+		if (cp_iter_next(cp, mas->tree, &it, &null) != first && !null)
+			return false;
+	}
+
+	return true;
+}
+
+/*
  * split_data() - Calculate the @cp data, populate @sib if the data can be
  * pushed into a sibling.
  * @cp: The maple copy node
@@ -4670,9 +5650,13 @@ static inline void split_data(struct maple_copy *cp,
 		return;
 	}
 
+	/* A leaf that can turn into one dense leaf needs no sibling. */
+	if (ma_is_leaf(wr_mas->type) && cp_fits_dense(cp, wr_mas, sib))
+		return;
+
 	push_data_sib(cp, wr_mas->mas, sib, parent);
 	if (sib->end)
-		cp->data = cp->data + sib->end + 1;
+		cp->data = cp->data + mas_data_count(sib);
 }
 
 /*
@@ -4697,8 +5681,8 @@ static void mas_wr_split(struct ma_wr_state *wr_mas)
 		}
 		split_data(&cp, wr_mas, &sib, &parent);
 		multi_src_setup(&cp, wr_mas, wr_mas, &sib);
-		dst_setup(&cp, mas, wr_mas->type);
-		cp_data_write(&cp, mas);
+		dst_setup(&cp, mas, wr_mas->type, cp_data_min(mas, &sib));
+		cp_data_write(&cp, mas, cp_data_min(mas, &sib));
 	} while (split_ascend(&cp, wr_mas, &sib, &parent));
 
 	mas_wmb_replace(mas, &cp);
@@ -4740,8 +5724,8 @@ static void mas_wr_rebalance(struct ma_wr_state *wr_mas)
 		}
 		rebalance_data(&cp, wr_mas, &sib, &parent);
 		multi_src_setup(&cp, wr_mas, wr_mas, &sib);
-		dst_setup(&cp, mas, wr_mas->type);
-		cp_data_write(&cp, mas);
+		dst_setup(&cp, mas, wr_mas->type, cp_data_min(mas, &sib));
+		cp_data_write(&cp, mas, cp_data_min(mas, &sib));
 	} while (rebalance_ascend(&cp, wr_mas, &sib, &parent));
 
 	mas_wmb_replace(mas, &cp);
@@ -4766,7 +5750,11 @@ static inline void mas_wr_store_entry(struct ma_wr_state *wr_mas)
 		mas_wr_slot_store(wr_mas);
 		break;
 	case wr_node_store:
-		mas_wr_node_store(wr_mas);
+		/* A dense leaf is replaced through the copy path. */
+		if (unlikely(ma_is_dense(wr_mas->type)))
+			mas_wr_split(wr_mas);
+		else
+			mas_wr_node_store(wr_mas);
 		break;
 	case wr_spanning_store:
 		mas_wr_spanning_store(wr_mas);
@@ -4861,6 +5849,12 @@ static inline void mas_prealloc_calc(struct ma_wr_state *wr_mas, void *entry)
 		break;
 	case wr_split_store:
 		ret = delta * 2 + 1;
+		/*
+		 * A dense leaf can become three leaves, which a parent with one
+		 * free slot cannot take.
+		 */
+		if (unlikely(ma_is_dense(wr_mas->type)))
+			ret = height * 2 + 2;
 		break;
 	case wr_rebalance:
 		if (wr_mas->sufficient_height < wr_mas->vacant_height)
@@ -4869,7 +5863,8 @@ static inline void mas_prealloc_calc(struct ma_wr_state *wr_mas, void *entry)
 			ret = delta * 2 + 1;
 		break;
 	case wr_node_store:
-		ret = mt_in_rcu(mas->tree) ? 1 : 0;
+		/* A dense leaf is always replaced. */
+		ret = (mt_in_rcu(mas->tree) || ma_is_dense(wr_mas->type)) ? 1 : 0;
 		break;
 	case wr_new_root:
 		ret = 1;
@@ -4973,7 +5968,8 @@ walk:
 	}
 	mas->last = last;
 
-	if (mixed)
+	/* A dense leaf can hold three range leaves of entries. */
+	if (mixed || ma_is_dense(l_wr.type) || ma_is_dense(r_wr.type))
 		wr_mas->span_nodes = 3;
 	else if (l_mas.offset == l_mas.end &&
 		 l_mas.end == mt_slots[l_wr.type] - 1 &&
@@ -5009,6 +6005,9 @@ static inline enum store_type mas_wr_store_type(struct ma_wr_state *wr_mas)
 	}
 
 	/* At this point, we are at the leaf node that needs to be altered. */
+	if (unlikely(ma_is_dense(wr_mas->type)))
+		return mas_wr_dense_type(wr_mas);
+
 	mas_wr_end_piv(wr_mas);
 	/* A NULL joining a NULL in the next or previous node spans them. */
 	if (!wr_mas->entry && mas_wr_extend_null(wr_mas))
@@ -5112,7 +6111,12 @@ static inline void *mas_insert(struct ma_state *mas, void *entry)
 
 	/* At this point, we are at the leaf node that needs to be altered. */
 	if (mas->store_type != wr_new_root && mas->store_type != wr_store_root) {
-		wr_mas.offset_end = mas->offset;
+		/* A dense leaf holds a NULL in every slot of its run. */
+		if (unlikely(ma_is_dense(wr_mas.type)))
+			wr_mas.offset_end = wr_mas.r_max - mas->min;
+		else
+			wr_mas.offset_end = mas->offset;
+
 		wr_mas.end_piv = wr_mas.r_max;
 
 		if (wr_mas.content || (mas->last > wr_mas.r_max))
@@ -5309,7 +6313,7 @@ retry:
 		goto retry;
 
 	if (mas->min <= min) {
-		pivot = mas_safe_min(mas, node, type, mas->offset);
+		pivot = mas_leaf_min(mas, node, type, mas->offset);
 
 		if (unlikely(mas_rewalk_if_dead(mas, node, save_point)))
 			goto retry;
@@ -5322,7 +6326,7 @@ again:
 	if (likely(mas->offset)) {
 		mas->offset--;
 		mas->last = mas->index - 1;
-		mas->index = mas_safe_min(mas, node, type, mas->offset);
+		mas->index = mas_leaf_min(mas, node, type, mas->offset);
 	} else  {
 		if (mas->index <= min)
 			goto underflow;
@@ -5338,7 +6342,7 @@ again:
 		mas->last = mas->max;
 		node = mas_mn(mas);
 		type = mte_node_type(mas->node);
-		mas->index = ma_pivot(node, type, mas->offset - 1) + 1;
+		mas->index = mas_leaf_min(mas, node, type, mas->offset);
 	}
 
 	slots = ma_slots(node, type);
@@ -5354,6 +6358,26 @@ again:
 			goto underflow;
 
 		goto again;
+	}
+
+	if (unlikely(ma_is_dense(type))) {
+		unsigned char start = mas->offset;
+
+		/* A NULL is its whole run. */
+		while (mas->offset && !mas_slot(mas, slots, mas->offset - 1))
+			mas->offset--;
+
+		mas->index = mas->min + mas->offset;
+		if (unlikely(mas_rewalk_if_dead(mas, node, save_point)))
+			goto retry;
+
+		/* The state was inside this run, so it has been seen. */
+		if (start < mas->end && !mas_slot(mas, slots, start + 1)) {
+			if (mas->index <= min)
+				goto underflow;
+
+			goto again;
+		}
 	}
 
 	return entry;
@@ -5430,6 +6454,9 @@ static int mas_next_node(struct ma_state *mas, struct maple_node *node,
 	tmp = mte_to_node(enode);
 	mt = mte_node_type(enode);
 	mas->end = ma_data_end(tmp, mt, mas->max);
+	if (unlikely(ma_is_dense(mt)))
+		mas->end = mas->max - min;
+
 	if (unlikely(ma_dead_node(node)))
 		return 1;
 
@@ -5475,7 +6502,7 @@ retry:
 
 	if (mas->max >= max) {
 		if (likely(mas->offset < mas->end))
-			pivot = ma_pivot(node, type, mas->offset);
+			pivot = mas_leaf_pivot(mas, node, type, mas->offset);
 		else
 			pivot = mas->max;
 
@@ -5489,11 +6516,11 @@ retry:
 	}
 
 	if (likely(mas->offset < mas->end)) {
-		mas->index = ma_pivot(node, type, mas->offset) + 1;
+		mas->index = mas_leaf_pivot(mas, node, type, mas->offset) + 1;
 again:
 		mas->offset++;
 		if (likely(mas->offset < mas->end))
-			mas->last = ma_pivot(node, type, mas->offset);
+			mas->last = mas_leaf_pivot(mas, node, type, mas->offset);
 		else
 			mas->last = mas->max;
 	} else  {
@@ -5515,7 +6542,7 @@ next_node:
 		mas->index = mas->min;
 		node = mas_mn(mas);
 		type = mte_node_type(mas->node);
-		mas->last = ma_pivot(node, type, 0);
+		mas->last = mas_leaf_pivot(mas, node, type, 0);
 	}
 
 	slots = ma_slots(node, type);
@@ -5533,11 +6560,35 @@ next_node:
 			return NULL;
 		}
 
+skip:
 		mas->index = mas->last + 1;
 		/* A node may end in a NULL; carry on into the next one. */
 		if (mas->offset < mas->end)
 			goto again;
 		goto next_node;
+	}
+
+	if (unlikely(ma_is_dense(type))) {
+		unsigned char start = mas->offset;
+
+		/* A NULL is its whole run. */
+		while (mas->offset < mas->end &&
+		       !mt_slot(mas->tree, slots, mas->offset + 1))
+			mas->offset++;
+
+		mas->last = mas->min + mas->offset;
+		if (unlikely(mas_rewalk_if_dead(mas, node, save_point)))
+			goto retry;
+
+		/* The state was inside this run, so it has been seen. */
+		if (start && !mt_slot(mas->tree, slots, start - 1)) {
+			if (mas->last >= max) {
+				mas->status = ma_overflow;
+				return NULL;
+			}
+
+			goto skip;
+		}
 	}
 
 	return entry;
@@ -5566,13 +6617,30 @@ static bool mas_rev_awalk(struct ma_state *mas, unsigned long size,
 	if (unlikely(mas_is_err(mas)))
 		return true;
 
+	slots = ma_slots(node, type);
 	if (ma_is_dense(type)) {
-		/* dense nodes. */
-		mas->offset = mas->index - mas->min;
-		return true;
+		/* The highest run of NULLs of @size within the window. */
+		for (offset = mas->offset; ; offset--) {
+			min = mas->min + offset;
+			if (min <= mas->last && !mas_slot(mas, slots, offset)) {
+				if (++gap >= size) {
+					mas->offset = offset;
+					*gap_min = min;
+					*gap_max = min + gap - 1;
+					return true;
+				}
+			} else {
+				gap = 0;
+			}
+
+			if (min <= mas->index)
+				goto no_space;
+
+			if (!offset)
+				goto ascend;
+		}
 	}
 
-	slots = ma_slots(node, type);
 	gap_array = type == maple_arange_64 || type == maple_arange_32;
 	offset = mas->offset;
 	min = mas_safe_min(mas, node, type, offset);
@@ -5648,15 +6716,34 @@ static inline bool mas_anode_descend(struct ma_state *mas, unsigned long size)
 	bool found = false;
 	bool gap_array;
 
-	if (ma_is_dense(type)) {
-		mas->offset = mas->index - mas->min;
-		return true;
-	}
-
 	node = mas_mn(mas);
 	slots = ma_slots(node, type);
-	gap_array = type == maple_arange_64 || type == maple_arange_32;
 	offset = mas->offset;
+	if (ma_is_dense(type)) {
+		/* The lowest run of NULLs of @size within the window. */
+		data_end = mas->max - mas->min;
+		for (; offset <= data_end; offset++) {
+			pivot = mas->min + offset;
+			if (pivot >= mas->index && !mas_slot(mas, slots, offset)) {
+				if (++gap >= size) {
+					mas->offset = offset + 1 - gap;
+					return true;
+				}
+			} else {
+				gap = 0;
+			}
+
+			if (mas->last <= pivot) {
+				mas_set_err(mas, -EBUSY);
+				return true;
+			}
+		}
+
+		mas->offset = offset;
+		return false;
+	}
+
+	gap_array = type == maple_arange_64 || type == maple_arange_32;
 	data_end = ma_data_end(node, type, mas->max);
 	min = mas_safe_min(mas, node, type, offset);
 	for (; offset <= data_end; offset++) {
@@ -5908,6 +6995,9 @@ ascend:
 			return 1;
 
 		if (ma_is_leaf(mt)) {
+			if (unlikely(ma_is_dense(mt)))
+				end = mas->max - mas->min;
+
 			mas->end = end;
 			return 0;
 		}
@@ -5950,7 +7040,7 @@ retry:
 		u64 pivot;
 
 		if (likely(mas->offset < mas->end))
-			pivot = ma_pivot(node, type, mas->offset);
+			pivot = mas_leaf_pivot(mas, node, type, mas->offset);
 		else
 			pivot = mas->max;
 
@@ -5964,7 +7054,7 @@ retry:
 	}
 
 	if (likely(mas->offset < mas->end)) {
-		mas->index = ma_pivot(node, type, mas->offset) + 1;
+		mas->index = mas_leaf_pivot(mas, node, type, mas->offset) + 1;
 		mas->offset++;
 	} else {
 		if (mas->last >= max) {
@@ -6006,10 +7096,10 @@ retry:
 		}
 
 		mas->offset = slot;
-		mas->index = mas_safe_min(mas, node, type, mas->offset);
+		mas->index = mas_leaf_min(mas, node, type, mas->offset);
 
 		if (likely(mas->offset < mas->end))
-			mas->last = ma_pivot(node, type, mas->offset);
+			mas->last = mas_leaf_pivot(mas, node, type, mas->offset);
 		else
 			mas->last = mas->max;
 
@@ -6218,11 +7308,11 @@ int mas_empty_area(struct ma_state *mas, unsigned long min,
 	offset = mas->offset;
 	node = mas_mn(mas);
 	mt = mte_node_type(mas->node);
-	min = mas_safe_min(mas, node, mt, offset);
+	min = mas_leaf_min(mas, node, mt, offset);
 	if (mas->index < min)
 		mas->index = min;
 	mas->last = mas->index + size - 1;
-	mas->end = ma_data_end(node, mt, mas->max);
+	mas->end = mas_data_end(mas);
 	return 0;
 }
 EXPORT_SYMBOL_GPL(mas_empty_area);
@@ -8827,11 +9917,34 @@ static void mt_dump_node(const struct maple_tree *mt, void *entry,
 	case maple_dense:
 		pr_cont(" | %02X %02X|\n", node->dense.meta.end,
 			node->dense.meta.gap);
-		for (i = 0; i < mt_slots[type]; i++) {
-			if (min + i > max)
-				pr_cont("OUT OF RANGE: ");
-			mt_dump_entry(mt_slot(mt, node->slot, i),
-					min + i, min + i, depth, format);
+		for (i = 0; i < mt_slots[type] && min + i <= max; i++)
+			mt_dump_entry(mt_slot(mt, node->dense.slot, i),
+					min + i, min + i, depth + 1, format);
+		break;
+	case maple_mdense:
+		pr_cont(" | %02X %02X|\n", node->mdense.meta.end,
+			node->mdense.meta.gap);
+		for (i = 0; i < mt_slots[type] && min + i <= max; i++) {
+			void *child = mt_slot(mt, node->mdense.slot, i);
+			char marks[12];
+			int m;
+
+			if (!child) {
+				mt_dump_entry(child, min + i, min + i,
+					      depth + 1, format);
+				continue;
+			}
+
+			marks[0] = '[';
+			for (m = 0; m <= MT_MARK_MAX; m++)
+				marks[1 + m + (m >= 4)] =
+					ma_mark_test(node->mdense.mark, type, i,
+						     (mt_mark_t)m) ? 'x' : '.';
+			marks[5] = ' ';
+			marks[10] = ']';
+			marks[11] = '\0';
+			mt_dump_marked_entry(child, min + i, min + i, depth + 1,
+					     marks, format);
 		}
 		break;
 	case maple_leaf_64:
@@ -8897,14 +10010,15 @@ static void mas_validate_gaps(struct ma_state *mas)
 	unsigned int i;
 
 	if (ma_is_dense(mt)) {
-		for (i = 0; i < mt_slot_count(mte); i++) {
+		/* The longest run of NULLs. */
+		for (i = 0; i <= mas->max - mas->min; i++) {
 			if (mas_get_slot(mas, i)) {
-				if (gap > max_gap)
-					max_gap = gap;
 				gap = 0;
 				continue;
 			}
-			gap++;
+
+			if (++gap > max_gap)
+				max_gap = gap;
 		}
 		goto counted;
 	}
@@ -9067,7 +10181,10 @@ static void mas_validate_limits(struct ma_state *mas)
 	for (i = 0; i < mt_slots[type]; i++) {
 		u64 piv;
 
-		piv = mas_safe_pivot(mas, mas_mn(mas), type, i);
+		if (ma_is_dense(type))
+			piv = mas->min + i;
+		else
+			piv = mas_safe_pivot(mas, mas_mn(mas), type, i);
 
 		if (!piv && (i != 0)) {
 			pr_err("Missing node limit pivot at " PTR_FMT "[%u]",
@@ -9142,11 +10259,13 @@ static void mt_validate_nulls(struct maple_tree *mt)
 	slots = ma_slots(mte_to_node(mas.node), mte_node_type(mas.node));
 	do {
 		entry = mas_slot(&mas, slots, offset);
-		if (!last && !entry) {
+		/* A dense leaf holds runs of NULLs, but not across its edges. */
+		if (!last && !entry &&
+		    !(offset && ma_is_dense(mte_node_type(mas.node)))) {
 			pr_err("Sequential nulls end at " PTR_FMT "[%u]\n",
 				mas_mn(&mas), offset);
+			MT_BUG_ON(mt, 1);
 		}
-		MT_BUG_ON(mt, !last && !entry);
 		last = entry;
 		if (offset == mas_data_end(&mas)) {
 			mas_next_node(&mas, mas_mn(&mas), U64_MAX);
@@ -9216,6 +10335,23 @@ static void mas_validate_marks(struct ma_state *mas)
 	}
 }
 
+/* The excess of a dense leaf must match its entries, and there must be some. */
+static void mas_validate_dense(struct ma_state *mas)
+{
+	enum maple_type type = mte_node_type(mas->node);
+	struct maple_node *node = mas_mn(mas);
+	unsigned char count, excess;
+
+	count = ma_dense_count(mas->tree, ma_slots(node, type), 0,
+			       mas->max - mas->min);
+	excess = mt_dense_excess(mas->tree, mas->max, count);
+	if (!excess || ma_excess(node, type) != excess) {
+		pr_err("dense " PTR_FMT " excess %u != %u for %u entries\n",
+		       node, ma_excess(node, type), excess, count);
+		MT_BUG_ON(mas->tree, 1);
+	}
+}
+
 /*
  * validate a maple tree by checking:
  * 1. The limits (pivots are within mas->min to mas->max)
@@ -9238,14 +10374,19 @@ void mt_validate(struct maple_tree *mt)
 	while (!mas_is_overflow(&mas)) {
 		MAS_WARN_ON(&mas, mte_dead_node(mas.node));
 		end = mas_data_end(&mas);
+		/* A dense leaf is sized by its excess, not a minimum. */
 		if (MAS_WARN_ON(&mas, (end < mt_min_slot_count(mas.node)) &&
-				(!mte_is_root(mas.node)))) {
+				!mte_is_root(mas.node) &&
+				!ma_is_dense(mte_node_type(mas.node)))) {
 			pr_err("Invalid size %u of " PTR_FMT "\n",
 			       end, mas_mn(&mas));
 		}
 
 		mas_validate_parent_slot(&mas);
 		mas_validate_limits(&mas);
+		if (ma_is_dense(mte_node_type(mas.node)))
+			mas_validate_dense(&mas);
+
 		mas_validate_child_slot(&mas);
 		if (mt_is_alloc(mt))
 			mas_validate_gaps(&mas);
