@@ -44,6 +44,7 @@ atomic_t maple_tree_tests_passed;
 /* #define BENCH_SLOT_STORE */
 /* #define BENCH_NODE_STORE */
 /* #define BENCH_AWALK */
+/* #define BENCH_AWALK_VMA */
 /* #define BENCH_WALK */
 /* #define BENCH_LOAD */
 /* #define BENCH_MT_FOR_EACH */
@@ -1644,6 +1645,69 @@ static noinline void __init bench_awalk(struct maple_tree *mt)
 	}
 }
 #endif
+
+#if defined(BENCH_AWALK_VMA)
+/*
+ * The address space of a process: text and heap at the bottom, a stack at the
+ * top, and the mmap region filled downwards from its base with libraries of
+ * four mappings each, a page of alignment hole above every library and a 64K
+ * hole above every 64th.  The searches are the top-down ones mmap() makes: a
+ * page, which the first hole fits; 64K, which is a dozen leaves down; and 2M,
+ * which only the space below the lowest library fits.
+ */
+static noinline void __init bench_awalk_vma(struct maple_tree *mt)
+{
+	const unsigned long page = 4096, groups = 800;
+	const unsigned long sizes[] = { page, 16 * page, 512 * page };
+	unsigned long mmap_base = (ULONG_MAX / 2 + 1) & ~(page - 1);
+	unsigned long top, hole, expected[3] = { 0 };
+	int i, count = 20000000;
+	MA_STATE(mas, mt, 0, 0);
+
+	/* text, data, heap */
+	mtree_store_range(mt, 64 * page, 320 * page - 1, xa_mk_value(1),
+			  GFP_KERNEL);
+	mtree_store_range(mt, 320 * page, 324 * page - 1, xa_mk_value(2),
+			  GFP_KERNEL);
+	mtree_store_range(mt, 324 * page, 1348 * page - 1, xa_mk_value(3),
+			  GFP_KERNEL);
+	/* stack */
+	mtree_store_range(mt, ULONG_MAX - 2048 * page + 1, ULONG_MAX - page,
+			  xa_mk_value(4), GFP_KERNEL);
+
+	top = mmap_base;
+	for (i = 0; i < groups; i++) {
+		hole = (i % 64 == 63) ? 16 * page : page;
+		if (i == 63)
+			expected[1] = top - 1;
+		top -= hole;
+		/* text, rodata, data, bss */
+		mtree_store_range(mt, top - 40 * page, top - 1,
+				  xa_mk_value(i), GFP_KERNEL);
+		mtree_store_range(mt, top - 48 * page, top - 40 * page - 1,
+				  xa_mk_value(i), GFP_KERNEL);
+		mtree_store_range(mt, top - 50 * page, top - 48 * page - 1,
+				  xa_mk_value(i), GFP_KERNEL);
+		mtree_store_range(mt, top - 51 * page, top - 50 * page - 1,
+				  xa_mk_value(i), GFP_KERNEL);
+		top -= 51 * page;
+	}
+	expected[0] = mmap_base - 1;
+	expected[2] = top - 1;
+
+	for (i = 0; i < count; i++) {
+		int s = i % 3;
+
+		mas_reset(&mas);
+		if (mas_empty_area_rev(&mas, 0, mmap_base - 1, sizes[s]) ||
+		    mas.last != expected[s]) {
+			MT_BUG_ON(mt, 1);
+			break;
+		}
+	}
+}
+#endif
+
 #if defined(BENCH_WALK)
 static noinline void __init bench_walk(struct maple_tree *mt)
 {
@@ -4075,6 +4139,13 @@ static int __init maple_tree_seed(void)
 #define BENCH
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
 	bench_awalk(&tree);
+	mtree_destroy(&tree);
+	goto skip;
+#endif
+#if defined(BENCH_AWALK_VMA)
+#define BENCH
+	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	bench_awalk_vma(&tree);
 	mtree_destroy(&tree);
 	goto skip;
 #endif
