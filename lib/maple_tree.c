@@ -7225,115 +7225,127 @@ skip:
 }
 
 /*
- * mas_rev_awalk() - Internal function.  Reverse allocation walk.  Find the
- * highest gap address of a given size in a given node and descend.
- * @mas: The maple state
+ * mas_rev_anode_descend() - Descend to the highest gap of @size within the
+ * window.
+ * @mas: The maple state, at the node and the offset to start from
  * @size: The needed size.
  *
- * Return: True if found in a leaf, false otherwise.
- *
+ * Sets -EBUSY when the window is exhausted.
+ * Return: true with @mas->offset at the gap in the leaf, false if there is
+ * none in or below this node.
  */
-static bool mas_rev_awalk(struct ma_state *mas, unsigned long size,
-		unsigned long *gap_min, unsigned long *gap_max)
+static bool mas_rev_anode_descend(struct ma_state *mas, unsigned long size)
 {
-	enum maple_type type = mte_node_type(mas->node);
-	struct maple_node *node = mas_mn(mas);
+	struct maple_node *node;
+	enum maple_type type;
 	void __rcu **slots;
 	struct ma_pivs pivs;
-	u64 gap = 0;
-	u64 max, min;
 	unsigned char offset, node_pivots;
-	bool gap_array;
+	u64 gap, max, min;
+	bool gap_array, leaf;
 
-	if (unlikely(mas_is_err(mas)))
-		return true;
+	do {
+		type = mte_node_type(mas->node);
+		leaf = ma_is_leaf(type);
+		node = mas_mn(mas);
+		slots = ma_slots(node, type);
+		offset = mas->offset;
+		gap = 0;
+		if (ma_is_dense(type)) {
+			unsigned char low = 0;
 
-	slots = ma_slots(node, type);
-	if (ma_is_dense(type)) {
-		/* The highest run of NULLs of @size within the window. */
-		for (offset = mas->offset; ; offset--) {
-			min = mas->min + offset;
-			if (min <= mas->last && !mas_slot(mas, slots, offset)) {
-				if (++gap >= size) {
-					mas->offset = offset;
-					*gap_min = min;
-					*gap_max = min + gap - 1;
-					return true;
+			/* The window within the leaf: its top slot to its bottom. */
+			if (mas->last < mas->min)
+				goto ascend;
+			if (mas->last - mas->min < offset)
+				offset = mas->last - mas->min;
+			if (mas->index > mas->min)
+				low = mas->index - mas->min;
+			if (offset < low)
+				goto no_space;
+
+			/* The highest run of NULLs of @size within the window. */
+			for (;; offset--) {
+				if (mas_slot(mas, slots, offset))
+					gap = 0;
+				else if (++gap >= size)
+					break;
+
+				if (offset == low) {
+					if (mas->index >= mas->min)
+						goto no_space;
+					goto ascend;
 				}
-			} else {
-				gap = 0;
 			}
 
-			if (min <= mas->index)
-				goto no_space;
+			min = mas->min + offset;
+			continue;
+		}
+
+		gap_array = type == maple_arange_64 || type == maple_arange_32;
+		pivs = ma_pivs_of(node, type, mas->min);
+		if (gap_array)
+			ma_pivs_gaps(&pivs, node, type);
+		node_pivots = mt_pivots[type];
+		min = ma_pivs_first(&pivs, offset);
+		/* Skip out of bounds. */
+		while (mas->last < min)
+			min = ma_pivs_first(&pivs, --offset);
+
+		max = mas->max;
+		if (offset < node_pivots)
+			max = ma_pivs_last(&pivs, offset);
+		while (mas->index <= max) {
+			if (gap_array)
+				gap = ma_pivs_gap(&pivs, offset);
+			else if (!mas_slot(mas, slots, offset))
+				gap = max - min + 1;
+			else
+				gap = 0;
+
+			if (gap) {
+				/* The window may be the whole space: no + 1. */
+				if (size <= gap && size - 1 <= mas->last - min)
+					break;
+
+				if (!gap_array) {
+					/* Skip the next slot, it cannot be a gap. */
+					if (offset < 2)
+						goto ascend;
+
+					offset -= 2;
+					max = ma_pivs_last(&pivs, offset);
+					min = ma_pivs_first(&pivs, offset);
+					continue;
+				}
+			}
 
 			if (!offset)
 				goto ascend;
-		}
-	}
 
-	gap_array = type == maple_arange_64 || type == maple_arange_32;
-	pivs = ma_pivs_of(node, type, mas->min);
-	if (gap_array)
-		ma_pivs_gaps(&pivs, node, type);
-	node_pivots = mt_pivots[type];
-	offset = mas->offset;
-	min = ma_pivs_first(&pivs, offset);
-	/* Skip out of bounds. */
-	while (mas->last < min)
-		min = ma_pivs_first(&pivs, --offset);
-
-	max = mas->max;
-	if (offset < node_pivots)
-		max = ma_pivs_last(&pivs, offset);
-	while (mas->index <= max) {
-		gap = 0;
-		if (gap_array)
-			gap = ma_pivs_gap(&pivs, offset);
-		else if (!mas_slot(mas, slots, offset))
-			gap = max - min + 1;
-
-		if (gap) {
-			/* The window may be the whole space: no + 1. */
-			if (size <= gap && size - 1 <= mas->last - min)
-				break;
-
-			if (!gap_array) {
-				/* Skip the next slot, it cannot be a gap. */
-				if (offset < 2)
-					goto ascend;
-
-				offset -= 2;
-				max = ma_pivs_last(&pivs, offset);
-				min = ma_pivs_first(&pivs, offset);
-				continue;
-			}
+			offset--;
+			max = min - 1;
+			min = ma_pivs_first(&pivs, offset);
 		}
 
-		if (!offset)
-			goto ascend;
+		/* The gap of a node is its largest; the part above @index must do. */
+		if (unlikely((mas->index > max) ||
+			     (size - 1 > max - mas->index)))
+			goto no_space;
 
-		offset--;
-		max = min - 1;
-		min = ma_pivs_first(&pivs, offset);
-	}
+		if (!leaf) {
+			/* descend, only happens under lock. */
+			mas->node = mas_slot(mas, slots, offset);
+			mas->min = min;
+			mas->max = max;
+			mas->offset = mas_data_end(mas);
+		}
+	} while (!leaf);
 
-	if (unlikely((mas->index > max) || (size - 1 > max - mas->index)))
-		goto no_space;
-
-	if (unlikely(ma_is_leaf(type))) {
-		mas->offset = offset;
-		*gap_min = min;
-		*gap_max = min + gap - 1;
-		return true;
-	}
-
-	/* descend, only happens under lock. */
-	mas->node = mas_slot(mas, slots, offset);
-	mas->min = min;
-	mas->max = max;
-	mas->offset = mas_data_end(mas);
-	return false;
+	mas->offset = offset;
+	if (mas->last > min + gap - 1)
+		mas->last = min + gap - 1;
+	return true;
 
 ascend:
 	if (!mte_is_root(mas->node))
@@ -7344,89 +7356,106 @@ no_space:
 	return false;
 }
 
+/*
+ * mas_anode_descend() - Descend to the lowest gap of @size within the window.
+ * @mas: The maple state, at the node and the offset to start from
+ * @size: The needed size.
+ *
+ * Sets -EBUSY when the window ends without a gap.
+ *
+ * Return: true with @mas->offset at the gap in the leaf, false if there is
+ * none in or below this node, which is then left past its end for
+ * mas_skip_node().
+ */
 static inline bool mas_anode_descend(struct ma_state *mas, unsigned long size)
 {
-	enum maple_type type = mte_node_type(mas->node);
-	u64 pivot, min, gap = 0;
+	u64 pivot, min, gap;
 	unsigned char offset, data_end, node_pivots;
-	void __rcu **slots;
 	struct maple_node *node;
+	enum maple_type type;
+	void __rcu **slots;
 	struct ma_pivs pivs;
-	bool found = false;
-	bool gap_array;
+	bool gap_array, leaf;
 
-	node = mas_mn(mas);
-	slots = ma_slots(node, type);
-	offset = mas->offset;
-	if (ma_is_dense(type)) {
-		/* The lowest run of NULLs of @size within the window. */
-		data_end = mas->max - mas->min;
-		for (; offset <= data_end; offset++) {
-			pivot = mas->min + offset;
-			if (pivot >= mas->index && !mas_slot(mas, slots, offset)) {
-				if (++gap >= size) {
-					mas->offset = offset + 1 - gap;
-					return true;
+	pivot = 0;
+	do {
+		type = mte_node_type(mas->node);
+		leaf = ma_is_leaf(type);
+		node = mas_mn(mas);
+		slots = ma_slots(node, type);
+		offset = mas->offset;
+		if (ma_is_dense(type)) {
+			/* The lowest run of NULLs of @size within the window. */
+			data_end = mas->max - mas->min;
+			gap = 0;
+			for (; offset <= data_end; offset++) {
+				pivot = mas->min + offset;
+				if (pivot >= mas->index &&
+				    !mas_slot(mas, slots, offset)) {
+					if (++gap >= size) {
+						mas->offset = offset + 1 - gap;
+						return true;
+					}
+				} else {
+					gap = 0;
 				}
-			} else {
-				gap = 0;
+
+				if (mas->last <= pivot) {
+					mas_set_err(mas, -EBUSY);
+					return false;
+				}
 			}
+
+			mas->offset = offset;
+			return false;
+		}
+
+		gap_array = type == maple_arange_64 || type == maple_arange_32;
+		pivs = ma_pivs_of(node, type, mas->min);
+		if (gap_array)
+			ma_pivs_gaps(&pivs, node, type);
+		node_pivots = mt_pivots[type];
+		data_end = ma_data_end(node, type, mas->max);
+		min = ma_pivs_first(&pivs, offset);
+		for (; offset <= data_end; offset++, min = pivot + 1) {
+			pivot = mas->max;
+			if (offset < node_pivots)
+				pivot = ma_pivs_last(&pivs, offset);
+			/* Not within lower bounds */
+			if (mas->index > pivot)
+				continue;
+
+			if (gap_array)
+				gap = ma_pivs_gap(&pivs, offset);
+			else if (!mas_slot(mas, slots, offset))
+				gap = min(pivot, mas->last) - max(mas->index, min) + 1;
+			else
+				gap = 0;
+
+			if (gap >= size)
+				break;
 
 			if (mas->last <= pivot) {
 				mas_set_err(mas, -EBUSY);
-				return true;
+				return false;
 			}
 		}
 
-		mas->offset = offset;
-		return false;
-	}
+		if (offset > data_end) {
+			mas->offset = offset;
+			return false;
+		}
 
-	gap_array = type == maple_arange_64 || type == maple_arange_32;
-	pivs = ma_pivs_of(node, type, mas->min);
-	if (gap_array)
-		ma_pivs_gaps(&pivs, node, type);
-	node_pivots = mt_pivots[type];
-	data_end = ma_data_end(node, type, mas->max);
-	min = ma_pivs_first(&pivs, offset);
-	for (; offset <= data_end; offset++) {
-		pivot = mas->max;
-		if (offset < node_pivots)
-			pivot = ma_pivs_last(&pivs, offset);
-
-		/* Not within lower bounds */
-		if (mas->index > pivot)
-			goto next_slot;
-
-		if (gap_array)
-			gap = ma_pivs_gap(&pivs, offset);
-		else if (!mas_slot(mas, slots, offset))
-			gap = min(pivot, mas->last) - max(mas->index, min) + 1;
-		else
-			goto next_slot;
-
-		if (gap >= size) {
-			if (ma_is_leaf(type)) {
-				found = true;
-				break;
-			}
-
+		if (!leaf) {
 			mas->node = mas_slot(mas, slots, offset);
 			mas->min = min;
 			mas->max = pivot;
-			offset = 0;
-			break;
+			mas->offset = 0;
 		}
-next_slot:
-		min = pivot + 1;
-		if (mas->last <= pivot) {
-			mas_set_err(mas, -EBUSY);
-			return true;
-		}
-	}
+	} while (!leaf);
 
 	mas->offset = offset;
-	return found;
+	return true;
 }
 
 /**
@@ -7860,15 +7889,26 @@ void *mas_find_marked_rev(struct ma_state *mas, unsigned long min,
 }
 EXPORT_SYMBOL_GPL(mas_find_marked_rev);
 
+/*
+ * mas_rewind_node() - Rewind to the node before this one.
+ * @mas: The maple state.
+ *
+ * Return: true if there is another node, false otherwise.
+ */
 static inline bool mas_rewind_node(struct ma_state *mas)
 {
 	unsigned char slot;
 
+	if (mas_is_err(mas))
+		return false;
+
 	do {
 		if (mte_is_root(mas->node)) {
 			slot = mas->offset;
-			if (!slot)
+			if (!slot) {
+				mas_set_err(mas, -EBUSY);
 				return false;
+			}
 		} else {
 			mas_ascend(mas);
 			slot = mas->offset;
@@ -7880,7 +7920,23 @@ static inline bool mas_rewind_node(struct ma_state *mas)
 }
 
 /*
- * mas_skip_node() - Internal function.  Skip over a node.
+ * mas_rev_awalk() - Reverse allocation walk.  Search from high address to low,
+ * for a gap of @size between @mas->index and @mas->last.
+ * @mas: The maple state
+ * @size: The size of the gap required
+ */
+static inline void mas_rev_awalk(struct ma_state *mas, unsigned long size)
+{
+	do {
+		if (mas_rev_anode_descend(mas, size))
+			return;
+
+		mas_rewind_node(mas);
+	} while (!mas_is_err(mas));
+}
+
+/*
+ * mas_skip_node() - Skip to the next node.
  * @mas: The maple state.
  *
  * Return: true if there is another node, false otherwise.
@@ -7915,28 +7971,17 @@ static inline bool mas_skip_node(struct ma_state *mas)
  */
 static inline void mas_awalk(struct ma_state *mas, unsigned long size)
 {
-	struct maple_enode *last;
-
-	/*
-	 * There are 4 options:
-	 * go to child (descend)
-	 * go back to parent (ascend)
-	 * no gap found. (return, error == -EBUSY)
-	 * found the gap. (return)
-	 */
 	do {
-		last = mas->node;
 		if (mas_anode_descend(mas, size))
 			return;
 
-		if (last == mas->node)
-			mas_skip_node(mas);
+		mas_skip_node(mas);
 	} while (!mas_is_err(mas));
 }
 
 /*
- * mas_sparse_area() - Internal function.  Return upper or lower limit when
- * searching for a gap in an empty tree.
+ * mas_sparse_area() - Return upper or lower limit when searching for a gap in
+ * an empty tree.
  * @mas: The maple state
  * @min: the minimum range
  * @max: The maximum range
@@ -8035,8 +8080,6 @@ EXPORT_SYMBOL_GPL(mas_empty_area);
 int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
 		unsigned long max, unsigned long size)
 {
-	struct maple_enode *last = mas->node;
-
 	if (min > max)
 		return -EINVAL;
 
@@ -8059,25 +8102,10 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
 	/* The start of the window can only be within these values. */
 	mas->index = min;
 	mas->last = max;
-
-	while (!mas_rev_awalk(mas, size, &min, &max)) {
-		if (last == mas->node) {
-			if (!mas_rewind_node(mas))
-				return -EBUSY;
-		} else {
-			last = mas->node;
-		}
-	}
+	mas_rev_awalk(mas, size);
 
 	if (mas_is_err(mas))
 		return xa_err(mas->node);
-
-	if (unlikely(mas->offset == MAPLE_NODE_SLOTS))
-		return -EBUSY;
-
-	/* Trim the upper limit to the max. */
-	if (max < mas->last)
-		mas->last = max;
 
 	mas->index = mas->last - size + 1;
 	mas->end = mas_data_end(mas);
