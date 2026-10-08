@@ -35587,8 +35587,9 @@ static u64 fill_to_split(struct maple_tree *mt, u64 next, unsigned long width)
 }
 
 /*
- * Halve entries of @width indexes in the leaf holding @index until that leaf
- * is full.  A width of 4 leaves pairs, which keep the leaf out of a dense leaf.
+ * Split @width / 2 indexes off entries of at least @width indexes in the leaf
+ * holding @index until that leaf is full.  A width of 4 leaves pairs, which
+ * keep the leaf out of a dense leaf.
  */
 static void fill_leaf(struct maple_tree *mt, u64 index, unsigned long width)
 {
@@ -35613,7 +35614,7 @@ static void fill_leaf(struct maple_tree *mt, u64 index, unsigned long width)
 		for (off = 0; off <= end; off++) {
 			lo = mas_safe_min(&mas, node, type, off);
 			up = mas_safe_pivot(&mas, node, type, off);
-			if (mas_get_slot(&mas, off) && up == lo + width - 1)
+			if (mas_get_slot(&mas, off) && up >= lo + width - 1)
 				break;
 		}
 		mas_unlock(&mas);
@@ -35906,6 +35907,77 @@ static void check_born32_seam(struct maple_tree *mt, unsigned int flags)
 	mtree_destroy(mt);
 }
 
+/*
+ * Splitting the 4G seam leaf below 4G gives a half holding only sub-4G
+ * data.  It is born 32-bit when it meets the 32-bit minimum.  When it would be
+ * insufficient it stays 64-bit, and overflowing it is the first write with
+ * enough data for the 32-bit type, which narrows it.
+ */
+static void check_born32_narrow(struct maple_tree *mt, unsigned int flags)
+{
+	u64 hi = (u64)U32_MAX + 1, next, b_min, max, i;
+	void *pv = xa_mk_value(0x1234), *v = xa_mk_value(0x5678);
+	enum maple_type type, t32;
+	unsigned char end;
+	MA_STATE(mas, mt, 0, 0);
+
+	/* Wide entries give fill_leaf() room to split without going dense. */
+	mt_init_flags(mt, flags);
+	for (i = 0; i < 600; i++)
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, i * 16, i * 16 + 15,
+						    xa_mk_value(i), GFP_KERNEL));
+	next = fill_to_split(mt, 9600, 16);
+	MT_BUG_ON(mt, mt_height(mt) < 2);
+
+	/* Promote; the right-most leaf widens in place across the 4G seam. */
+	MT_BUG_ON(mt, mtree_store_range_u64(mt, hi, hi, pv, GFP_KERNEL));
+	mas_lock(&mas);
+	mas_set_range(&mas, hi, hi);
+	MT_BUG_ON(mt, mas_walk(&mas) != pv);
+	type = mte_node_type(mas.node);
+	b_min = mas.min;
+	mas_unlock(&mas);
+	MT_BUG_ON(mt, node_is_32b(type) || b_min >= hi);
+
+	/*
+	 * Fill the left neighbour so nothing is pushed into it, then fill
+	 * below the 4G seam and split there.
+	 */
+	t32 = leaf_type_at(mt, b_min - 1);
+	MT_BUG_ON(mt, !node_is_32b(t32));
+	fill_leaf(mt, b_min - 1, 4);
+	fill_leaf(mt, b_min, 4);
+	MT_BUG_ON(mt, mtree_insert_u64(mt, next, v, GFP_KERNEL));
+	mas_lock(&mas);
+	mas_set_range(&mas, b_min, b_min);
+	MT_BUG_ON(mt, !mas_walk(&mas));
+	type = mte_node_type(mas.node);
+	end = mas_data_end(&mas);
+	max = mas.max;
+	mas_unlock(&mas);
+	MT_BUG_ON(mt, max >= hi);
+	MT_BUG_ON(mt, node_is_32b(type) != (end >= mt_min_slots[t32]));
+
+	/*
+	 * A half insufficient for the 32-bit type: fill the 4G seam leaf on the
+	 * right too, then overflow it.  Its data now fits one 32-bit leaf.
+	 */
+	if (!node_is_32b(type)) {
+		fill_last_leaf(mt, hi + 1);
+		fill_leaf(mt, b_min, 4);
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, b_min, b_min, v,
+						    GFP_KERNEL));
+		MT_BUG_ON(mt, !node_is_32b(leaf_type_at(mt, b_min)));
+		MT_BUG_ON(mt, mtree_load_u64(mt, b_min) != v);
+	}
+
+	MT_BUG_ON(mt, mtree_load_u64(mt, b_min + 1) == NULL);
+	MT_BUG_ON(mt, mtree_load_u64(mt, next) != v);
+	MT_BUG_ON(mt, mtree_load_u64(mt, hi) != pv);
+	mt_validate(mt);
+	mtree_destroy(mt);
+}
+
 /* Duplicating a promoted tree copies both node widths intact. */
 static void check_born32_dup(struct maple_tree *mt, unsigned int flags)
 {
@@ -35933,7 +36005,10 @@ static void check_born32_dup(struct maple_tree *mt, unsigned int flags)
 	mtree_destroy(mt);
 }
 
-/* Gap searches see the space on both sides of the seam of a promoted tree. */
+/*
+ * Gap searches see the free space above the ceiling of a born-32 tree, joined
+ * to its trailing NULL, and both sides of the 4G seam once promoted.
+ */
 static void check_born32_gaps(struct maple_tree *mt, unsigned int flags)
 {
 	u64 hi = (u64)U32_MAX + 1, i;
@@ -35944,6 +36019,45 @@ static void check_born32_gaps(struct maple_tree *mt, unsigned int flags)
 	for (i = 0; i < 600; i++)
 		MT_BUG_ON(mt, mtree_store_range_u64(mt, i * 2, i * 2 + 1,
 						    xa_mk_value(i), GFP_KERNEL));
+
+	mas_lock(&mas);
+	/* Unpromoted: one gap [1200, U64_MAX], only [1200, U32_MAX] in nodes. */
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area(&mas, 0, U64_MAX, 1));
+	MT_BUG_ON(mt, mas.index != 1200);
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area(&mas, 0, U64_MAX, gap + 1));
+	MT_BUG_ON(mt, mas.index != 1200 || mas.last != hi);
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area(&mas, hi, U64_MAX, 1));
+	MT_BUG_ON(mt, mas.index != hi);
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area(&mas, 1300, hi + 2, hi - 1297));
+	MT_BUG_ON(mt, mas.index != 1300 || mas.last != hi + 2);
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, !mas_empty_area(&mas, 1300, hi + 2, hi - 1296));
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, U64_MAX, 1));
+	MT_BUG_ON(mt, mas.index != U64_MAX);
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, U64_MAX, gap + 1));
+	MT_BUG_ON(mt, mas.index != U64_MAX - gap || mas.last != U64_MAX);
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, hi + 10, 5));
+	MT_BUG_ON(mt, mas.index != hi + 6 || mas.last != hi + 10);
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, hi, U64_MAX, 1));
+	MT_BUG_ON(mt, mas.index != U64_MAX);
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 1300, hi + 2, hi - 1297));
+	MT_BUG_ON(mt, mas.index != 1300 || mas.last != hi + 2);
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, !mas_empty_area_rev(&mas, 1300, hi + 2, hi - 1296));
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, U32_MAX, 1));
+	MT_BUG_ON(mt, mas.index != U32_MAX);
+	mas_unlock(&mas);
+
 	MT_BUG_ON(mt, mtree_store_range_u64(mt, hi, hi, xa_mk_value(1),
 					    GFP_KERNEL));
 
@@ -35961,22 +36075,19 @@ static void check_born32_gaps(struct maple_tree *mt, unsigned int flags)
 	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, U32_MAX, 1));
 	MT_BUG_ON(mt, mas.index != U32_MAX);
 
-	/* Above the seam needs 64-bit bounds; the API is still unsigned long. */
-	if (!MAPLE_32BIT) {
-		/* A 4G request cannot fit below the seam. */
-		mas_set_range(&mas, 0, 0);
-		MT_BUG_ON(mt, mas_empty_area(&mas, 0, ULONG_MAX, U32_MAX));
-		MT_BUG_ON(mt, mas.index != hi + 1);
-		mas_set_range(&mas, 0, 0);
-		MT_BUG_ON(mt, mas_empty_area(&mas, hi, ULONG_MAX, 1));
-		MT_BUG_ON(mt, mas.index != hi + 1);
-		mas_set_range(&mas, 0, 0);
-		MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, ULONG_MAX, 1));
-		MT_BUG_ON(mt, mas.index != ULONG_MAX);
-		mas_set_range(&mas, 0, 0);
-		MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, hi, 1));
-		MT_BUG_ON(mt, mas.index != hi - 1);
-	}
+	/* A 4G request cannot fit below the 4G seam. */
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area(&mas, 0, U64_MAX, U32_MAX));
+	MT_BUG_ON(mt, mas.index != hi + 1);
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area(&mas, hi, U64_MAX, 1));
+	MT_BUG_ON(mt, mas.index != hi + 1);
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, U64_MAX, 1));
+	MT_BUG_ON(mt, mas.index != U64_MAX);
+	mas_set_range(&mas, 0, 0);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, hi, 1));
+	MT_BUG_ON(mt, mas.index != hi - 1);
 	mas_unlock(&mas);
 	mt_validate(mt);
 	mtree_destroy(mt);
@@ -36191,6 +36302,7 @@ static void check_born32(struct maple_tree *mt)
 		check_born32_rebalance(mt, flags[i], 0);
 		check_born32_walk(mt, flags[i]);
 		check_born32_seam(mt, flags[i]);
+		check_born32_narrow(mt, flags[i]);
 		check_born32_seam_sweep(mt, flags[i]);
 		check_born32_seam_min(mt, flags[i]);
 		check_born32_dup(mt, flags[i]);

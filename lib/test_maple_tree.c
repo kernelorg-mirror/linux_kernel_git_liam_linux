@@ -3785,6 +3785,101 @@ static noinline void __init check_empty_area_resume(struct maple_tree *mt)
 }
 
 /*
+ * The u64 API above U32_MAX, where the unsigned long calls cannot reach on
+ * 32-bit.  @mt arrives as an allocation tree and leaves as a marks tree.
+ */
+static noinline void __init check_u64_api(struct maple_tree *mt)
+{
+	u64 base, index, start, next;
+	unsigned long nr;
+	void *entry;
+	int ret;
+	MA_STATE(mas, mt, 0, 0);
+
+	base = (u64)U32_MAX + 1;
+	MT_BUG_ON(mt, mtree_store_u64(mt, base, xa_mk_value(1), GFP_KERNEL));
+	MT_BUG_ON(mt, mtree_store_range_u64(mt, base + 10, base + 19,
+					    xa_mk_value(2), GFP_KERNEL));
+	MT_BUG_ON(mt, mtree_insert_u64(mt, base + 5, xa_mk_value(3), GFP_KERNEL));
+	MT_BUG_ON(mt, mtree_insert_range_u64(mt, base + 10, base + 12,
+					     xa_mk_value(4), GFP_KERNEL) != -EEXIST);
+	MT_BUG_ON(mt, mtree_load_u64(mt, base) != xa_mk_value(1));
+	MT_BUG_ON(mt, mtree_load_u64(mt, base + 15) != xa_mk_value(2));
+	MT_BUG_ON(mt, mtree_load_u64(mt, base + 5) != xa_mk_value(3));
+
+	index = base;
+	entry = mt_find_u64(mt, &index, U64_MAX);
+	MT_BUG_ON(mt, entry != xa_mk_value(1) || index != base + 1);
+	entry = mt_find_after_u64(mt, &index, U64_MAX);
+	MT_BUG_ON(mt, entry != xa_mk_value(3) || index != base + 6);
+	nr = 0;
+	index = 0;
+	mt_for_each_u64(mt, entry, index, U64_MAX)
+		nr++;
+	MT_BUG_ON(mt, nr != 3);
+	MT_BUG_ON(mt, mt_next_u64(mt, base, U64_MAX) != xa_mk_value(3));
+	MT_BUG_ON(mt, mt_prev_u64(mt, base + 10, 0) != xa_mk_value(3));
+
+	ret = mtree_alloc_range_u64(mt, &start, xa_mk_value(5), 3, base,
+				    base + 100, GFP_KERNEL);
+	MT_BUG_ON(mt, ret || start != base + 1);
+	ret = mtree_alloc_rrange_u64(mt, &start, xa_mk_value(6), 3, base,
+				     base + 100, GFP_KERNEL);
+	MT_BUG_ON(mt, ret || start != base + 98);
+	next = base + 20;
+	ret = mtree_alloc_cyclic_u64(mt, &start, xa_mk_value(7), base,
+				     base + 100, &next, GFP_KERNEL);
+	MT_BUG_ON(mt, ret || start != base + 20 || next != base + 21);
+
+	/* The advanced API with limits above U32_MAX. */
+	mtree_lock(mt);
+	mas_set(&mas, base + 4);
+	MT_BUG_ON(mt, mas_find(&mas, U64_MAX) != xa_mk_value(3));
+	MT_BUG_ON(mt, mas.index != base + 5);
+	MT_BUG_ON(mt, mas_next(&mas, U64_MAX) != xa_mk_value(2));
+	MT_BUG_ON(mt, mas.last != base + 19);
+	MT_BUG_ON(mt, mas_prev(&mas, base) != xa_mk_value(3));
+	mas_set(&mas, base + 50);
+	MT_BUG_ON(mt, mas_find_rev(&mas, base) != xa_mk_value(7));
+	MT_BUG_ON(mt, mas.index != base + 20);
+	mas_reset(&mas);
+	MT_BUG_ON(mt, mas_empty_area(&mas, base, base + 100, 10));
+	MT_BUG_ON(mt, mas.index != base + 21);
+	mas_reset(&mas);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, base, base + 100, 10));
+	MT_BUG_ON(mt, mas.last != base + 97);
+	mas_reset(&mas);
+	next = base + 30;
+	ret = mas_alloc_cyclic(&mas, &start, xa_mk_value(9), base, base + 100,
+			       &next, GFP_KERNEL);
+	MT_BUG_ON(mt, ret || start != base + 30 || next != base + 31);
+	mtree_unlock(mt);
+
+	MT_BUG_ON(mt, mtree_erase_u64(mt, base + 15) != xa_mk_value(2));
+	MT_BUG_ON(mt, mtree_load_u64(mt, base + 15) != NULL);
+	mtree_destroy(mt);
+
+	mt_init_flags(mt, MT_FLAGS_MARKS);
+	MT_BUG_ON(mt, mtree_store_u64(mt, base + 3, xa_mk_value(8), GFP_KERNEL));
+	mtree_set_mark_u64(mt, base + 3, MT_MARK_2);
+	MT_BUG_ON(mt, !mtree_get_mark_u64(mt, base + 3, MT_MARK_2));
+	MT_BUG_ON(mt, !mt_marked(mt, MT_MARK_2));
+	index = 0;
+	entry = mt_find_marked_u64(mt, &index, U64_MAX, MT_MARK_2);
+	MT_BUG_ON(mt, entry != xa_mk_value(8) || index != base + 4);
+	MT_BUG_ON(mt, mt_find_after_marked_u64(mt, &index, U64_MAX,
+					       MT_MARK_2) != NULL);
+	nr = 0;
+	index = 0;
+	mt_for_each_marked_u64(mt, entry, index, U64_MAX, MT_MARK_2)
+		nr++;
+	MT_BUG_ON(mt, nr != 1);
+	mtree_clear_mark_u64(mt, base + 3, MT_MARK_2);
+	MT_BUG_ON(mt, mtree_get_mark_u64(mt, base + 3, MT_MARK_2));
+	MT_BUG_ON(mt, mt_marked(mt, MT_MARK_2));
+}
+
+/*
  * Destroy a copy of the tree under RCU at every fill of the nodes above the
  * leaves.  Inserting at the right edge only changes the upper nodes when the
  * last leaf splits or pushes, seen as its end dropping.  Growing to height 4
@@ -4576,6 +4671,10 @@ static int __init maple_tree_seed(void)
 
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
 	check_rev_gap_first(&tree);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_u64_api(&tree);
 	mtree_destroy(&tree);
 
 	check_range64_in_rcu(&tree);
