@@ -531,7 +531,11 @@ int __mt_dup(struct maple_tree *mt, struct maple_tree *new, gfp_t gfp);
 void mtree_destroy(struct maple_tree *mt);
 void __mt_destroy(struct maple_tree *mt);
 
-/* u64 and unsigned long exist for 32b compatibility */
+/*
+ * The index space is 64-bit on every architecture.  The unsigned long normal
+ * API covers a 32-bit caller's own address space; the u64 variants reach the
+ * whole tree.  On 64-bit they are the same calls.
+ */
 void *mtree_load_u64(struct maple_tree *mt, u64 index);
 int mtree_store_range_u64(struct maple_tree *mt, u64 first, u64 last,
 		void *entry, gfp_t gfp);
@@ -540,6 +544,19 @@ int mtree_insert_range_u64(struct maple_tree *mt, u64 first, u64 last,
 		void *entry, gfp_t gfp);
 int mtree_insert_u64(struct maple_tree *mt, u64 index, void *entry, gfp_t gfp);
 void *mtree_erase_u64(struct maple_tree *mt, u64 index);
+int mtree_alloc_range_u64(struct maple_tree *mt, u64 *startp, void *entry,
+		u64 size, u64 min, u64 max, gfp_t gfp);
+int mtree_alloc_cyclic_u64(struct maple_tree *mt, u64 *startp, void *entry,
+		u64 range_lo, u64 range_hi, u64 *next, gfp_t gfp);
+int mtree_alloc_rrange_u64(struct maple_tree *mt, u64 *startp, void *entry,
+		u64 size, u64 min, u64 max, gfp_t gfp);
+bool mtree_get_mark_u64(struct maple_tree *mt, u64 index, mt_mark_t mark);
+int mtree_set_mark_u64(struct maple_tree *mt, u64 index, mt_mark_t mark);
+int mtree_clear_mark_u64(struct maple_tree *mt, u64 index, mt_mark_t mark);
+void *mt_find_marked_u64(struct maple_tree *mt, u64 *index, u64 max,
+		mt_mark_t mark);
+void *mt_find_after_marked_u64(struct maple_tree *mt, u64 *index, u64 max,
+		mt_mark_t mark);
 
 /**
  * mtree_empty() - Determine if a tree has any present entries.
@@ -745,18 +762,16 @@ void mas_store_prealloc(struct ma_state *mas, void *entry);
 bool mas_get_mark(struct ma_state *mas, mt_mark_t mark);
 void mas_set_mark(struct ma_state *mas, mt_mark_t mark);
 void mas_clear_mark(struct ma_state *mas, mt_mark_t mark);
-void *mas_find_marked(struct ma_state *mas, unsigned long max,
-		      mt_mark_t mark);
-void *mas_find_marked_rev(struct ma_state *mas, unsigned long min,
-			  mt_mark_t mark);
-void *mas_find(struct ma_state *mas, unsigned long max);
-void *mas_find_range(struct ma_state *mas, unsigned long max);
-void *mas_find_rev(struct ma_state *mas, unsigned long min);
-void *mas_find_range_rev(struct ma_state *mas, unsigned long max);
+/* The advanced API takes u64 limits, matching the maple state. */
+void *mas_find_marked(struct ma_state *mas, u64 max, mt_mark_t mark);
+void *mas_find_marked_rev(struct ma_state *mas, u64 min, mt_mark_t mark);
+void *mas_find(struct ma_state *mas, u64 max);
+void *mas_find_range(struct ma_state *mas, u64 max);
+void *mas_find_rev(struct ma_state *mas, u64 min);
+void *mas_find_range_rev(struct ma_state *mas, u64 min);
 int mas_preallocate(struct ma_state *mas, void *entry, gfp_t gfp);
-int mas_alloc_cyclic(struct ma_state *mas, unsigned long *startp,
-		void *entry, unsigned long range_lo, unsigned long range_hi,
-		unsigned long *next, gfp_t gfp);
+int mas_alloc_cyclic(struct ma_state *mas, u64 *startp, void *entry,
+		u64 range_lo, u64 range_hi, u64 *next, gfp_t gfp);
 
 bool mas_nomem(struct ma_state *mas, gfp_t gfp);
 bool mas_nomem_nofail(struct ma_state *mas, u64 index,
@@ -765,22 +780,20 @@ void mas_pause(struct ma_state *mas);
 void maple_tree_init(void);
 void mas_destroy(struct ma_state *mas);
 
-void *mas_prev(struct ma_state *mas, unsigned long min);
-void *mas_prev_range(struct ma_state *mas, unsigned long min);
-void *mas_next(struct ma_state *mas, unsigned long max);
-void *mas_next_range(struct ma_state *mas, unsigned long max);
+void *mas_prev(struct ma_state *mas, u64 min);
+void *mas_prev_range(struct ma_state *mas, u64 min);
+void *mas_next(struct ma_state *mas, u64 max);
+void *mas_next_range(struct ma_state *mas, u64 max);
 
-int mas_empty_area(struct ma_state *mas, unsigned long min, unsigned long max,
-		   unsigned long size);
+int mas_empty_area(struct ma_state *mas, u64 min, u64 max, u64 size);
 /*
  * This finds an empty area from the highest address to the lowest.
  * AKA "Topdown" version,
  */
-int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
-		       unsigned long max, unsigned long size);
+int mas_empty_area_rev(struct ma_state *mas, u64 min, u64 max, u64 size);
 
 static inline void mas_init(struct ma_state *mas, struct maple_tree *tree,
-			    unsigned long addr)
+			    u64 addr)
 {
 	memset(mas, 0, sizeof(struct ma_state));
 	mas->tree = tree;
@@ -1029,9 +1042,8 @@ void mas_set_range(struct ma_state *mas, u64 start, u64 last)
  * have the effect of starting a walk from the top; see mas_next()
  * to move to an adjacent index.
  */
-static inline void mas_set(struct ma_state *mas, unsigned long index)
+static inline void mas_set(struct ma_state *mas, u64 index)
 {
-
 	mas_set_range(mas, index, index);
 }
 
@@ -1165,6 +1177,10 @@ void *mt_find_after(struct maple_tree *mt, unsigned long *index,
 		    unsigned long max);
 void *mt_prev(struct maple_tree *mt, unsigned long index,  unsigned long min);
 void *mt_next(struct maple_tree *mt, unsigned long index, unsigned long max);
+void *mt_find_u64(struct maple_tree *mt, u64 *index, u64 max);
+void *mt_find_after_u64(struct maple_tree *mt, u64 *index, u64 max);
+void *mt_prev_u64(struct maple_tree *mt, u64 index, u64 min);
+void *mt_next_u64(struct maple_tree *mt, u64 index, u64 max);
 
 /**
  * mt_for_each - Iterate over each entry starting at index until max.
@@ -1184,5 +1200,15 @@ void *mt_next(struct maple_tree *mt, unsigned long index, unsigned long max);
 	for (__entry = mt_find_marked(__tree, &(__index), __max, __filter); \
 		__entry; __entry = mt_find_after_marked(__tree, &(__index), \
 					       __max, __filter))
+
+/* As above with a u64 cursor, for the whole index space on 32-bit. */
+#define mt_for_each_u64(__tree, __entry, __index, __max) \
+	for (__entry = mt_find_u64(__tree, &(__index), __max); \
+		__entry; __entry = mt_find_after_u64(__tree, &(__index), __max))
+
+#define mt_for_each_marked_u64(__tree, __entry, __index, __max, __filter) \
+	for (__entry = mt_find_marked_u64(__tree, &(__index), __max, __filter); \
+		__entry; __entry = mt_find_after_marked_u64(__tree, &(__index), \
+						   __max, __filter))
 
 #endif /*_LINUX_MAPLE_TREE_H */

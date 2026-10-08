@@ -26,13 +26,29 @@ use the normal API.  An :ref:`maple-tree-advanced-api` exists for more complex
 scenarios.  The most important usage of the Maple Tree is the tracking of the
 virtual memory areas.
 
-The Maple Tree can store values between ``0`` and ``ULONG_MAX``.  The Maple
+The Maple Tree can store values between ``0`` and ``U64_MAX`` on every
+architecture.  The normal API takes ``unsigned long`` indexes, which covers a
+32-bit caller's own address space; the ``_u64`` variants of the same calls
+(mtree_store_u64(), mt_find_u64(), mt_for_each_u64() and so on) reach the whole
+index space.  The advanced API takes ``u64`` throughout.  The Maple
 Tree reserves values with the bottom two bits set to '10' which are below 4096
 (ie 2, 6, 10 .. 4094) for internal use.  If the entries may use reserved
 entries then the users can convert the entries using xa_mk_value() and convert
 them back by calling xa_to_value().  If the user needs to use a reserved
 value, then the user can convert the value when using the
 :ref:`maple-tree-advanced-api`, but are blocked by the normal API.
+
+On a 32-bit host ``ULONG_MAX`` is ``U32_MAX``, and until an entry is stored
+above ``U32_MAX`` the tree ends there: searching may return ``U32_MAX`` as the
+end of the last range, and mas_find() or mas_next() past it overflows with
+mas->last set to ``ULONG_MAX``.  Stores can still go anywhere up to ``U64_MAX``
+through the ``_u64`` variants and the advanced API, and the tree then ends at
+``U64_MAX``.  It is the user's responsibility to use the indexes above
+``U32_MAX`` on a 32-bit host: the ``unsigned long`` calls cannot reach them,
+and a search that ends at ``U32_MAX`` does not mean nothing can be stored above
+it.  Once something is stored there, mas->last may be above ``ULONG_MAX`` even
+after a search limited to ``ULONG_MAX``; the gap below an entry at ``U64_MAX``
+ends at ``U64_MAX - 1``.
 
 The Maple Tree can also be configured to support searching for a gap of a given
 size (or larger).

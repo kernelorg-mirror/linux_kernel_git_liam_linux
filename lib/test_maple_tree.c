@@ -1477,9 +1477,9 @@ static noinline void __init check_root_expand(struct maple_tree *mt)
 	MT_BUG_ON(mt, mas.index != 0);
 	MT_BUG_ON(mt, ptr != NULL);
 	MT_BUG_ON(mt, mas.index != 0);
-	MT_BUG_ON(mt, mas.last != mas_tree_max(&mas));
+	MT_BUG_ON(mt, mas.last != ULONG_MAX);
 
-	ptr = &check_prev_entry;
+	ptr = &mas;
 	mas_set(&mas, 1);
 	mas_store_gfp(&mas, ptr, GFP_KERNEL);
 
@@ -1489,7 +1489,7 @@ static noinline void __init check_root_expand(struct maple_tree *mt)
 
 	mas_set(&mas, 1);
 	ptr = mas_walk(&mas);
-	MT_BUG_ON(mt, ptr != &check_prev_entry);
+	MT_BUG_ON(mt, ptr != &mas);
 
 	mas_set(&mas, 2);
 	ptr = mas_walk(&mas);
@@ -1502,18 +1502,18 @@ static noinline void __init check_root_expand(struct maple_tree *mt)
 	mas_lock(&mas);
 
 	mas_set(&mas, 0);
-	ptr = &check_prev_entry;
+	ptr = &mas;
 	mas_store_gfp(&mas, ptr, GFP_KERNEL);
 
 	mas_set(&mas, 5);
 	ptr = mas_walk(&mas);
 	MT_BUG_ON(mt, ptr != NULL);
 	MT_BUG_ON(mt, mas.index != 1);
-	MT_BUG_ON(mt, mas.last != mas_tree_max(&mas));
+	MT_BUG_ON(mt, mas.last != ULONG_MAX);
 
 	mas_set_range(&mas, 0, 100);
 	ptr = mas_walk(&mas);
-	MT_BUG_ON(mt, ptr != &check_prev_entry);
+	MT_BUG_ON(mt, ptr != &mas);
 	MT_BUG_ON(mt, mas.last != 0);
 	mas_unlock(&mas);
 	mtree_destroy(mt);
@@ -1522,16 +1522,16 @@ static noinline void __init check_root_expand(struct maple_tree *mt)
 	mas_lock(&mas);
 
 	mas_set(&mas, 0);
-	ptr = (void *)((unsigned long) check_prev_entry | 1UL);
+	ptr = (void *)((unsigned long)&mas | 1UL);
 	mas_store_gfp(&mas, ptr, GFP_KERNEL);
 	ptr = mas_next(&mas, ULONG_MAX);
 	MT_BUG_ON(mt, ptr != NULL);
-	MT_BUG_ON(mt, (mas.index != 1) || (mas.last != mas_tree_max(&mas)));
+	MT_BUG_ON(mt, (mas.index != 1) || (mas.last != ULONG_MAX));
 
 	mas_set(&mas, 1);
 	ptr = mas_prev(&mas, 0);
 	MT_BUG_ON(mt, (mas.index != 0) || (mas.last != 0));
-	MT_BUG_ON(mt, ptr != (void *)((unsigned long) check_prev_entry | 1UL));
+	MT_BUG_ON(mt, ptr != (void *)((unsigned long)&mas | 1UL));
 
 	mas_unlock(&mas);
 
@@ -1540,7 +1540,7 @@ static noinline void __init check_root_expand(struct maple_tree *mt)
 	mt_init_flags(mt, 0);
 	mas_lock(&mas);
 	mas_set(&mas, 0);
-	ptr = (void *)((unsigned long) check_prev_entry | 2UL);
+	ptr = (void *)((unsigned long)&mas | 2UL);
 	mas_store_gfp(&mas, ptr, GFP_KERNEL);
 	ptr = mas_next(&mas, ULONG_MAX);
 	MT_BUG_ON(mt, ptr != NULL);
@@ -1549,7 +1549,7 @@ static noinline void __init check_root_expand(struct maple_tree *mt)
 	mas_set(&mas, 1);
 	ptr = mas_prev(&mas, 0);
 	MT_BUG_ON(mt, (mas.index != 0) || (mas.last != 0));
-	MT_BUG_ON(mt, ptr != (void *)((unsigned long) check_prev_entry | 2UL));
+	MT_BUG_ON(mt, ptr != (void *)((unsigned long)&mas | 2UL));
 
 
 	mas_unlock(&mas);
@@ -3124,7 +3124,7 @@ static noinline void __init check_state_handling(struct maple_tree *mt)
 	mas_set(&mas, 0);
 	entry = mas_next(&mas, ULONG_MAX);
 	MT_BUG_ON(mt, mas.index != 1);
-	MT_BUG_ON(mt, mas.last != mas_tree_max(&mas));
+	MT_BUG_ON(mt, mas.last != ULONG_MAX);
 	MT_BUG_ON(mt, entry != NULL);
 	MT_BUG_ON(mt, mas.status != ma_none);
 
@@ -3132,7 +3132,7 @@ static noinline void __init check_state_handling(struct maple_tree *mt)
 	mas_set(&mas, 10);
 	entry = mas_next(&mas, ULONG_MAX);
 	MT_BUG_ON(mt, mas.index != 1);
-	MT_BUG_ON(mt, mas.last != mas_tree_max(&mas));
+	MT_BUG_ON(mt, mas.last != ULONG_MAX);
 	MT_BUG_ON(mt, entry != NULL);
 	MT_BUG_ON(mt, mas.status != ma_none);
 
@@ -3148,14 +3148,14 @@ static noinline void __init check_state_handling(struct maple_tree *mt)
 	entry = mas_find(&mas, ULONG_MAX);
 	MT_BUG_ON(mt, entry != NULL);
 	MT_BUG_ON(mt, mas.index != 1);
-	MT_BUG_ON(mt, mas.last != mas_tree_max(&mas));
+	MT_BUG_ON(mt, mas.last != ULONG_MAX);
 	MT_BUG_ON(mt, mas.status != ma_none);
 
 	/* find: none -> none */
 	entry = mas_find(&mas, ULONG_MAX);
 	MT_BUG_ON(mt, entry != NULL);
 	MT_BUG_ON(mt, mas.index != 1);
-	MT_BUG_ON(mt, mas.last != mas_tree_max(&mas));
+	MT_BUG_ON(mt, mas.last != ULONG_MAX);
 	MT_BUG_ON(mt, mas.status != ma_none);
 
 	/* find: start -> none */
@@ -3163,7 +3163,7 @@ static noinline void __init check_state_handling(struct maple_tree *mt)
 	entry = mas_find(&mas, ULONG_MAX);
 	MT_BUG_ON(mt, entry != NULL);
 	MT_BUG_ON(mt, mas.index != 1);
-	MT_BUG_ON(mt, mas.last != mas_tree_max(&mas));
+	MT_BUG_ON(mt, mas.last != ULONG_MAX);
 	MT_BUG_ON(mt, mas.status != ma_none);
 
 	/* find_rev: none -> root */
@@ -3208,7 +3208,7 @@ static noinline void __init check_state_handling(struct maple_tree *mt)
 	entry = mas_walk(&mas);
 	MT_BUG_ON(mt, entry != NULL);
 	MT_BUG_ON(mt, mas.index != 1);
-	MT_BUG_ON(mt, mas.last != mas_tree_max(&mas));
+	MT_BUG_ON(mt, mas.last != ULONG_MAX);
 	MT_BUG_ON(mt, mas.status != ma_none);
 
 	/* walk: pause -> none*/
@@ -3217,7 +3217,7 @@ static noinline void __init check_state_handling(struct maple_tree *mt)
 	entry = mas_walk(&mas);
 	MT_BUG_ON(mt, entry != NULL);
 	MT_BUG_ON(mt, mas.index != 1);
-	MT_BUG_ON(mt, mas.last != mas_tree_max(&mas));
+	MT_BUG_ON(mt, mas.last != ULONG_MAX);
 	MT_BUG_ON(mt, mas.status != ma_none);
 
 	/* walk: none -> none */
@@ -3225,14 +3225,14 @@ static noinline void __init check_state_handling(struct maple_tree *mt)
 	entry = mas_walk(&mas);
 	MT_BUG_ON(mt, entry != NULL);
 	MT_BUG_ON(mt, mas.index != 1);
-	MT_BUG_ON(mt, mas.last != mas_tree_max(&mas));
+	MT_BUG_ON(mt, mas.last != ULONG_MAX);
 	MT_BUG_ON(mt, mas.status != ma_none);
 
 	/* walk: none -> none */
 	entry = mas_walk(&mas);
 	MT_BUG_ON(mt, entry != NULL);
 	MT_BUG_ON(mt, mas.index != 1);
-	MT_BUG_ON(mt, mas.last != mas_tree_max(&mas));
+	MT_BUG_ON(mt, mas.last != ULONG_MAX);
 	MT_BUG_ON(mt, mas.status != ma_none);
 
 	/* walk: start -> root */
@@ -3272,7 +3272,7 @@ static noinline void __init check_state_handling(struct maple_tree *mt)
 	entry = mas_walk(&mas);
 	MT_BUG_ON(mt, entry != NULL);
 	MT_BUG_ON(mt, mas.index != 1);
-	MT_BUG_ON(mt, mas.last != mas_tree_max(&mas));
+	MT_BUG_ON(mt, mas.last != ULONG_MAX);
 	MT_BUG_ON(mt, mas.status != ma_none);
 
 	/* walk: none -> root */
@@ -3660,17 +3660,19 @@ static noinline void __init alloc_cyclic_testing(struct maple_tree *mt)
 {
 	unsigned long location;
 	unsigned long next;
+	u64 location64, next64;
 	int ret = 0;
 	MA_STATE(mas, mt, 0, 0);
 
-	next = 0;
+	next64 = 0;
 	mtree_lock(mt);
 	for (int i = 0; i < 100; i++) {
-		mas_alloc_cyclic(&mas, &location, mt, 2, ULONG_MAX, &next, GFP_KERNEL);
-		MAS_BUG_ON(&mas, i != location - 2);
-		MAS_BUG_ON(&mas, mas.index != location);
-		MAS_BUG_ON(&mas, mas.last != location);
-		MAS_BUG_ON(&mas, i != next - 3);
+		mas_alloc_cyclic(&mas, &location64, mt, 2, ULONG_MAX, &next64,
+				 GFP_KERNEL);
+		MAS_BUG_ON(&mas, i != location64 - 2);
+		MAS_BUG_ON(&mas, mas.index != location64);
+		MAS_BUG_ON(&mas, mas.last != location64);
+		MAS_BUG_ON(&mas, i != next64 - 3);
 	}
 
 	mtree_unlock(mt);
@@ -3725,25 +3727,24 @@ static noinline void __init alloc_cyclic_testing(struct maple_tree *mt)
 
 /*
  * A reverse gap search over the whole space must reach a gap under the root's
- * first slot, where the window is every index: one more than a long holds.
+ * first slot, where the window is every index: one more than a u64 holds.
  */
 static noinline void __init check_rev_gap_first(struct maple_tree *mt)
 {
-	unsigned long top = ULONG_MAX - 4096, i;
-	unsigned long size = 1UL << (BITS_PER_LONG - 4);
+	u64 top = U64_MAX - 4096, size = 1ULL << 60, i;
 	MA_STATE(mas, mt, 0, 0);
 
 	/* Singletons fill the top; the one gap of size is below them. */
 	for (i = 0; i < 2000; i++)
-		MT_BUG_ON(mt, mtree_store(mt, top + i * 2, xa_mk_value(i),
-					  GFP_KERNEL));
+		MT_BUG_ON(mt, mtree_store_u64(mt, top + i * 2, xa_mk_value(i),
+					      GFP_KERNEL));
 
 	mtree_lock(mt);
-	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, ULONG_MAX, size));
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, U64_MAX, size));
 	MT_BUG_ON(mt, mas.last != top - 1);
 	MT_BUG_ON(mt, mas.index != top - size);
 	mas_reset(&mas);
-	MT_BUG_ON(mt, mas_empty_area(&mas, 0, ULONG_MAX, size));
+	MT_BUG_ON(mt, mas_empty_area(&mas, 0, U64_MAX, size));
 	MT_BUG_ON(mt, mas.index != 0);
 	mtree_unlock(mt);
 }
@@ -3755,7 +3756,8 @@ static noinline void __init check_rev_gap_first(struct maple_tree *mt)
  */
 static noinline void __init check_empty_area_resume(struct maple_tree *mt)
 {
-	unsigned long i, loc, next = 0;
+	unsigned long i;
+	u64 loc, next = 0;
 	MA_STATE(mas, mt, 0, 0);
 
 	for (i = 0; i < 1000; i++)

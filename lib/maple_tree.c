@@ -6772,12 +6772,11 @@ exists:
  * allocation succeeded after wrapping, or -EBUSY if there are no
  * free entries.
  */
-int mas_alloc_cyclic(struct ma_state *mas, unsigned long *startp,
-		void *entry, unsigned long range_lo, unsigned long range_hi,
-		unsigned long *next, gfp_t gfp)
+int mas_alloc_cyclic(struct ma_state *mas, u64 *startp, void *entry,
+		u64 range_lo, u64 range_hi, u64 *next, gfp_t gfp)
 {
 	int ret;
-	unsigned long min;
+	u64 min;
 
 	min = range_lo;
 	do {
@@ -7234,7 +7233,7 @@ skip:
  * Return: true with @mas->offset at the gap in the leaf, false if there is
  * none in or below this node.
  */
-static bool mas_rev_anode_descend(struct ma_state *mas, unsigned long size)
+static bool mas_rev_anode_descend(struct ma_state *mas, u64 size)
 {
 	struct maple_node *node;
 	enum maple_type type;
@@ -7367,7 +7366,7 @@ no_space:
  * none in or below this node, which is then left past its end for
  * mas_skip_node().
  */
-static inline bool mas_anode_descend(struct ma_state *mas, unsigned long size)
+static inline bool mas_anode_descend(struct ma_state *mas, u64 size)
 {
 	u64 pivot, min, gap;
 	unsigned char offset, data_end, node_pivots;
@@ -7596,10 +7595,9 @@ void mas_clear_mark(struct ma_state *mas, mt_mark_t mark)
 }
 EXPORT_SYMBOL_GPL(mas_clear_mark);
 
-static __always_inline bool mas_find_setup(struct ma_state *mas,
-					   unsigned long max, void **entry);
-static bool mas_find_rev_setup(struct ma_state *mas, unsigned long min,
-			       void **entry);
+static __always_inline bool mas_find_setup(struct ma_state *mas, u64 max,
+					   void **entry);
+static bool mas_find_rev_setup(struct ma_state *mas, u64 min, void **entry);
 
 /*
  * mas_next_marked() - Find the next entry with @mark from @mas->index.
@@ -7616,8 +7614,7 @@ static bool mas_find_rev_setup(struct ma_state *mas, unsigned long min,
  * The status is ma_overflow when nothing marked is left up to @max.
  * Return: The entry or %NULL.
  */
-static void *mas_next_marked(struct ma_state *mas, unsigned long max,
-			     mt_mark_t mark)
+static void *mas_next_marked(struct ma_state *mas, u64 max, mt_mark_t mark)
 {
 	u64 min, pivot;
 	struct maple_node *node;
@@ -7718,8 +7715,7 @@ overflow:
  * The status is ma_underflow when nothing marked is left down to @min.
  * Return: The entry or %NULL.
  */
-static void *mas_prev_marked(struct ma_state *mas, unsigned long min,
-			     mt_mark_t mark)
+static void *mas_prev_marked(struct ma_state *mas, u64 min, mt_mark_t mark)
 {
 	u64 low, pivot;
 	struct maple_node *node;
@@ -7811,7 +7807,7 @@ underflow:
  *
  * Return: The entry or %NULL.
  */
-void *mas_find_marked(struct ma_state *mas, unsigned long max, mt_mark_t mark)
+void *mas_find_marked(struct ma_state *mas, u64 max, mt_mark_t mark)
 {
 	void *entry = NULL;
 
@@ -7856,8 +7852,7 @@ EXPORT_SYMBOL_GPL(mas_find_marked);
  *
  * Return: The entry or %NULL.
  */
-void *mas_find_marked_rev(struct ma_state *mas, unsigned long min,
-			  mt_mark_t mark)
+void *mas_find_marked_rev(struct ma_state *mas, u64 min, mt_mark_t mark)
 {
 	void *entry = NULL;
 
@@ -7925,7 +7920,7 @@ static inline bool mas_rewind_node(struct ma_state *mas)
  * @mas: The maple state
  * @size: The size of the gap required
  */
-static inline void mas_rev_awalk(struct ma_state *mas, unsigned long size)
+static inline void mas_rev_awalk(struct ma_state *mas, u64 size)
 {
 	do {
 		if (mas_rev_anode_descend(mas, size))
@@ -7969,7 +7964,7 @@ static inline bool mas_skip_node(struct ma_state *mas)
  *
  * Search between @mas->index and @mas->last for a gap of @size.
  */
-static inline void mas_awalk(struct ma_state *mas, unsigned long size)
+static inline void mas_awalk(struct ma_state *mas, u64 size)
 {
 	do {
 		if (mas_anode_descend(mas, size))
@@ -7988,8 +7983,8 @@ static inline void mas_awalk(struct ma_state *mas, unsigned long size)
  * @size: The size of the gap
  * @fwd: Searching forward or back
  */
-static inline int mas_sparse_area(struct ma_state *mas, unsigned long min,
-				unsigned long max, unsigned long size, bool fwd)
+static inline int mas_sparse_area(struct ma_state *mas, u64 min, u64 max,
+				  u64 size, bool fwd)
 {
 	if (!unlikely(mas_is_none(mas)) && min == 0) {
 		min++;
@@ -8013,6 +8008,49 @@ static inline int mas_sparse_area(struct ma_state *mas, unsigned long min,
 }
 
 /*
+ * mas_empty_area_above() - The gap above the ceiling of a born-32 tree.
+ * @mas: The maple state
+ * @min: The lowest value of the range
+ * @max: The highest value of the range, above the ceiling
+ * @size: The size needed
+ * @fwd: Lowest fit, else highest
+ *
+ * No node covers the space above the ceiling, so it is free; a trailing NULL
+ * in the tree joins it.  Leaves @mas at the last leaf.
+ *
+ * Return: 0 with @mas->index and @mas->last set, or -EBUSY.
+ */
+static int mas_empty_area_above(struct ma_state *mas, u64 min, u64 max,
+				u64 size, bool fwd)
+{
+	u64 lo = mas_tree_max(mas);
+
+	mas_set(mas, lo);
+	if (mas_walk(mas))
+		lo++;
+	else
+		lo = mas->index;
+
+	if (lo < min)
+		lo = min;
+
+	if (max - lo + 1 < size) {
+		mas_set_err(mas, -EBUSY);
+		return -EBUSY;
+	}
+
+	if (fwd) {
+		mas->index = lo;
+		mas->last = lo + size - 1;
+	} else {
+		mas->last = max;
+		mas->index = max - size + 1;
+	}
+	mas->end = mas_data_end(mas);
+	return 0;
+}
+
+/*
  * mas_empty_area() - Get the lowest address within the range that is
  * sufficient for the size requested.
  * @mas: The maple state
@@ -8020,12 +8058,12 @@ static inline int mas_sparse_area(struct ma_state *mas, unsigned long min,
  * @max: The highest value of the range
  * @size: The size needed
  */
-int mas_empty_area(struct ma_state *mas, unsigned long min,
-		unsigned long max, unsigned long size)
+int mas_empty_area(struct ma_state *mas, u64 min, u64 max, u64 size)
 {
 	unsigned char offset;
 	enum maple_type mt;
 	struct maple_node *node;
+	u64 ceiling;
 
 	if (min > max)
 		return -EINVAL;
@@ -8045,17 +8083,22 @@ int mas_empty_area(struct ma_state *mas, unsigned long min,
 	if (mas_is_none(mas) || mas_is_ptr(mas))
 		return mas_sparse_area(mas, min, max, size, true);
 
-	/* A born-32 tree has no gaps above its ceiling. */
-	if (max > mas_tree_max(mas))
-		max = mas_tree_max(mas);
+	/* The tree holds the gaps up to its ceiling, the rest is free. */
+	ceiling = mas_tree_max(mas);
+	if (min > ceiling)
+		return mas_empty_area_above(mas, min, max, size, true);
 
 	/* The start of the window can only be within these values */
 	mas->index = min;
-	mas->last = max;
+	mas->last = max > ceiling ? ceiling : max;
 	mas_awalk(mas, size);
 
-	if (unlikely(mas_is_err(mas)))
+	if (unlikely(mas_is_err(mas))) {
+		if (max > ceiling)
+			return mas_empty_area_above(mas, min, max, size, true);
+
 		return xa_err(mas->node);
+	}
 
 	offset = mas->offset;
 	node = mas_mn(mas);
@@ -8077,16 +8120,18 @@ EXPORT_SYMBOL_GPL(mas_empty_area);
  * @max: The highest value of the range
  * @size: The size needed
  */
-int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
-		unsigned long max, unsigned long size)
+int mas_empty_area_rev(struct ma_state *mas, u64 min, u64 max, u64 size)
 {
+	bool fresh = mas_is_start(mas);
+	u64 ceiling;
+
 	if (min > max)
 		return -EINVAL;
 
 	if (size == 0 || max - min < size - 1)
 		return -EINVAL;
 
-	if (mas_is_start(mas))
+	if (fresh)
 		mas_start_wr(mas);
 	else if ((mas->offset < 2) && (!mas_rewind_node(mas)))
 		return -EBUSY;
@@ -8098,10 +8143,23 @@ int mas_empty_area_rev(struct ma_state *mas, unsigned long min,
 	else
 		mas->offset = mas_data_end(mas);
 
+	/* The highest gap is the free space above the ceiling, if any. */
+	ceiling = mas_tree_max(mas);
+	if (fresh && max > ceiling) {
+		if (!mas_empty_area_above(mas, min, max, size, false))
+			return 0;
+
+		if (min > ceiling)
+			return -EBUSY;
+
+		mas_reset(mas);
+		mas_start_wr(mas);
+		mas->offset = mas_data_end(mas);
+	}
 
 	/* The start of the window can only be within these values. */
 	mas->index = min;
-	mas->last = max;
+	mas->last = max > ceiling ? ceiling : max;
 	mas_rev_awalk(mas, size);
 
 	if (mas_is_err(mas))
@@ -8534,8 +8592,7 @@ static inline bool mas_ceiling_overflow(struct ma_state *mas)
 	return true;
 }
 
-static bool mas_next_setup(struct ma_state *mas, unsigned long max,
-		void **entry)
+static bool mas_next_setup(struct ma_state *mas, u64 max, void **entry)
 {
 	bool was_none = mas_is_none(mas);
 
@@ -8585,7 +8642,7 @@ static bool mas_next_setup(struct ma_state *mas, unsigned long max,
 			return true;
 		}
 		mas->index = 1;
-		mas->last = mas_tree_max(mas);
+		mas->last = ULONG_MAX;
 		mas->status = ma_none;
 		return true;
 	}
@@ -8609,7 +8666,7 @@ static bool mas_next_setup(struct ma_state *mas, unsigned long max,
  *
  * Return: The next entry or %NULL
  */
-void *mas_next(struct ma_state *mas, unsigned long max)
+void *mas_next(struct ma_state *mas, u64 max)
 {
 	void *entry = NULL;
 
@@ -8633,7 +8690,7 @@ EXPORT_SYMBOL_GPL(mas_next);
  *
  * Return: The next entry or %NULL
  */
-void *mas_next_range(struct ma_state *mas, unsigned long max)
+void *mas_next_range(struct ma_state *mas, u64 max)
 {
 	void *entry = NULL;
 
@@ -8660,6 +8717,12 @@ EXPORT_SYMBOL_GPL(mas_next_range);
  */
 void *mt_next(struct maple_tree *mt, unsigned long index, unsigned long max)
 {
+	return mt_next_u64(mt, index, max);
+}
+EXPORT_SYMBOL_GPL(mt_next);
+
+void *mt_next_u64(struct maple_tree *mt, u64 index, u64 max)
+{
 	void *entry = NULL;
 	MA_STATE(mas, mt, index, index);
 
@@ -8668,7 +8731,7 @@ void *mt_next(struct maple_tree *mt, unsigned long index, unsigned long max)
 	rcu_read_unlock();
 	return entry;
 }
-EXPORT_SYMBOL_GPL(mt_next);
+EXPORT_SYMBOL_GPL(mt_next_u64);
 
 /*
  * mas_prev_above_ceiling() - Step back onto the ceiling of a tree of 32b from
@@ -8691,7 +8754,7 @@ static inline bool mas_prev_above_ceiling(struct ma_state *mas, void **entry)
 	return *entry != NULL;
 }
 
-static bool mas_prev_setup(struct ma_state *mas, unsigned long min, void **entry)
+static bool mas_prev_setup(struct ma_state *mas, u64 min, void **entry)
 {
 	if (unlikely(mas->index <= min)) {
 		mas->status = ma_underflow;
@@ -8766,7 +8829,7 @@ static bool mas_prev_setup(struct ma_state *mas, unsigned long min, void **entry
  *
  * Return: the previous value or %NULL.
  */
-void *mas_prev(struct ma_state *mas, unsigned long min)
+void *mas_prev(struct ma_state *mas, u64 min)
 {
 	void *entry = NULL;
 
@@ -8790,7 +8853,7 @@ EXPORT_SYMBOL_GPL(mas_prev);
  *
  * Return: the previous value or %NULL.
  */
-void *mas_prev_range(struct ma_state *mas, unsigned long min)
+void *mas_prev_range(struct ma_state *mas, u64 min)
 {
 	void *entry = NULL;
 
@@ -8816,6 +8879,12 @@ EXPORT_SYMBOL_GPL(mas_prev_range);
  */
 void *mt_prev(struct maple_tree *mt, unsigned long index, unsigned long min)
 {
+	return mt_prev_u64(mt, index, min);
+}
+EXPORT_SYMBOL_GPL(mt_prev);
+
+void *mt_prev_u64(struct maple_tree *mt, u64 index, u64 min)
+{
 	void *entry = NULL;
 	MA_STATE(mas, mt, index, index);
 
@@ -8824,7 +8893,7 @@ void *mt_prev(struct maple_tree *mt, unsigned long index, unsigned long min)
 	rcu_read_unlock();
 	return entry;
 }
-EXPORT_SYMBOL_GPL(mt_prev);
+EXPORT_SYMBOL_GPL(mt_prev_u64);
 
 /**
  * mas_pause() - Pause a mas_find/mas_for_each to drop the lock.
@@ -8855,7 +8924,8 @@ EXPORT_SYMBOL_GPL(mas_pause);
  *
  * Returns: True if entry is the answer, false otherwise.
  */
-static __always_inline bool mas_find_setup(struct ma_state *mas, unsigned long max, void **entry)
+static __always_inline bool mas_find_setup(struct ma_state *mas, u64 max,
+					   void **entry)
 {
 	switch (mas->status) {
 	case ma_active:
@@ -8951,7 +9021,7 @@ ptr_out_of_range:
  *
  * Return: The entry or %NULL.
  */
-void *mas_find(struct ma_state *mas, unsigned long max)
+void *mas_find(struct ma_state *mas, u64 max)
 {
 	void *entry = NULL;
 
@@ -8979,7 +9049,7 @@ EXPORT_SYMBOL_GPL(mas_find);
  *
  * Return: The entry or %NULL.
  */
-void *mas_find_range(struct ma_state *mas, unsigned long max)
+void *mas_find_range(struct ma_state *mas, u64 max)
 {
 	void *entry = NULL;
 
@@ -9000,8 +9070,7 @@ EXPORT_SYMBOL_GPL(mas_find_range);
  *
  * Returns: True if entry is the answer, false otherwise.
  */
-static bool mas_find_rev_setup(struct ma_state *mas, unsigned long min,
-		void **entry)
+static bool mas_find_rev_setup(struct ma_state *mas, u64 min, void **entry)
 {
 	switch (mas->status) {
 	case ma_active:
@@ -9098,7 +9167,7 @@ none:
  *
  * Return: The entry or %NULL.
  */
-void *mas_find_rev(struct ma_state *mas, unsigned long min)
+void *mas_find_rev(struct ma_state *mas, u64 min)
 {
 	void *entry = NULL;
 
@@ -9125,7 +9194,7 @@ EXPORT_SYMBOL_GPL(mas_find_rev);
  *
  * Return: The entry or %NULL.
  */
-void *mas_find_range_rev(struct ma_state *mas, unsigned long min)
+void *mas_find_range_rev(struct ma_state *mas, u64 min)
 {
 	void *entry = NULL;
 
@@ -9286,6 +9355,12 @@ EXPORT_SYMBOL(mtree_load);
 
 bool mtree_get_mark(struct maple_tree *mt, unsigned long index, mt_mark_t mark)
 {
+	return mtree_get_mark_u64(mt, index, mark);
+}
+EXPORT_SYMBOL(mtree_get_mark);
+
+bool mtree_get_mark_u64(struct maple_tree *mt, u64 index, mt_mark_t mark)
+{
 	MA_STATE(mas, mt, index, index);
 	bool ret;
 
@@ -9294,9 +9369,15 @@ bool mtree_get_mark(struct maple_tree *mt, unsigned long index, mt_mark_t mark)
 	rcu_read_unlock();
 	return ret;
 }
-EXPORT_SYMBOL(mtree_get_mark);
+EXPORT_SYMBOL(mtree_get_mark_u64);
 
 int mtree_set_mark(struct maple_tree *mt, unsigned long index, mt_mark_t mark)
+{
+	return mtree_set_mark_u64(mt, index, mark);
+}
+EXPORT_SYMBOL(mtree_set_mark);
+
+int mtree_set_mark_u64(struct maple_tree *mt, u64 index, mt_mark_t mark)
 {
 	MA_STATE(mas, mt, index, index);
 
@@ -9308,10 +9389,16 @@ int mtree_set_mark(struct maple_tree *mt, unsigned long index, mt_mark_t mark)
 
 	return 0;
 }
-EXPORT_SYMBOL(mtree_set_mark);
+EXPORT_SYMBOL(mtree_set_mark_u64);
 
 int mtree_clear_mark(struct maple_tree *mt, unsigned long index,
 		     mt_mark_t mark)
+{
+	return mtree_clear_mark_u64(mt, index, mark);
+}
+EXPORT_SYMBOL(mtree_clear_mark);
+
+int mtree_clear_mark_u64(struct maple_tree *mt, u64 index, mt_mark_t mark)
 {
 	MA_STATE(mas, mt, index, index);
 
@@ -9323,7 +9410,7 @@ int mtree_clear_mark(struct maple_tree *mt, unsigned long index,
 
 	return 0;
 }
-EXPORT_SYMBOL(mtree_clear_mark);
+EXPORT_SYMBOL(mtree_clear_mark_u64);
 
 /**
  * mtree_store_range() - Store an entry at a given range.
@@ -9402,6 +9489,20 @@ int mtree_alloc_range(struct maple_tree *mt, unsigned long *startp,
 		void *entry, unsigned long size, unsigned long min,
 		unsigned long max, gfp_t gfp)
 {
+	u64 start;
+	int ret;
+
+	ret = mtree_alloc_range_u64(mt, &start, entry, size, min, max, gfp);
+	if (!ret)
+		*startp = start;
+
+	return ret;
+}
+EXPORT_SYMBOL(mtree_alloc_range);
+
+int mtree_alloc_range_u64(struct maple_tree *mt, u64 *startp, void *entry,
+		u64 size, u64 min, u64 max, gfp_t gfp)
+{
 	int ret = 0;
 
 	MA_STATE(mas, mt, 0, 0);
@@ -9435,7 +9536,7 @@ unlock:
 	mas_destroy(&mas);
 	return ret;
 }
-EXPORT_SYMBOL(mtree_alloc_range);
+EXPORT_SYMBOL(mtree_alloc_range_u64);
 
 /**
  * mtree_alloc_cyclic() - Find somewhere to store this entry in the tree.
@@ -9464,6 +9565,33 @@ int mtree_alloc_cyclic(struct maple_tree *mt, unsigned long *startp,
 		void *entry, unsigned long range_lo, unsigned long range_hi,
 		unsigned long *next, gfp_t gfp)
 {
+	u64 start, next64 = *next;
+	int ret;
+
+	MA_STATE(mas, mt, 0, 0);
+
+	if (!mt_is_alloc(mt))
+		return -EINVAL;
+	if (WARN_ON_ONCE(mt_is_reserved(entry)))
+		return -EINVAL;
+	mtree_lock(mt);
+	ret = mas_alloc_cyclic(&mas, &start, entry, range_lo, range_hi,
+			       &next64, gfp);
+	if (ret >= 0) {
+		*startp = start;
+		*next = next64;
+		/* Wrapped at the caller's width. */
+		if (!*next)
+			mt->ma_flags |= MT_FLAGS_ALLOC_WRAPPED;
+	}
+	mtree_unlock(mt);
+	return ret;
+}
+EXPORT_SYMBOL(mtree_alloc_cyclic);
+
+int mtree_alloc_cyclic_u64(struct maple_tree *mt, u64 *startp, void *entry,
+		u64 range_lo, u64 range_hi, u64 *next, gfp_t gfp)
+{
 	int ret;
 
 	MA_STATE(mas, mt, 0, 0);
@@ -9478,11 +9606,25 @@ int mtree_alloc_cyclic(struct maple_tree *mt, unsigned long *startp,
 	mtree_unlock(mt);
 	return ret;
 }
-EXPORT_SYMBOL(mtree_alloc_cyclic);
+EXPORT_SYMBOL(mtree_alloc_cyclic_u64);
 
 int mtree_alloc_rrange(struct maple_tree *mt, unsigned long *startp,
 		void *entry, unsigned long size, unsigned long min,
 		unsigned long max, gfp_t gfp)
+{
+	u64 start;
+	int ret;
+
+	ret = mtree_alloc_rrange_u64(mt, &start, entry, size, min, max, gfp);
+	if (!ret)
+		*startp = start;
+
+	return ret;
+}
+EXPORT_SYMBOL(mtree_alloc_rrange);
+
+int mtree_alloc_rrange_u64(struct maple_tree *mt, u64 *startp, void *entry,
+		u64 size, u64 min, u64 max, gfp_t gfp)
 {
 	int ret = 0;
 
@@ -9517,7 +9659,7 @@ unlock:
 	mas_destroy(&mas);
 	return ret;
 }
-EXPORT_SYMBOL(mtree_alloc_rrange);
+EXPORT_SYMBOL(mtree_alloc_rrange_u64);
 
 /**
  * mtree_erase() - Find an index and erase the entire range.
@@ -9983,10 +10125,23 @@ EXPORT_SYMBOL(mtree_destroy);
  */
 void *mt_find(struct maple_tree *mt, unsigned long *index, unsigned long max)
 {
+	u64 idx = *index;
+	void *entry;
+
+	entry = mt_find_u64(mt, &idx, max);
+	if (entry)
+		*index = idx;
+
+	return entry;
+}
+EXPORT_SYMBOL(mt_find);
+
+void *mt_find_u64(struct maple_tree *mt, u64 *index, u64 max)
+{
 	MA_STATE(mas, mt, *index, *index);
 	void *entry;
 #ifdef CONFIG_DEBUG_MAPLE_TREE
-	unsigned long copy = *index;
+	u64 copy = *index;
 #endif
 
 	trace_ma_read(TP_FCT, &mas);
@@ -10020,34 +10175,49 @@ unlock:
 		*index = mas.last + 1;
 #ifdef CONFIG_DEBUG_MAPLE_TREE
 		if (MT_WARN_ON(mt, (*index) && ((*index) <= copy)))
-			pr_err("index not increased! %lx <= %lx\n",
-			       *index, copy);
+			pr_err("index not increased! %llx <= %llx\n",
+			       (unsigned long long)*index,
+			       (unsigned long long)copy);
 #endif
 	}
 
 	return entry;
 }
-EXPORT_SYMBOL(mt_find);
+EXPORT_SYMBOL(mt_find_u64);
 
 bool mt_marked(struct maple_tree *mt, mt_mark_t mark)
 {
-	unsigned long index = 0;
+	u64 index = 0;
 
-	return mt_find_marked(mt, &index, ULONG_MAX, mark) != NULL;
+	return mt_find_marked_u64(mt, &index, U64_MAX, mark) != NULL;
 }
 EXPORT_SYMBOL(mt_marked);
 
 void *mt_find_marked(struct maple_tree *mt, unsigned long *index,
 		     unsigned long max, mt_mark_t mark)
 {
+	u64 idx = *index;
+	void *entry;
+
+	entry = mt_find_marked_u64(mt, &idx, max, mark);
+	if (entry)
+		*index = idx;
+
+	return entry;
+}
+EXPORT_SYMBOL(mt_find_marked);
+
+void *mt_find_marked_u64(struct maple_tree *mt, u64 *index, u64 max,
+		mt_mark_t mark)
+{
 	MA_STATE(mas, mt, *index, *index);
 	void *entry;
 #ifdef CONFIG_DEBUG_MAPLE_TREE
-	unsigned long copy = *index;
+	u64 copy = *index;
 #endif
 
 	if (mark == MT_PRESENT)
-		return mt_find(mt, index, max);
+		return mt_find_u64(mt, index, max);
 
 	if ((mark > MT_MARK_MAX) || ((*index) > max))
 		return NULL;
@@ -10063,13 +10233,15 @@ void *mt_find_marked(struct maple_tree *mt, unsigned long *index,
 		*index = mas.last + 1;
 #ifdef CONFIG_DEBUG_MAPLE_TREE
 		if (MT_WARN_ON(mt, (*index) && ((*index) <= copy)))
-			pr_err("index not increased! %lx <= %lx\n", *index, copy);
+			pr_err("index not increased! %llx <= %llx\n",
+			       (unsigned long long)*index,
+			       (unsigned long long)copy);
 #endif
 	}
 
 	return entry;
 }
-EXPORT_SYMBOL(mt_find_marked);
+EXPORT_SYMBOL(mt_find_marked_u64);
 
 void *mt_find_after_marked(struct maple_tree *mt, unsigned long *index,
 			   unsigned long max, mt_mark_t mark)
@@ -10080,6 +10252,16 @@ void *mt_find_after_marked(struct maple_tree *mt, unsigned long *index,
 	return mt_find_marked(mt, index, max, mark);
 }
 EXPORT_SYMBOL(mt_find_after_marked);
+
+void *mt_find_after_marked_u64(struct maple_tree *mt, u64 *index, u64 max,
+		mt_mark_t mark)
+{
+	if (!(*index))
+		return NULL;
+
+	return mt_find_marked_u64(mt, index, max, mark);
+}
+EXPORT_SYMBOL(mt_find_after_marked_u64);
 
 /**
  * mt_find_after() - Search from the start up until an entry is found.
@@ -10102,6 +10284,15 @@ void *mt_find_after(struct maple_tree *mt, unsigned long *index,
 	return mt_find(mt, index, max);
 }
 EXPORT_SYMBOL(mt_find_after);
+
+void *mt_find_after_u64(struct maple_tree *mt, u64 *index, u64 max)
+{
+	if (!(*index))
+		return NULL;
+
+	return mt_find_u64(mt, index, max);
+}
+EXPORT_SYMBOL(mt_find_after_u64);
 
 #ifdef CONFIG_DEBUG_MAPLE_TREE
 atomic_t maple_tree_tests_run;
