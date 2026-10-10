@@ -88,8 +88,8 @@
  * searching for gaps or any other code that needs to find the end of the data.
  */
 struct maple_metadata {
-	unsigned char end;	/* end of data */
 	unsigned char gap;	/* offset of largest gap */
+	unsigned char end;	/* end of data */
 	unsigned char pad[sizeof(void *) - 2];
 };
 
@@ -105,7 +105,9 @@ struct maple_metadata {
  * mas_is_err().
  *
  * Non-leaf nodes store the type of the node pointed to (enum maple_type in bits
- * 3-6), bit 2 is reserved.  That leaves bits 0-1 unused for now.
+ * 3-6), and bit 2 is set when a NULL entry lies in or below that node, so a
+ * gap search can skip a subtree without one.  That leaves bits 0-1 unused for
+ * now.
  *
  * In regular B-Tree terms, pivots are called keys.  The term pivot is used to
  * indicate that the tree is specifying ranges,  Pivots may appear in the
@@ -627,8 +629,9 @@ enum maple_status {
  *
  * If state->node has bit 0 set then it references a tree location which is not
  * a node (eg the root).  If bit 1 is set, the rest of the bits are a negative
- * errno.  Bit 2 (the 'unallocated slots' bit) is clear.  Bits 3-6 indicate the
- * node type.
+ * errno.  Bit 2 is the NULL bit, carried by every node pointer the tree holds
+ * in a slot or the root; a pointer built from a child's parent pointer does
+ * not have it.  Bits 3-6 indicate the node type.
  *
  * state->alloc either has a request number of nodes or an allocated node.  If
  * stat->alloc has a requested number of nodes, the first bit will be set (0x1)
