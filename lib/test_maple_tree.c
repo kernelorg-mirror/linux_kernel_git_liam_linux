@@ -3784,6 +3784,55 @@ static noinline void __init check_empty_area_resume(struct maple_tree *mt)
 	mtree_unlock(mt);
 }
 
+/* The gap search on a regular tree goes by the NULL bits in the parents. */
+static noinline void __init check_plain_gaps(struct maple_tree *mt)
+{
+	unsigned long i;
+	MA_STATE(mas, mt, 0, 0);
+
+	/* No NULL anywhere: the ranges touch from 0 to the end. */
+	for (i = 0; i < 2000; i++)
+		mtree_store_range(mt, i * 10, i * 10 + 9, xa_mk_value(i),
+				  GFP_KERNEL);
+	mt_validate(mt);
+	/* The top store promotes a populated born-32 tree. */
+	mtree_store_range(mt, 20000, ULONG_MAX, xa_mk_value(2000), GFP_KERNEL);
+	mt_validate(mt);
+
+	mas_lock(&mas);
+	mas_set(&mas, 0);
+	MT_BUG_ON(mt, mas_empty_area(&mas, 0, ULONG_MAX, 1) != -EBUSY);
+	mas_set(&mas, 0);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, ULONG_MAX, 1) != -EBUSY);
+	mas_unlock(&mas);
+
+	/* One NULL deep in the tree is found from either end, at its size. */
+	mtree_store_range(mt, 10000, 10004, NULL, GFP_KERNEL);
+	mt_validate(mt);
+	mas_lock(&mas);
+	mas_set(&mas, 0);
+	MT_BUG_ON(mt, mas_empty_area(&mas, 0, ULONG_MAX, 5));
+	MT_BUG_ON(mt, mas.index != 10000 || mas.last != 10004);
+	mas_set(&mas, 0);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, ULONG_MAX, 5));
+	MT_BUG_ON(mt, mas.index != 10000 || mas.last != 10004);
+	mas_set(&mas, 0);
+	MT_BUG_ON(mt, mas_empty_area(&mas, 0, ULONG_MAX, 6) != -EBUSY);
+	mas_set(&mas, 0);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, ULONG_MAX, 6) != -EBUSY);
+	mas_unlock(&mas);
+
+	/* Filling it takes the bits back down. */
+	mtree_store_range(mt, 10000, 10004, xa_mk_value(1000), GFP_KERNEL);
+	mt_validate(mt);
+	mas_lock(&mas);
+	mas_set(&mas, 0);
+	MT_BUG_ON(mt, mas_empty_area(&mas, 0, ULONG_MAX, 1) != -EBUSY);
+	mas_set(&mas, 0);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, ULONG_MAX, 1) != -EBUSY);
+	mas_unlock(&mas);
+}
+
 /*
  * The u64 API above U32_MAX, where the unsigned long calls cannot reach on
  * 32-bit.  @mt arrives as an allocation tree and leaves as a marks tree.
@@ -4665,12 +4714,29 @@ static int __init maple_tree_seed(void)
 	alloc_cyclic_testing(&tree);
 	mtree_destroy(&tree);
 
+	/* The cursor allocation on a regular tree, by the NULL bits. */
+	mt_init_flags(&tree, 0);
+	alloc_cyclic_testing(&tree);
+	mtree_destroy(&tree);
+
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_empty_area_resume(&tree);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, 0);
 	check_empty_area_resume(&tree);
 	mtree_destroy(&tree);
 
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
 	check_rev_gap_first(&tree);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, 0);
+	check_rev_gap_first(&tree);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, 0);
+	check_plain_gaps(&tree);
 	mtree_destroy(&tree);
 
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
