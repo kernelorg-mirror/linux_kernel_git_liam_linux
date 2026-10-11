@@ -883,9 +883,23 @@ u64 ma_gap(struct maple_node *node, enum maple_type type,
 #if defined(CONFIG_DEBUG_MAPLE_TREE)
 #define ma_warn_narrow(type, val) \
 	WARN_ON_ONCE(node_is_32b(type) && (val) > U32_MAX)
+#define ma_pivs_warn(p, val) \
+	WARN_ON_ONCE((p)->is32 && (val) > U32_MAX)
 #else
 #define ma_warn_narrow(type, val) do { } while (0)
+#define ma_pivs_warn(p, val) do { } while (0)
 #endif
+
+/* Set pivot @offset of the node of @p to @val. */
+static __always_inline
+void ma_pivs_set(const struct ma_pivs *p, unsigned char offset, u64 val)
+{
+	ma_pivs_warn(p, val);
+	if (p->is32)
+		p->p32[offset] = val;
+	else
+		p->p64[offset] = val;
+}
 
 /* ma_set_gap() - Write the arange gap at @offset of @node width-aware. */
 static inline
@@ -3451,6 +3465,39 @@ static inline void node_clear_tail(struct maple_node *node,
 	mas_leaf_set_meta(node, type, new_end);
 }
 
+/*
+ * ma_clear_range() - Clear slots @from to @to of a node laid out as @l, with
+ * their pivots and their marks.
+ */
+static inline void ma_clear_range(const struct ma_layout *l, unsigned char from,
+		unsigned char to)
+{
+	unsigned char size = to - from + 1;
+
+	memset(ma_layout_slots(l) + from, 0, size * sizeof(void *));
+	if (l->t.mark)
+		ma_mark_clear_slots(ma_layout_marks(l), from, size);
+
+	if (to >= l->t.pivots)
+		size = l->t.pivots - from;
+	if (!size)
+		return;
+
+	if (l->t.is32)
+		memset(ma_layout_p32(l) + from, 0, size * sizeof(u32));
+	else
+		memset(ma_layout_p64(l) + from, 0, size * sizeof(u64));
+}
+
+static inline void node_clear_range(struct maple_node *node,
+		enum maple_type type, unsigned char from, unsigned char to)
+{
+	struct ma_layout l;
+
+	ma_layout_of(&l, node, type);
+	ma_clear_range(&l, from, to);
+}
+
 struct ma_walk {
 	u64 min;
 	u64 max;
@@ -5445,50 +5492,144 @@ static void mas_wr_spanning_store(struct ma_wr_state *wr_mas)
 	mas_wmb_replace(mas, &cp);
 }
 
-/*
- * mas_wr_node_store_mark_cp() - Copy the marks for a node store
- * @wr_mas: The maple write state
- * @node: The destination node
- * @old_offset: The offset of the first overwritten entry
- * @offset_end: The offset of the first entry after the overwritten entries
- * @suffix_len: The number of entries copied after the new entry
- * @left_insert: True if the entry at @old_offset is kept as a left remnant
- *
- * The new entry gets the union of the marks of the ranges it covers, or no
- * marks if it is NULL.  Remnants of partially overwritten entries keep their
- * marks.
- *
- * Return: The marks that may no longer exist in the node (NULL store only).
- */
-static inline u8 mas_wr_node_store_mark_cp(struct ma_wr_state *wr_mas,
-		struct maple_node *node, unsigned char old_offset,
-		unsigned char offset_end, unsigned char suffix_len,
-		bool left_insert)
+static inline u8 mas_wr_node_replace(struct ma_wr_state *wr_mas,
+		unsigned char offset_end, unsigned char new_end)
 {
-	unsigned char entry_offset = old_offset + left_insert;
-	u8 *dst_marks, *src_marks;
+	struct ma_state *mas = wr_mas->mas;
+	struct maple_enode *old_enode = mas->node;
+	enum maple_type type = wr_mas->type;
+	unsigned char old_offset = mas->offset;
+	unsigned char entry_offset, suffix_len, node_pivots;
+	struct maple_node *newnode;
+	void __rcu **dst_slots;
+	u8 *src_marks, *dst_marks;
+	struct ma_pivs dp;
 	u8 entry_marks;
 
-	dst_marks = ma_marks(node, wr_mas->type);
-	src_marks = ma_marks(wr_mas->node, wr_mas->type);
-	if (old_offset)
-		memcpy(dst_marks, src_marks, sizeof(u8) * old_offset);
-
-	if (left_insert)
-		dst_marks[old_offset] = src_marks[old_offset];
-
-	if (suffix_len)
-		memcpy(dst_marks + entry_offset + 1, src_marks + offset_end,
-		       sizeof(u8) * suffix_len);
-
-	entry_marks = ma_marks_union(src_marks, old_offset, wr_mas->offset_end);
-	if (wr_mas->entry) {
-		dst_marks[entry_offset] = entry_marks;
-		return 0;
+	entry_marks = 0;
+	node_pivots = mt_pivots[type];
+	entry_offset = old_offset + (wr_mas->r_min < mas->index);
+	newnode = mas_pop_node(mas);
+	newnode->parent = mas_mn(mas)->parent;
+	dst_slots = ma_slots(newnode, type);
+	dp = ma_pivs_of(newnode, type, mas->min);
+	dst_marks = src_marks = NULL;
+	if (mt_has_marks(mas->tree)) {
+		dst_marks = ma_marks(newnode, type);
+		src_marks = ma_marks(wr_mas->node, type);
+	}
+	if (old_offset) {
+		if (dp.is32)
+			memcpy(dp.p32, wr_mas->pivots32, sizeof(u32) * old_offset);
+		else
+			memcpy(dp.p64, wr_mas->pivots, sizeof(u64) * old_offset);
+		memcpy(dst_slots, wr_mas->slots, sizeof(void __rcu *) * old_offset);
+		if (dst_marks)
+			memcpy(dst_marks, src_marks, old_offset);
 	}
 
-	dst_marks[entry_offset] = 0;
-	return entry_marks;
+	if (entry_offset != old_offset) {
+		rcu_assign_pointer(dst_slots[old_offset], wr_mas->content);
+		ma_pivs_set(&dp, old_offset, mas->index - 1);
+		if (dst_marks)
+			dst_marks[old_offset] = src_marks[old_offset];
+	}
+
+	if (entry_offset < node_pivots)
+		ma_pivs_set(&dp, entry_offset, mas->last);
+	rcu_assign_pointer(dst_slots[entry_offset], wr_mas->entry);
+
+	if (offset_end <= mas->end) {
+		suffix_len = mas->end - offset_end + 1;
+		memcpy(dst_slots + entry_offset + 1, wr_mas->slots + offset_end,
+		       sizeof(void __rcu *) * suffix_len);
+		if (dp.is32)
+			memcpy(dp.p32 + entry_offset + 1,
+			       wr_mas->pivots32 + offset_end,
+			       sizeof(u32) * (suffix_len - 1));
+		else
+			memcpy(dp.p64 + entry_offset + 1,
+			       wr_mas->pivots + offset_end,
+			       sizeof(u64) * (suffix_len - 1));
+		if (dst_marks)
+			memcpy(dst_marks + entry_offset + 1, src_marks + offset_end,
+			       suffix_len);
+		if (new_end < node_pivots)
+			ma_pivs_set(&dp, new_end, mas->max);
+	}
+
+	if (dst_marks) {
+		entry_marks = ma_marks_union(src_marks, old_offset,
+					     wr_mas->offset_end);
+		dst_marks[entry_offset] = wr_mas->entry ? entry_marks : 0;
+	}
+
+	mas->offset = entry_offset;
+	node_clear_tail(newnode, type, new_end);
+	mas->node = mt_mk_node(newnode, type);
+	mas_replace_node(mas, old_enode, mas_mt_height(mas));
+	return wr_mas->entry ? 0 : entry_marks;
+}
+
+static inline u8 mas_wr_node_shift(struct ma_wr_state *wr_mas,
+		unsigned char offset_end, unsigned char new_end)
+{
+	struct ma_state *mas = wr_mas->mas;
+	struct maple_node *node = wr_mas->node;
+	enum maple_type type = wr_mas->type;
+	void __rcu **slots = wr_mas->slots;
+	unsigned char old_offset = mas->offset;
+	unsigned char entry_offset, suffix_len, node_pivots;
+	u8 entry_marks;
+	u8 *marks;
+	int delta;
+
+	entry_marks = 0;
+	suffix_len = 0;
+	node_pivots = mt_pivots[type];
+	entry_offset = old_offset + (wr_mas->r_min < mas->index);
+	marks = ma_marks(node, type);
+	if (marks)
+		entry_marks = ma_marks_union(marks, old_offset, wr_mas->offset_end);
+
+	delta = entry_offset + 1 - offset_end;
+	if (offset_end <= mas->end)
+		suffix_len = mas->end - offset_end + 1;
+
+	if (suffix_len && delta) {
+		memmove(slots + offset_end + delta, slots + offset_end,
+			sizeof(void __rcu *) * suffix_len);
+		if (suffix_len > 1) {
+			if (node_is_32b(type))
+				memmove(wr_mas->pivots32 + offset_end + delta,
+					wr_mas->pivots32 + offset_end,
+					sizeof(u32) * (suffix_len - 1));
+			else
+				memmove(wr_mas->pivots + offset_end + delta,
+					wr_mas->pivots + offset_end,
+					sizeof(u64) * (suffix_len - 1));
+		}
+		if (marks)
+			memmove(marks + offset_end + delta, marks + offset_end,
+				suffix_len);
+	}
+
+	if (entry_offset != old_offset)
+		ma_set_pivot(node, type, old_offset, mas->index - 1);
+
+	if (entry_offset < node_pivots)
+		ma_set_pivot(node, type, entry_offset, mas->last);
+	rcu_assign_pointer(slots[entry_offset], wr_mas->entry);
+	if (suffix_len && new_end < node_pivots)
+		ma_set_pivot(node, type, new_end, mas->max);
+	if (marks)
+		marks[entry_offset] = wr_mas->entry ? entry_marks : 0;
+
+	mas->offset = entry_offset;
+	if (new_end < mas->end)
+		node_clear_range(node, type, new_end + 1, mas->end);
+	mas_leaf_set_meta(node, type, new_end);
+	return wr_mas->entry ? 0 : entry_marks;
 }
 
 /*
@@ -5499,108 +5640,31 @@ static inline u8 mas_wr_node_store_mark_cp(struct ma_wr_state *wr_mas,
  */
 static inline void mas_wr_node_store(struct ma_wr_state *wr_mas)
 {
-	unsigned char dst_offset, offset_end;
-	unsigned char suffix_len, node_pivots;
-	struct maple_node reuse, *newnode;
-	void __rcu **dst_slots;
-	unsigned char new_end, old_offset, entry_offset, i;
-	bool left_insert;
-	struct ma_state *mas;
-	bool in_rcu;
+	struct ma_state *mas = wr_mas->mas;
+	unsigned char offset_end = wr_mas->offset_end;
+	unsigned char new_end, i;
 	bool gap;
-	u8 lost = 0;
+	u8 lost;
 
-	mas = wr_mas->mas;
 	trace_ma_op(TP_FCT, mas);
-	in_rcu = mt_in_rcu(mas->tree);
-	offset_end = wr_mas->offset_end;
-	node_pivots = mt_pivots[wr_mas->type];
-	old_offset = mas->offset;
-	left_insert = wr_mas->r_min < mas->index;
-
-	/*
-	 * The largest gap and the NULL bits can only change if a NULL is
-	 * written, removed, or resized.  Check the new entry and every slot the
-	 * store touches.
-	 */
 	gap = !wr_mas->entry;
-	for (i = old_offset; !gap && i <= offset_end; i++)
+	for (i = mas->offset; !gap && i <= offset_end; i++)
 		gap = !wr_mas->slots[i];
 
-	/* Assume last adds an entry */
-	new_end = mas->end + 1 - offset_end + old_offset;
+	new_end = mas->end + 1 - offset_end + mas->offset;
 	if (mas->last == wr_mas->end_piv) {
-		offset_end++; /* don't copy this offset */
+		offset_end++;
 		new_end--;
 	}
 
-	if (left_insert)
+	if (wr_mas->r_min < mas->index)
 		new_end++;
 
-	/* set up node. */
-	if (in_rcu) {
-		newnode = mas_pop_node(mas);
-	} else {
-		newnode = &reuse;
-	}
+	if (mt_in_rcu(mas->tree))
+		lost = mas_wr_node_replace(wr_mas, offset_end, new_end);
+	else
+		lost = mas_wr_node_shift(wr_mas, offset_end, new_end);
 
-	newnode->parent = mas_mn(mas)->parent;
-	dst_slots = ma_slots(newnode, wr_mas->type);
-	if (old_offset) {
-		if (node_is_32b(wr_mas->type))
-			memcpy(ma_pivots32(newnode, wr_mas->type),
-			       wr_mas->pivots32, sizeof(u32) * old_offset);
-		else
-			memcpy(ma_pivots(newnode, wr_mas->type),
-			       wr_mas->pivots, sizeof(u64) * old_offset);
-		memcpy(dst_slots, wr_mas->slots, sizeof(void __rcu *) * old_offset);
-	}
-
-	if (left_insert) {
-		rcu_assign_pointer(dst_slots[old_offset], wr_mas->content);
-		ma_set_pivot(newnode, wr_mas->type, old_offset, mas->index - 1);
-	}
-
-	entry_offset = old_offset + left_insert;
-	if (entry_offset < node_pivots)
-		ma_set_pivot(newnode, wr_mas->type, entry_offset, mas->last);
-	rcu_assign_pointer(dst_slots[entry_offset], wr_mas->entry);
-
-	suffix_len = 0;
-	if (offset_end <= mas->end) {
-		dst_offset = entry_offset + 1;
-		suffix_len = mas->end - offset_end + 1;
-		memcpy(dst_slots + dst_offset, wr_mas->slots + offset_end,
-		       sizeof(void __rcu *) * suffix_len);
-		if (node_is_32b(wr_mas->type))
-			memcpy(ma_pivots32(newnode, wr_mas->type) + dst_offset,
-			       wr_mas->pivots32 + offset_end,
-			       sizeof(u32) * (suffix_len - 1));
-		else
-			memcpy(ma_pivots(newnode, wr_mas->type) + dst_offset,
-			       wr_mas->pivots + offset_end,
-			       sizeof(u64) * (suffix_len - 1));
-
-		if (new_end < node_pivots)
-			ma_set_pivot(newnode, wr_mas->type, new_end, mas->max);
-	}
-	mas->offset = entry_offset;
-
-	if (unlikely(mt_has_marks(mas->tree)))
-		lost = mas_wr_node_store_mark_cp(wr_mas, newnode, old_offset,
-						 offset_end, suffix_len,
-						 left_insert);
-
-	node_clear_tail(newnode, wr_mas->type, new_end);
-	if (in_rcu) {
-		struct maple_enode *old_enode = mas->node;
-
-		mas->node = mt_mk_node(newnode, wr_mas->type);
-		mas_replace_node(mas, old_enode,
-				 mas_mt_height(mas));
-	} else {
-		memcpy(wr_mas->node, newnode, sizeof(struct maple_node));
-	}
 	trace_ma_write(TP_FCT, mas, 0, wr_mas->entry);
 	if (gap)
 		mas_wr_update_parents(wr_mas, lost);
