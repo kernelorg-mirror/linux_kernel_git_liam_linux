@@ -3357,6 +3357,45 @@ u64 node_copy(struct ma_state *mas, const struct ma_layout *s,
 }
 
 /*
+ * ma_clear_range() - Clear slots @from to @to of a node laid out as @l, with
+ * their pivots and their gaps or marks.
+ */
+static inline void ma_clear_range(const struct ma_layout *l, unsigned char from,
+		unsigned char to)
+{
+	unsigned char size = to - from + 1;
+
+	memset(ma_layout_slots(l) + from, 0, size * sizeof(void *));
+	if (l->t.gap) {
+		if (l->t.is32)
+			memset(ma_layout_g32(l) + from, 0, size * sizeof(u32));
+		else
+			memset(ma_layout_g64(l) + from, 0, size * sizeof(u64));
+	} else if (l->t.mark) {
+		ma_mark_clear_slots(ma_layout_marks(l), from, size);
+	}
+
+	if (to >= l->t.pivots)
+		size = l->t.pivots - from;
+	if (!size)
+		return;
+
+	if (l->t.is32)
+		memset(ma_layout_p32(l) + from, 0, size * sizeof(u32));
+	else
+		memset(ma_layout_p64(l) + from, 0, size * sizeof(u64));
+}
+
+static inline void node_clear_range(struct maple_node *node,
+		enum maple_type type, unsigned char from, unsigned char to)
+{
+	struct ma_layout l;
+
+	ma_layout_of(&l, node, type);
+	ma_clear_range(&l, from, to);
+}
+
+/*
  * ma_finalise() - Zero out the unused area of a node laid out as @l and
  * populate its metadata.
  * @l: The layout
@@ -3366,31 +3405,9 @@ static inline void ma_finalise(const struct ma_layout *l, unsigned char end)
 {
 	unsigned char max_end = mt_slots[l->t.type];
 	unsigned char gap_slot;
-	unsigned char size;
 
-	if (end < max_end) {
-		size = max_end - end;
-		memset(ma_layout_slots(l) + end, 0, size * sizeof(void *));
-		if (l->t.gap) {
-			if (l->t.is32)
-				memset(ma_layout_g32(l) + end, 0,
-				       size * sizeof(u32));
-			else
-				memset(ma_layout_g64(l) + end, 0,
-				       size * sizeof(u64));
-		}
-		if (l->t.mark)
-			ma_mark_clear_slots(ma_layout_marks(l), end, size);
-
-		if (--size) {
-			if (l->t.is32)
-				memset(ma_layout_p32(l) + end, 0,
-				       size * sizeof(u32));
-			else
-				memset(ma_layout_p64(l) + end, 0,
-				       size * sizeof(u64));
-		}
-	}
+	if (end < max_end)
+		ma_clear_range(l, end, max_end - 1);
 
 	gap_slot = 0;
 	if (l->t.gap && !ma_is_leaf(l->t.type)) {
@@ -3433,69 +3450,18 @@ void node_finalise(struct maple_node *node, enum maple_type mt,
 static inline void node_clear_tail(struct maple_node *node,
 		enum maple_type type, unsigned char new_end)
 {
-	unsigned char node_slots;
-	unsigned char clear_from;
-	unsigned char size;
-	u8 *marks;
-
-	node_slots = mt_slots[type];
-	clear_from = new_end + 1;
-
-	if (clear_from >= node_slots) {
-		WARN_ON_ONCE(clear_from > node_slots);
-		return;
-	}
-
-	size = node_slots - clear_from;
-	memset(ma_slots(node, type) + clear_from, 0, size * sizeof(void *));
-
-	marks = ma_marks(node, type);
-	if (marks)
-		ma_mark_clear_slots(marks, clear_from, size);
-
-	if (--size) {
-		if (node_is_32b(type))
-			memset(ma_pivots32(node, type) + clear_from, 0,
-			       size * sizeof(u32));
-		else
-			memset(ma_pivots(node, type) + clear_from, 0,
-			       size * sizeof(u64));
-	}
-
-	mas_leaf_set_meta(node, type, new_end);
-}
-
-/*
- * ma_clear_range() - Clear slots @from to @to of a node laid out as @l, with
- * their pivots and their marks.
- */
-static inline void ma_clear_range(const struct ma_layout *l, unsigned char from,
-		unsigned char to)
-{
-	unsigned char size = to - from + 1;
-
-	memset(ma_layout_slots(l) + from, 0, size * sizeof(void *));
-	if (l->t.mark)
-		ma_mark_clear_slots(ma_layout_marks(l), from, size);
-
-	if (to >= l->t.pivots)
-		size = l->t.pivots - from;
-	if (!size)
-		return;
-
-	if (l->t.is32)
-		memset(ma_layout_p32(l) + from, 0, size * sizeof(u32));
-	else
-		memset(ma_layout_p64(l) + from, 0, size * sizeof(u64));
-}
-
-static inline void node_clear_range(struct maple_node *node,
-		enum maple_type type, unsigned char from, unsigned char to)
-{
 	struct ma_layout l;
+	unsigned char last;
+
+	last = mt_slots[type] - 1;
+	if (new_end >= last) {
+		WARN_ON_ONCE(new_end > last);
+		return;
+	}
 
 	ma_layout_of(&l, node, type);
-	ma_clear_range(&l, from, to);
+	ma_clear_range(&l, new_end + 1, last);
+	ma_layout_set_meta(&l, 0, new_end);
 }
 
 struct ma_walk {
