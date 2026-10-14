@@ -9,4 +9,5 @@ multiorder
 radix-tree.c
 xarray
 maple
+maple-fuzz
 ma_xa_benchmark

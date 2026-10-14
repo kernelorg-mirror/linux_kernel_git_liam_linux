@@ -39705,6 +39705,9 @@ void maple_tree_tests(void)
 	maple_tree_harvest();
 }
 
+#ifdef MAPLE_FUZZ
+#include "maple-fuzz.c"
+#else
 int __weak main(void)
 {
 	maple_tree_init();
@@ -39714,3 +39717,4 @@ int __weak main(void)
 		printf("nr_allocated = %d\n", nr_allocated);
 	return 0;
 }
+#endif

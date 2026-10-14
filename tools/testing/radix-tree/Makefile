@@ -22,9 +22,14 @@ xarray: $(CORE_OFILES) xarray.o
 
 maple: $(CORE_OFILES) maple.o
 
+maple-fuzz.o: maple.c maple-fuzz.c $(SHARED_DEPS) *.h
+	$(CC) -c $(CFLAGS) -DMAPLE_FUZZ maple.c -o $@
+
+maple-fuzz: $(SHARED_OFILES) xarray.o test.o maple-fuzz.o
+
 multiorder: multiorder.o $(CORE_OFILES)
 
 clean:
-	$(RM) $(TARGETS) *.o radix-tree.c idr.c generated/*
+	$(RM) $(TARGETS) maple-fuzz *.o radix-tree.c idr.c generated/*
 
 $(OFILES): $(SHARED_DEPS) *.h
