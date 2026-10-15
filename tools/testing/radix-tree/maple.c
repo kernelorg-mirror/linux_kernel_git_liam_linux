@@ -136,11 +136,11 @@ static noinline bool __init mas_node_fill(struct ma_state *mas)
 	if (!mas_is_active(mas))
 		return false;
 
-	if (mas->max - mas->min <= mt_slot_count(mas->node))
+	if (mas->max - mas->min <= mas_slot_count(mas, mas->node))
 		goto done;
 
 	val = mas_data_end(mas) + 1;
-	target = mt_slot_count(mas->node);
+	target = mas_slot_count(mas, mas->node);
 	if (val == target)
 		goto full;
 
@@ -168,7 +168,7 @@ static noinline bool __init mas_node_fill(struct ma_state *mas)
 	return mas_node_first_split_offset(mas);
 
 full:
-	if (mas->max - mas->min > mt_slot_count(mas->node))
+	if (mas->max - mas->min > mas_slot_count(mas, mas->node))
 		return mas_node_first_split_offset(mas);
 done:
 	mas_set(mas, mas->max);
@@ -209,7 +209,8 @@ static noinline void __init test_mas_node_depth(struct ma_state *mas,
 		offset = 0;
 		while (offset < count &&
 		       mas->index > ma_pivot(mas_mn(mas),
-					      mte_node_type(mas->node), offset)) {
+					      mas_node_type(mas, mas->node),
+					      offset)) {
 			offset++;
 		}
 		mas->offset = offset;
@@ -226,7 +227,7 @@ static noinline void __init mas_internal_node_fill(struct ma_state *mas)
 
 	MT_BUG_ON(mas->tree, mte_is_leaf(mas->node));
 	val = mas_data_end(mas) + 1;
-	target = mt_slot_count(mas->node);
+	target = mas_slot_count(mas, mas->node);
 	if (val == target)
 		return;
 
@@ -294,9 +295,10 @@ static void __maybe_unused mas_fill_node_at_depth(struct maple_tree *mt,
 
 	/* A leaf may end in a NULL; the boundary slot must hold a value. */
 	if (descending && mte_is_leaf(mas.node) &&
-	    !ma_slots(mas_mn(&mas), mte_node_type(mas.node))[end]) {
+	    !ma_slots(mas_mn(&mas), mas_node_type(&mas, mas.node))[end]) {
 		unsigned long start = end ? ma_pivot(mas_mn(&mas),
-				mte_node_type(mas.node), end - 1) + 1 : node_min;
+				mas_node_type(&mas, mas.node),
+				end - 1) + 1 : node_min;
 
 		mas_set_range(&mas, start, node_max);
 		mas_store_gfp(&mas, xa_mk_value(start), GFP_KERNEL);
@@ -306,16 +308,17 @@ static void __maybe_unused mas_fill_node_at_depth(struct maple_tree *mt,
 	}
 
 	if (descending)
-		v = end ? ma_pivot(mas_mn(&mas), mte_node_type(mas.node),
+		v = end ? ma_pivot(mas_mn(&mas), mas_node_type(&mas, mas.node),
 				   end - 1) : node_max - 1;
 	else
-		v = (end ? ma_pivot(mas_mn(&mas), mte_node_type(mas.node), 0) :
+		v = (end ? ma_pivot(mas_mn(&mas),
+				    mas_node_type(&mas, mas.node), 0) :
 			   node_min) + 1;
 
 	for (;;) {
 		mas_set(&mas, index);
 		test_mas_node_depth(&mas, depth);
-		if (mas_data_end(&mas) >= mt_slot_count(mas.node) - 1)
+		if (mas_data_end(&mas) >= mas_slot_count(&mas, mas.node) - 1)
 			return;			/* node is full */
 		if (descending) {
 			if (v <= node_min)
@@ -341,7 +344,8 @@ static void __maybe_unused fill_root_branches(struct maple_tree *mt,
 	unsigned char d, height;
 
 	mas_start(&mas);
-	boundary = ma_pivot(mas_mn(&mas), mte_node_type(mas.node), offset);
+	boundary = ma_pivot(mas_mn(&mas), mas_node_type(&mas, mas.node),
+			    offset);
 	height = mt_height(mt);
 
 	for (d = 1; d <= height; d++) {
@@ -391,7 +395,7 @@ static unsigned long __maybe_unused find_full_node_boundary(struct maple_tree *m
 	entry = mas_walk(mas);
 	do {
 		if (entry && mas->offset == mas->end &&
-		    mas->end == mt_slot_count(mas->node) - 1) {
+		    mas->end == mas_slot_count(mas, mas->node) - 1) {
 			unsigned long start = mas->index;
 			struct maple_enode *node = mas->node;
 			struct maple_node *parent = mte_parent(node);
@@ -399,7 +403,7 @@ static unsigned long __maybe_unused find_full_node_boundary(struct maple_tree *m
 			entry = mas_next_range(mas, ULONG_MAX);
 			if (mas->node != node &&
 			    (!two_levels || mte_parent(mas->node) != parent) &&
-			    mas->end == mt_slot_count(mas->node) - 1) {
+			    mas->end == mas_slot_count(mas, mas->node) - 1) {
 				mas_set(mas, start);
 				mas_walk(mas);
 				return start;
@@ -891,7 +895,7 @@ static inline bool mas_descend_walk(struct ma_state *mas,
 	next = mas->node;
 	while (true) {
 		node = mte_to_node(next);
-		type = mte_node_type(next);
+		type = mas_node_type(mas, next);
 		mas_node_walk(mas, node, type, range_min, range_max);
 		next = mas_slot(mas, ma_slots(node, type), mas->offset);
 		if (unlikely(ma_dead_node(node)))
@@ -1023,7 +1027,8 @@ static noinline void __init check_erase2_testset(struct maple_tree *mt,
 			break;
 		case STORE:
 			value = xa_mk_value(set[i + 1]);
-			if (mas_start.offset > mt_slot_count(mas_start.node)) {
+			if (mas_start.offset >
+			    mas_slot_count(&mas_start, mas_start.node)) {
 				entry_count++; /* appending an entry. */
 			} else if ((s_min == e_min) && (s_max == e_max)) {
 				if (!entry_count)
@@ -35406,10 +35411,10 @@ walk_up:
 		mas_ascend(mas);
 		goto walk_up;
 	}
-	mas->max = mas_safe_pivot(mas, mte_to_node(prev), mte_node_type(prev),
-				  slot);
-	mas->min = mas_safe_min(mas, mte_to_node(prev), mte_node_type(prev),
-				slot);
+	mas->max = mas_safe_pivot(mas, mte_to_node(prev),
+				  mas_node_type(mas, prev), slot);
+	mas->min = mas_safe_min(mas, mte_to_node(prev),
+				mas_node_type(mas, prev), slot);
 
 	return;
 done:
@@ -35531,9 +35536,9 @@ static void count_node_widths(struct maple_tree *mt, unsigned int *n32,
 
 	*n32 = *n64 = 0;
 	mas_dfs_preorder(&mas);
-	*root32 = node_is_32b(mte_node_type(mas.node));
+	*root32 = node_is_32b(mas_node_type(&mas, mas.node));
 	while (!mas_is_none(&mas)) {
-		enum maple_type type = mte_node_type(mas.node);
+		enum maple_type type = mas_node_type(&mas, mas.node);
 
 		/* A dense leaf has no pivots to be either width. */
 		if (node_is_32b(type))
@@ -35551,7 +35556,7 @@ static unsigned int count_dense_leaves(struct maple_tree *mt)
 
 	mas_dfs_preorder(&mas);
 	while (!mas_is_none(&mas)) {
-		if (ma_is_dense(mte_node_type(mas.node)))
+		if (ma_is_dense(mas_node_type(&mas, mas.node)))
 			count++;
 		mas_dfs_preorder(&mas);
 	}
@@ -35567,7 +35572,7 @@ static unsigned int count_dense_partial(struct maple_tree *mt)
 
 	mas_dfs_preorder(&mas);
 	while (!mas_is_none(&mas)) {
-		enum maple_type type = mte_node_type(mas.node);
+		enum maple_type type = mas_node_type(&mas, mas.node);
 
 		if (ma_is_dense(type) && mas.max - mas.min + 1 < mt_slots[type])
 			count++;
@@ -35588,7 +35593,7 @@ static u64 fill_last_leaf(struct maple_tree *mt, u64 next)
 		mas_lock(&mas);
 		mas_set_range(&mas, next - 1, next - 1);
 		MT_BUG_ON(mt, !mas_walk(&mas));
-		full = mas_data_end(&mas) == mt_slots[mte_node_type(mas.node)] - 1;
+		full = mas_data_end(&mas) == mas_slot_count(&mas, mas.node) - 1;
 		mas_unlock(&mas);
 		if (full)
 			return next;
@@ -35606,7 +35611,7 @@ static enum maple_type leaf_type_at(struct maple_tree *mt, u64 index)
 	mas_lock(&mas);
 	mas_set_range(&mas, index, index);
 	MT_BUG_ON(mt, !mas_walk(&mas));
-	type = mte_node_type(mas.node);
+	type = mas_node_type(&mas, mas.node);
 	mas_unlock(&mas);
 	return type;
 }
@@ -35626,7 +35631,7 @@ static u64 fill_to_split(struct maple_tree *mt, u64 next, unsigned long width)
 		mas_lock(&mas);
 		mas_set_range(&mas, next - 1, next - 1);
 		MT_BUG_ON(mt, !mas_walk(&mas));
-		type = mte_node_type(mas.node);
+		type = mas_node_type(&mas, mas.node);
 		small = mas_data_end(&mas) + 4 <=
 			mt_slots[node_transition_type(type)];
 		mas_unlock(&mas);
@@ -35652,7 +35657,7 @@ static bool leaf_wide_entry(struct maple_tree *mt, u64 index,
 	mas_set_range(&mas, index, index);
 	MT_BUG_ON(mt, !mas_walk(&mas));
 	node = mas_mn(&mas);
-	type = mte_node_type(mas.node);
+	type = mas_node_type(&mas, mas.node);
 	end = mas_data_end(&mas);
 	for (off = 0; off <= end; off++) {
 		*lo = mas_safe_min(&mas, node, type, off);
@@ -35680,7 +35685,7 @@ static void fill_leaf(struct maple_tree *mt, u64 index, unsigned long width)
 		mas_lock(&mas);
 		mas_set_range(&mas, index, index);
 		MT_BUG_ON(mt, !mas_walk(&mas));
-		full = mas_data_end(&mas) == mt_slots[mte_node_type(mas.node)] - 1;
+		full = mas_data_end(&mas) == mas_slot_count(&mas, mas.node) - 1;
 		mas_unlock(&mas);
 		if (full)
 			return;
@@ -35807,7 +35812,7 @@ static void check_born32_rebalance(struct maple_tree *mt, unsigned int flags,
 	mas_lock(&mas);
 	mas_set_range(&mas, next - 1, next - 1);
 	MT_BUG_ON(mt, !mas_walk(&mas));
-	t = mte_node_type(mas.node);
+	t = mas_node_type(&mas, mas.node);
 	first = mas.min + 2 * (range + 1);
 	mas_unlock(&mas);
 	MT_BUG_ON(mt, 4 >= mt_min_slots[node_transition_type(t)]);
@@ -35980,7 +35985,7 @@ static void check_born32_null_join(struct maple_tree *mt, unsigned int flags)
 		MT_BUG_ON(mt, !seam);
 		mas_set_range(&mas, seam - 1, seam - 1);
 		mas_walk(&mas);
-		if (node_is_32b(mte_node_type(mas.node)))
+		if (node_is_32b(mas_node_type(&mas, mas.node)))
 			break;
 		seam = mas.min;
 	}
@@ -36000,11 +36005,12 @@ static void check_born32_null_join(struct maple_tree *mt, unsigned int flags)
 	mas_set_range(&mas, seam - 1, seam - 1);
 	MT_BUG_ON(mt, mas_walk(&mas) != NULL);
 	MT_BUG_ON(mt, mas.last != seam - 1);
-	MT_BUG_ON(mt, !node_is_32b(mte_node_type(mas.node)));
+	MT_BUG_ON(mt, !node_is_32b(mas_node_type(&mas, mas.node)));
 	start = mas.index;
 	mas_set_range(&mas, seam, seam);
 	MT_BUG_ON(mt, mas_walk(&mas) != c);
-	MT_BUG_ON(mt, mas.offset || node_is_32b(mte_node_type(mas.node)));
+	MT_BUG_ON(mt, mas.offset ||
+		      node_is_32b(mas_node_type(&mas, mas.node)));
 
 	/* Clearing the value joins the NULL before it across the 4G seam. */
 	mas_set_range(&mas, seam, last);
@@ -36045,14 +36051,14 @@ static void check_born32_push_seam(struct maple_tree *mt, unsigned int flags)
 	mas_lock(&mas);
 	mas_set_range(&mas, hi, hi);
 	MT_BUG_ON(mt, mas_walk(&mas) != xa_mk_value(hi));
-	MT_BUG_ON(mt, node_is_32b(mte_node_type(mas.node)));
-	cap64 = mt_slots[mte_node_type(mas.node)];
+	MT_BUG_ON(mt, node_is_32b(mas_node_type(&mas, mas.node)));
+	cap64 = mt_slots[mas_node_type(&mas, mas.node)];
 	count = mas_data_end(&mas) + 1;
 	index = mas.min - 1;
 	mas_set_range(&mas, index, index);
 	MT_BUG_ON(mt, !mas_walk(&mas));
-	MT_BUG_ON(mt, !node_is_32b(mte_node_type(mas.node)));
-	cap32 = mt_slots[mte_node_type(mas.node)];
+	MT_BUG_ON(mt, !node_is_32b(mas_node_type(&mas, mas.node)));
+	cap32 = mt_slots[mas_node_type(&mas, mas.node)];
 	mas_unlock(&mas);
 
 	/*
@@ -36073,7 +36079,8 @@ static void check_born32_push_seam(struct maple_tree *mt, unsigned int flags)
 		mas_set_range(&mas, hi, hi);
 		MT_BUG_ON(mt, !mas_walk(&mas));
 		lo = mas.min;
-		last = mas_safe_pivot(&mas, mas_mn(&mas), mte_node_type(mas.node),
+		last = mas_safe_pivot(&mas, mas_mn(&mas),
+				      mas_node_type(&mas, mas.node),
 				      count - want);
 		mas_unlock(&mas);
 		MT_BUG_ON(mt, mtree_store_range_u64(mt, lo, last, NULL,
@@ -36098,7 +36105,7 @@ static void check_born32_push_seam(struct maple_tree *mt, unsigned int flags)
 	mas_lock(&mas);
 	mas_set_range(&mas, lo, lo);
 	MT_BUG_ON(mt, mas_walk(&mas) != xa_mk_value(0xbad));
-	MT_BUG_ON(mt, !node_is_32b(mte_node_type(mas.node)));
+	MT_BUG_ON(mt, !node_is_32b(mas_node_type(&mas, mas.node)));
 	mas_set_range(&mas, hi, hi);
 	MT_BUG_ON(mt, mas_walk(&mas) != xa_mk_value(hi));
 	MT_BUG_ON(mt, mas_data_end(&mas) + 1 != want);
@@ -36132,7 +36139,7 @@ static void check_born32_span_null_end(struct maple_tree *mt, unsigned int flags
 		MT_BUG_ON(mt, !seam);
 		mas_set_range(&mas, seam - 1, seam - 1);
 		mas_walk(&mas);
-		if (node_is_32b(mte_node_type(mas.node)))
+		if (node_is_32b(mas_node_type(&mas, mas.node)))
 			break;
 		seam = mas.min;
 	}
@@ -36143,7 +36150,8 @@ static void check_born32_span_null_end(struct maple_tree *mt, unsigned int flags
 	/* The write starts in the last entry of the 32-bit leaf before that. */
 	mas_set_range(&mas, mas.min - 1, mas.min - 1);
 	MT_BUG_ON(mt, !mas_walk(&mas));
-	MT_BUG_ON(mt, !node_is_32b(mte_node_type(mas.node)) || !mas.offset);
+	MT_BUG_ON(mt, !node_is_32b(mas_node_type(&mas, mas.node)) ||
+		      !mas.offset);
 	index = mas.index;
 
 	/* A value first in the 64-bit leaf, a NULL ending the 32-bit one. */
@@ -36157,7 +36165,7 @@ static void check_born32_span_null_end(struct maple_tree *mt, unsigned int flags
 	mas_set_range(&mas, seam - 1, seam - 1);
 	MT_BUG_ON(mt, mas_walk(&mas) != NULL);
 	MT_BUG_ON(mt, mas.index > start || mas.last != seam - 1);
-	MT_BUG_ON(mt, !node_is_32b(mte_node_type(mas.node)));
+	MT_BUG_ON(mt, !node_is_32b(mas_node_type(&mas, mas.node)));
 	start = mas.index;
 
 	/*
@@ -36220,18 +36228,18 @@ static void check_born32_span_sib(struct maple_tree *mt, unsigned int flags)
 	mas_set_range(&mas, 0, 0);
 	MT_BUG_ON(mt, !mas_walk(&mas));
 	mas_ascend(&mas);
-	type = mte_node_type(mas.node);
+	type = mas_node_type(&mas, mas.node);
 	k = mt_min_slots[type] - 1;
 	MT_BUG_ON(mt, !node_is_32b(type) || mas_data_end(&mas) <= k);
 	a_max = mas.max;
 	mas.offset = k;
 	mas_descend(&mas);
-	a = mas_safe_min(&mas, mas_mn(&mas), mte_node_type(mas.node),
+	a = mas_safe_min(&mas, mas_mn(&mas), mas_node_type(&mas, mas.node),
 			 mas_data_end(&mas));
 	mas_set_range(&mas, a_max + 1, a_max + 1);
 	MT_BUG_ON(mt, !mas_walk(&mas));
 	mas_ascend(&mas);
-	type = mte_node_type(mas.node);
+	type = mas_node_type(&mas, mas.node);
 	end = mas_data_end(&mas);
 	r_max = mas.max;
 	MT_BUG_ON(mt, mte_parent_slot(mas.node) != 1 || r_max > U32_MAX);
@@ -36256,7 +36264,7 @@ static void check_born32_span_sib(struct maple_tree *mt, unsigned int flags)
 	mas_set_range(&mas, a, a);
 	MT_BUG_ON(mt, mas_walk(&mas) != v);
 	mas_ascend(&mas);
-	MT_BUG_ON(mt, mas_data_end(&mas) < mt_min_slot_count(mas.node));
+	MT_BUG_ON(mt, mas_data_end(&mas) < mas_min_slot_count(&mas, mas.node));
 	mas_unlock(&mas);
 	mtree_destroy(mt);
 }
@@ -36475,7 +36483,7 @@ static u64 leaf_widest(struct maple_tree *mt, u64 index, u64 *lo)
 	mas_set_range(&mas, index, index);
 	MT_BUG_ON(mt, !mas_walk(&mas));
 	node = mas_mn(&mas);
-	type = mte_node_type(mas.node);
+	type = mas_node_type(&mas, mas.node);
 	end = mas_data_end(&mas);
 	for (off = 0; off <= end; off++) {
 		min = mas_safe_min(&mas, node, type, off);
@@ -36511,7 +36519,7 @@ static void fill_leaf_halving(struct maple_tree *mt, u64 index)
 		mas_lock(&mas);
 		mas_set_range(&mas, index, index);
 		MT_BUG_ON(mt, !mas_walk(&mas));
-		full = mas_data_end(&mas) == mt_slots[mte_node_type(mas.node)] - 1;
+		full = mas_data_end(&mas) == mas_slot_count(&mas, mas.node) - 1;
 		mas_unlock(&mas);
 		if (full)
 			return;
@@ -36594,7 +36602,7 @@ static void check_born32_seam_three(struct maple_tree *mt, unsigned int flags)
 	MT_BUG_ON(mt, !mas_walk(&mas));
 	mas_ascend(&mas);
 	MT_BUG_ON(mt, mte_is_root(mas.node));
-	type = mte_node_type(mas.node);
+	type = mas_node_type(&mas, mas.node);
 	slots = mt_slots[type];
 	a_max = mas.max;
 	for (n32 = 0; n32 <= mas_data_end(&mas); n32++)
@@ -36612,12 +36620,12 @@ static void check_born32_seam_three(struct maple_tree *mt, unsigned int flags)
 	mas_lock(&mas);
 	mas_set_range(&mas, a_max, a_max);
 	MT_BUG_ON(mt, !mas_walk(&mas));
-	MT_BUG_ON(mt, mas_data_end(&mas) != mt_slots[mte_node_type(mas.node)] - 1);
+	MT_BUG_ON(mt, mas_data_end(&mas) != mas_slot_count(&mas, mas.node) - 1);
 	lo = mas.index + 1;
 	MT_BUG_ON(mt, lo > a_max);
 	mas_set_range(&mas, a_max + 1, a_max + 1);
 	MT_BUG_ON(mt, !mas_walk(&mas));
-	MT_BUG_ON(mt, mas_data_end(&mas) != mt_slots[mte_node_type(mas.node)] - 1);
+	MT_BUG_ON(mt, mas_data_end(&mas) != mas_slot_count(&mas, mas.node) - 1);
 	last = mas.last - 1;
 	MT_BUG_ON(mt, last <= a_max);
 	mas_unlock(&mas);
@@ -36630,7 +36638,7 @@ static void check_born32_seam_three(struct maple_tree *mt, unsigned int flags)
 	mas_set_range(&mas, 0, 0);
 	MT_BUG_ON(mt, !mas_walk(&mas));
 	mas_ascend(&mas);
-	MT_BUG_ON(mt, mas_data_end(&mas) < mt_min_slot_count(mas.node));
+	MT_BUG_ON(mt, mas_data_end(&mas) < mas_min_slot_count(&mas, mas.node));
 	mas_unlock(&mas);
 	mtree_destroy(mt);
 }
@@ -36675,7 +36683,7 @@ static void check_born32_seam_rest(struct maple_tree *mt, unsigned int flags)
 	mas_lock(&mas);
 	MT_BUG_ON(mt, !mas_walk(&mas));
 	mas_ascend(&mas);
-	type = mte_node_type(mas.node);
+	type = mas_node_type(&mas, mas.node);
 	a_max = mas.max;
 	mas_unlock(&mas);
 	MT_BUG_ON(mt, !node_is_32b(type));
@@ -36700,7 +36708,7 @@ static void check_born32_seam_rest(struct maple_tree *mt, unsigned int flags)
 	mas_set_range(&mas, a_max + 1, a_max + 1);
 	mas_walk(&mas);
 	mas_ascend(&mas);
-	type = mte_node_type(mas.node);
+	type = mas_node_type(&mas, mas.node);
 	end = mas_data_end(&mas);
 	MT_BUG_ON(mt, node_is_32b(type) || mte_parent_slot(mas.node) != 1);
 
@@ -36715,7 +36723,7 @@ static void check_born32_seam_rest(struct maple_tree *mt, unsigned int flags)
 	/* From the last entry of the first node's last leaf. */
 	mas_set_range(&mas, a_max, a_max);
 	mas_walk(&mas);
-	a = mas_safe_min(&mas, mas_mn(&mas), mte_node_type(mas.node),
+	a = mas_safe_min(&mas, mas_mn(&mas), mas_node_type(&mas, mas.node),
 			 mas_data_end(&mas));
 	mas_unlock(&mas);
 
@@ -36730,7 +36738,7 @@ static void check_born32_seam_rest(struct maple_tree *mt, unsigned int flags)
 	mas_set_range(&mas, b + 1, b + 1);
 	mas_walk(&mas);
 	mas_ascend(&mas);
-	MT_BUG_ON(mt, mas_data_end(&mas) < mt_min_slot_count(mas.node));
+	MT_BUG_ON(mt, mas_data_end(&mas) < mas_min_slot_count(&mas, mas.node));
 	mas_unlock(&mas);
 	mtree_destroy(mt);
 }
@@ -36761,11 +36769,11 @@ static void check_born32_seam(struct maple_tree *mt, unsigned int flags)
 	mas_lock(&mas);
 	mas_set_range(&mas, hi, hi);
 	MT_BUG_ON(mt, mas_walk(&mas) != pv);
-	t64 = mte_node_type(mas.node);
+	t64 = mas_node_type(&mas, mas.node);
 	b_min = mas.min;
 	mas_set_range(&mas, b_min - 1, b_min - 1);
 	MT_BUG_ON(mt, !mas_walk(&mas));
-	t32 = mte_node_type(mas.node);
+	t32 = mas_node_type(&mas, mas.node);
 	mas_unlock(&mas);
 	MT_BUG_ON(mt, node_is_32b(t64) || !node_is_32b(t32));
 
@@ -36818,7 +36826,7 @@ static void check_born32_narrow(struct maple_tree *mt, unsigned int flags)
 	mas_lock(&mas);
 	mas_set_range(&mas, hi, hi);
 	MT_BUG_ON(mt, mas_walk(&mas) != pv);
-	type = mte_node_type(mas.node);
+	type = mas_node_type(&mas, mas.node);
 	b_min = mas.min;
 	mas_unlock(&mas);
 	MT_BUG_ON(mt, node_is_32b(type) || b_min >= hi);
@@ -36835,7 +36843,7 @@ static void check_born32_narrow(struct maple_tree *mt, unsigned int flags)
 	mas_lock(&mas);
 	mas_set_range(&mas, b_min, b_min);
 	MT_BUG_ON(mt, !mas_walk(&mas));
-	type = mte_node_type(mas.node);
+	type = mas_node_type(&mas, mas.node);
 	end = mas_data_end(&mas);
 	max = mas.max;
 	mas_unlock(&mas);
@@ -37122,7 +37130,7 @@ static void check_born32_seam_min(struct maple_tree *mt, unsigned int flags)
 	mas_lock(&mas);
 	mas_set_range(&mas, 3000, 3000);
 	MT_BUG_ON(mt, !mas_walk(&mas));
-	lt = mte_node_type(mas.node);
+	lt = mas_node_type(&mas, mas.node);
 	l_min = mas.min;
 	l_end = mas.end;
 	mas_set_range(&mas, l_min - 1, l_min - 1);
@@ -37131,7 +37139,7 @@ static void check_born32_seam_min(struct maple_tree *mt, unsigned int flags)
 
 	mas_set_range(&mas, hi + 200, hi + 200);
 	MT_BUG_ON(mt, !mas_walk(&mas));
-	rt = mte_node_type(mas.node);
+	rt = mas_node_type(&mas, mas.node);
 	r_max = mas.max;
 	r_end = mas.end;
 	mas_set_range(&mas, r_max + 1, r_max + 1);
@@ -37225,7 +37233,7 @@ static unsigned char get_vacant_height(struct ma_wr_state *wr_mas, void *entry)
 	if (!xa_is_node(mas_root(mas)))
 		return 0;
 
-	type = mte_node_type(mas->node);
+	type = mas_node_type(mas, mas->node);
 	wr_mas->type = type;
 	wr_mas->sufficient_height = 0;
 	while (!ma_is_leaf(type)) {
@@ -37246,10 +37254,10 @@ static unsigned char get_vacant_height(struct ma_wr_state *wr_mas, void *entry)
 			mas->max;
 
 		/* detect spanning write */
-		if (mas_is_span_wr(wr_mas))
+		if (mas_is_span_wr(wr_mas, type))
 			break;
 
-		if (mas->end < mt_slot_count(mas->node) - 1)
+		if (mas->end < mas_slot_count(mas, mas->node) - 1)
 			vacant_height = mas->depth + 1;
 
 		if (ma_is_root(mas_mn(mas))) {
@@ -37260,7 +37268,7 @@ static unsigned char get_vacant_height(struct ma_wr_state *wr_mas, void *entry)
 		}
 
 		mas_descend(mas);
-		type = mte_node_type(mas->node);
+		type = mas_node_type(mas, mas->node);
 		mas->depth++;
 	}
 
@@ -37652,13 +37660,15 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 
 		mas_set(&mas, 0);
 		mas_start(&mas);
-		boundary = ma_pivot(mas_mn(&mas), mte_node_type(mas.node), 0);
+		boundary = ma_pivot(mas_mn(&mas),
+				    mas_node_type(&mas, mas.node), 0);
 
 		/* Ensure the parent node at the boundary is full. */
 		mas_set(&mas, boundary);
 		mas_walk(&mas);
 		mas_ascend(&mas);
-		MT_BUG_ON(mt, mas_data_end(&mas) != mt_slot_count(mas.node) - 1);
+		MT_BUG_ON(mt, mas_data_end(&mas) !=
+			      mas_slot_count(&mas, mas.node) - 1);
 
 		/* A store spanning the full boundary cascades a split upward. */
 		mas_set_range(&mas, boundary - 100, boundary + 100);
@@ -37756,14 +37766,14 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 	mas_set(&mas, i);
 	MT_BUG_ON(mt, mas_walk(&mas) == NULL);
 	MT_BUG_ON(mt, mas.index != i);
-	MT_BUG_ON(mt, mas.end != mt_slot_count(mas.node) - 1);
+	MT_BUG_ON(mt, mas.end != mas_slot_count(&mas, mas.node) - 1);
 	enode = mas.node;
 	{
 		unsigned long vend = mas.last;
 
 		/* The next range begins a different, also full, node. */
 		mas_next_range(&mas, ULONG_MAX);
-		MT_BUG_ON(mt, mas.end != mt_slot_count(mas.node) - 1);
+		MT_BUG_ON(mt, mas.end != mas_slot_count(&mas, mas.node) - 1);
 		MT_BUG_ON(mt, enode == mas.node);
 
 		/* Store a value spanning the boundary -> 3 way split. */
@@ -37796,14 +37806,14 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 	mas_set(&mas, i);
 	MT_BUG_ON(mt, mas_walk(&mas) == NULL);
 	MT_BUG_ON(mt, mas.index != i);
-	MT_BUG_ON(mt, mas.end != mt_slot_count(mas.node) - 1);
+	MT_BUG_ON(mt, mas.end != mas_slot_count(&mas, mas.node) - 1);
 	enode = mas.node;
 	pnode = mte_parent(enode);
 	{
 		unsigned long vend = mas.last;
 
 		mas_next_range(&mas, ULONG_MAX);
-		MT_BUG_ON(mt, mas.end != mt_slot_count(mas.node) - 1);
+		MT_BUG_ON(mt, mas.end != mas_slot_count(&mas, mas.node) - 1);
 		MT_BUG_ON(mt, enode == mas.node);
 		MT_BUG_ON(mt, pnode == mte_parent(mas.node));
 		/* Store a value spanning the boundary -> split at two levels. */
@@ -37829,13 +37839,13 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 	fill_root_branches(mt, 0);
 	mas_set(&mas, 0);
 	mas_start(&mas);
-	i = ma_pivot(mas_mn(&mas), mte_node_type(mas.node), 0);
+	i = ma_pivot(mas_mn(&mas), mas_node_type(&mas, mas.node), 0);
 	/* The leaf ending on the first root pivot is full and ends in a value. */
 	mas_set(&mas, i);
 	MT_BUG_ON(mt, mas_walk(&mas) == NULL);
 	MT_BUG_ON(mt, mas.last != i);
 	MT_BUG_ON(mt, mas.offset != mas.end);
-	MT_BUG_ON(mt, mas.end != mt_slot_count(mas.node) - 1);
+	MT_BUG_ON(mt, mas.end != mas_slot_count(&mas, mas.node) - 1);
 	pnode = mte_parent(mas.node);
 	{
 		unsigned long pmax = i;		/* pnode's max, its last leaf's */
@@ -37845,7 +37855,7 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 		mas_set(&mas, i + 1);
 		mas_walk(&mas);
 		MT_BUG_ON(mt, mas.index != i + 1);
-		MT_BUG_ON(mt, mas.end != mt_slot_count(mas.node) - 1);
+		MT_BUG_ON(mt, mas.end != mas_slot_count(&mas, mas.node) - 1);
 		MT_BUG_ON(mt, mte_parent(mas.node) == pnode);
 
 		/* The leaf before it: full, the write starts inside its last slot. */
@@ -37864,7 +37874,7 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 			MT_BUG_ON(mt, mas_walk(&mas) == NULL);
 		}
 		MT_BUG_ON(mt, mas.index == mas.last);
-		MT_BUG_ON(mt, mas.end != mt_slot_count(mas.node) - 1);
+		MT_BUG_ON(mt, mas.end != mas_slot_count(&mas, mas.node) - 1);
 		MT_BUG_ON(mt, mas.offset != mas.end);
 		MT_BUG_ON(mt, mte_parent(mas.node) != pnode);
 
@@ -37912,7 +37922,7 @@ static __init unsigned long find_val_null_surrounded(struct ma_state *mas,
 			continue;
 		if (mas->offset < 1 || mas->offset + span > mas->end)
 			continue;
-		if (mas->end - 2 * nvals < mt_min_slots[mte_node_type(mas->node)])
+		if (mas->end - 2 * nvals < mas_min_slot_count(mas, mas->node))
 			continue;
 		return v;
 	}
@@ -38048,7 +38058,8 @@ static noinline void __init check_locky(struct maple_tree *mt)
  * Compares two nodes except for the addresses stored in the nodes.
  * Returns zero if they are the same, otherwise returns non-zero.
  */
-static int __init compare_node(struct maple_enode *enode_a,
+static int __init compare_node(struct maple_tree *mt,
+			       struct maple_enode *enode_a,
 			       struct maple_enode *enode_b)
 {
 	struct maple_node *node_a, *node_b;
@@ -38063,7 +38074,7 @@ static int __init compare_node(struct maple_enode *enode_a,
 		return -1;
 	}
 
-	type = mte_node_type(enode_a);
+	type = mt_node_type(mt, enode_a);
 	node_a = mte_to_node(enode_a);
 	node_b = mte_to_node(enode_b);
 	a = *node_a;
@@ -38157,7 +38168,7 @@ static int __init compare_tree(struct maple_tree *mt_a, struct maple_tree *mt_b)
 			return -1;
 		}
 
-		if (compare_node(mas_a.node, mas_b.node)) {
+		if (compare_node(mt_a, mas_a.node, mas_b.node)) {
 			pr_err("The contents of nodes %p and %p are different.\n",
 			       mas_a.node, mas_b.node);
 			mt_dump(mt_a, mt_dump_dec);
@@ -38223,7 +38234,7 @@ static __init int build_full_tree(struct maple_tree *mt, unsigned int flags,
 			if (mas_is_none(&mas))
 				goto unlock;
 
-			type = mte_node_type(mas.node);
+			type = mas_node_type(&mas, mas.node);
 			if (mas_data_end(&mas) + 1 < mt_slots[type]) {
 				mas_set(&mas, mas.min);
 				goto store;
@@ -38779,7 +38790,7 @@ static noinline void __init check_multilevel_triple_split(struct maple_tree *mt)
 	mas_reset(&mas);
 	/* Fill the second-to-last subtree of the root. */
 	mas_start(&mas);
-	index = ma_pivot(mas_mn(&mas), mte_node_type(mas.node),
+	index = ma_pivot(mas_mn(&mas), mas_node_type(&mas, mas.node),
 			 mas_data_end(&mas) - 2) + 1;
 	mas_set(&mas, index);
 	mas_start(&mas);
@@ -38787,7 +38798,7 @@ static noinline void __init check_multilevel_triple_split(struct maple_tree *mt)
 	mas_reset(&mas);
 	/* Fill the last subtree of the root */
 	mas_start(&mas);
-	index = ma_pivot(mas_mn(&mas), mte_node_type(mas.node),
+	index = ma_pivot(mas_mn(&mas), mas_node_type(&mas, mas.node),
 			 mas_data_end(&mas) - 1) + 1;
 	mas_set(&mas, index);
 	mas_start(&mas);
@@ -38979,13 +38990,13 @@ static noinline void __init check_next_prev_two_level(struct maple_tree *mt)
  */
 static bool __init leaf_can_lose(struct ma_state *mas, unsigned long n)
 {
-	enum maple_type type = mte_node_type(mas->node);
+	enum maple_type type = mas_node_type(mas, mas->node);
 
 	if (ma_is_dense(type))
 		return ma_dense_cnt_ranges(mas->tree, mas_mn(mas), type, mas->max) -
 		       n + 1 > mt_slots[mt_leaf_type(mas->tree, mas->max)] - 1;
 
-	return mas_data_end(mas) >= mt_min_slot_count(mas->node) + n;
+	return mas_data_end(mas) >= mas_min_slot_count(mas, mas->node) + n;
 }
 
 static bool __init mt_find_gap_boundary_index(struct maple_tree *mt,
@@ -39351,11 +39362,11 @@ static noinline void __init check_dense_edge(struct maple_tree *mt,
 	rcu_read_lock();
 	mas_set(&mas, 500);
 	MT_BUG_ON(mt, mas_walk(&mas) == NULL);
-	MT_BUG_ON(mt, !ma_is_dense(mte_node_type(mas.node)));
+	MT_BUG_ON(mt, !ma_is_dense(mas_node_type(&mas, mas.node)));
 	l_max = mas.max;
 	mas_set(&mas, l_max + 1);
 	MT_BUG_ON(mt, mas_walk(&mas) == NULL);
-	MT_BUG_ON(mt, !ma_is_dense(mte_node_type(mas.node)));
+	MT_BUG_ON(mt, !ma_is_dense(mas_node_type(&mas, mas.node)));
 	MT_BUG_ON(mt, mas.min != l_max + 1);
 	rcu_read_unlock();
 
@@ -39368,7 +39379,7 @@ static noinline void __init check_dense_edge(struct maple_tree *mt,
 	mas_set(&mas, l_max);
 	MT_BUG_ON(mt, mas_walk(&mas) != NULL);
 	MT_BUG_ON(mt, mas.index != l_max - 2 || mas.last != l_max);
-	MT_BUG_ON(mt, !ma_is_dense(mte_node_type(mas.node)));
+	MT_BUG_ON(mt, !ma_is_dense(mas_node_type(&mas, mas.node)));
 	MT_BUG_ON(mt, mas.max != l_max);
 	rcu_read_unlock();
 
@@ -39400,7 +39411,7 @@ static noinline void __init check_dense_edge(struct maple_tree *mt,
 	rcu_read_lock();
 	mas_set(&mas, 800);
 	MT_BUG_ON(mt, mas_walk(&mas) == NULL);
-	MT_BUG_ON(mt, !ma_is_dense(mte_node_type(mas.node)));
+	MT_BUG_ON(mt, !ma_is_dense(mas_node_type(&mas, mas.node)));
 	r_min = mas.min;
 	rcu_read_unlock();
 	for (i = r_min; i <= r_min + 2; i++)
@@ -39411,7 +39422,7 @@ static noinline void __init check_dense_edge(struct maple_tree *mt,
 	mas_set(&mas, r_min);
 	MT_BUG_ON(mt, mas_walk(&mas) != NULL);
 	MT_BUG_ON(mt, mas.index != r_min || mas.last != r_min + 2);
-	MT_BUG_ON(mt, !ma_is_dense(mte_node_type(mas.node)));
+	MT_BUG_ON(mt, !ma_is_dense(mas_node_type(&mas, mas.node)));
 	MT_BUG_ON(mt, mas.min != r_min);
 	rcu_read_unlock();
 
@@ -39505,7 +39516,8 @@ static noinline void __init check_dense_merge(struct maple_tree *mt,
 		MT_BUG_ON(mt, !mas_walk(&mas));
 		if (mas.max >= a_max) {
 			merged = true;
-			MT_BUG_ON(mt, !ma_is_dense(mte_node_type(mas.node)));
+			MT_BUG_ON(mt,
+				  !ma_is_dense(mas_node_type(&mas, mas.node)));
 			MT_BUG_ON(mt, mas.min != b_min || mas.max != a_max);
 		}
 		mas_unlock(&mas);
@@ -39729,7 +39741,7 @@ void farmer_tests(void)
 static unsigned long get_last_index(struct ma_state *mas)
 {
 	struct maple_node *node = mas_mn(mas);
-	enum maple_type mt = mte_node_type(mas->node);
+	enum maple_type mt = mas_node_type(mas, mas->node);
 	unsigned long last_index = mas_data_end(mas);
 
 	BUG_ON(last_index == 0);

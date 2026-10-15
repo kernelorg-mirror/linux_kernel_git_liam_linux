@@ -1774,7 +1774,7 @@ static unsigned int mf_count_dense(void)
 		while (!mte_is_leaf(mas.node))
 			mas_descend(&mas);
 		while (!mas_is_overflow(&mas)) {
-			if (ma_is_dense(mte_node_type(mas.node)))
+			if (ma_is_dense(mas_node_type(&mas, mas.node)))
 				count++;
 			mas_dfs_postorder(&mas, U64_MAX);
 		}
@@ -2151,13 +2151,14 @@ static bool mf_directed_split(void)
 		mf_record(MF_DIRECTED, wr_split_store, iv.start, 0);
 		mtree_lock(&mf.mt);
 		mas_set(&mas, iv.start);
-		if (!mas_walk(&mas) || ma_is_dense(mte_node_type(mas.node))) {
+		if (!mas_walk(&mas) ||
+		    ma_is_dense(mas_node_type(&mas, mas.node))) {
 			mtree_unlock(&mf.mt);
 			continue;
 		}
 		lo = mas.min;
 		hi = mas.max;
-		slots = mt_slot_count(mas.node);
+		slots = mas_slot_count(&mas, mas.node);
 
 		/* Fill the leaf with node stores, then one store more. */
 		for (;;) {
@@ -2194,7 +2195,7 @@ static bool mf_directed_spanning(void)
 	while (mas_is_active(&mas) && mas.last < ceiling) {
 		u64 s = mas.index, l = mas.last;
 		bool edge = mas.offset == mas.end &&
-			    !ma_is_dense(mte_node_type(mas.node));
+			    !ma_is_dense(mas_node_type(&mas, mas.node));
 
 		entry = mas_next_range(&mas, U64_MAX);
 		if (!mas_is_active(&mas))
@@ -2248,7 +2249,7 @@ static bool mf_directed_rebalance(void)
 		mtree_lock(&mf.mt);
 		mas_set(&mas, iv.start);
 		if (!mas_walk(&mas) || mte_is_root(mas.node) ||
-		    ma_is_dense(mte_node_type(mas.node))) {
+		    ma_is_dense(mas_node_type(&mas, mas.node))) {
 			mtree_unlock(&mf.mt);
 			continue;
 		}

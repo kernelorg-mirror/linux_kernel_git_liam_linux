@@ -104,10 +104,10 @@ struct maple_metadata {
  * is not an error, it may lead to confusion if you're testing for an error with
  * mas_is_err().
  *
- * Non-leaf nodes store the type of the node pointed to (enum maple_type in bits
- * 3-6), and bit 2 is set when a NULL entry lies in or below that node, so a
- * gap search can skip a subtree without one.  That leaves bits 0-1 unused for
- * now.
+ * Non-leaf nodes store the base type of the node pointed to (bits 3-6; the
+ * tree's flags complete enum maple_type), and bit 2 is set when a NULL entry
+ * lies in or below that node, so a gap search can skip a subtree without one.
+ * That leaves bits 0-1 unused for now.
  *
  * In regular B-Tree terms, pivots are called keys.  The term pivot is used to
  * indicate that the tree is specifying ranges,  Pivots may appear in the
@@ -226,22 +226,37 @@ struct maple_topiary {
 	struct maple_enode *next; /* Overlaps the pivot */
 };
 
+/*
+ * An encoded node stores its base type in four bits.  Leaves come before
+ * maple_range_64 and parents from it, which is all ma_is_leaf() tests.  The
+ * tree completes the type with its secondary storage: gaps in an allocation
+ * tree's parents, marks in a marks tree's nodes.  Its bits, MAPLE_TYPE_ALLOC
+ * and MAPLE_TYPE_MARKS, sit above MAPLE_NODE_TYPE_MASK, so every base type
+ * must fit within the mask.
+ */
+#define MAPLE_NODE_TYPE_MASK	0x0F
+#define MAPLE_NODE_TYPE_SHIFT	0x03
+#define MAPLE_TYPE_ALLOC	0x10
+#define MAPLE_TYPE_MARKS	0x20
+
 enum maple_type {
 	maple_invalid,
-	maple_mleaf_64,
-	maple_mleaf_32,
 	maple_leaf_64,
 	maple_leaf_32,
 	maple_dense,
-	maple_mdense,
 	maple_range_64,
 	maple_range_32,
-	maple_arange_64,
-	maple_arange_32,
-	maple_mrange_64,
-	maple_mrange_32,
-	maple_copy,
+	maple_copy,	/* Never encoded; keep it the last base type */
+	maple_arange_64	= maple_range_64 | MAPLE_TYPE_ALLOC,
+	maple_arange_32	= maple_range_32 | MAPLE_TYPE_ALLOC,
+	maple_mleaf_64	= maple_leaf_64 | MAPLE_TYPE_MARKS,
+	maple_mleaf_32	= maple_leaf_32 | MAPLE_TYPE_MARKS,
+	maple_mdense	= maple_dense | MAPLE_TYPE_MARKS,
+	maple_mrange_64	= maple_range_64 | MAPLE_TYPE_MARKS,
+	maple_mrange_32	= maple_range_32 | MAPLE_TYPE_MARKS,
 };
+
+static_assert(maple_copy <= MAPLE_NODE_TYPE_MASK);
 
 enum store_type {
 	wr_invalid,
@@ -330,6 +345,11 @@ static_assert(sizeof(struct maple_copy) <= 256);
 #define MT_FLAGS_MARKS		0x400
 #define MT_FLAGS_SECONDARY_STORAGE	(MT_FLAGS_ALLOC_RANGE | MT_FLAGS_MARKS)
 
+/* The secondary storage flags, shifted down, are the tree's type bits. */
+#define MT_FLAGS_TYPE_SHIFT	5
+static_assert(MT_FLAGS_ALLOC_RANGE >> MT_FLAGS_TYPE_SHIFT == MAPLE_TYPE_ALLOC);
+static_assert(MT_FLAGS_MARKS >> MT_FLAGS_TYPE_SHIFT == MAPLE_TYPE_MARKS);
+
 typedef uint8_t mt_mark_t;
 
 #define MT_MARK_0		((mt_mark_t)0U)
@@ -345,9 +365,6 @@ typedef uint8_t mt_mark_t;
 
 #define MAPLE_HEIGHT_MAX	31
 
-
-#define MAPLE_NODE_TYPE_MASK	0x0F
-#define MAPLE_NODE_TYPE_SHIFT	0x03
 
 #define MAPLE_RESERVED_RANGE	4096
 
@@ -374,7 +391,7 @@ typedef uint8_t mt_mark_t;
  * If the tree contains a single entry at index 0, it is usually stored in
  * tree->ma_root.  To optimise for the page cache, an entry which ends in '00',
  * '01' or '11' is stored in the root, but an entry which ends in '10' will be
- * stored in a node.  Bits 3-6 are used to store enum maple_type.
+ * stored in a node.  Bits 3-6 store the node's base type.
  *
  * The flags are used both to store some immutable information about this tree
  * (set at tree creation time) and dynamic information set under the spinlock.
@@ -631,7 +648,8 @@ enum maple_status {
  * a node (eg the root).  If bit 1 is set, the rest of the bits are a negative
  * errno.  Bit 2 is the NULL bit, carried by every node pointer the tree holds
  * in a slot or the root; a pointer built from a child's parent pointer does
- * not have it.  Bits 3-6 indicate the node type.
+ * not have it.  Bits 3-6 indicate the node's base type, which state->tree_type
+ * completes.
  *
  * state->alloc either has a request number of nodes or an allocated node.  If
  * stat->alloc has a requested number of nodes, the first bit will be set (0x1)
@@ -679,6 +697,7 @@ struct ma_state {
 	unsigned char mas_flags;
 	unsigned char end;		/* The end of the node */
 	bool root_64b;			/* Root holds 64-bit pivots (else born-32) */
+	unsigned char tree_type;	/* The tree's secondary storage bits */
 	enum store_type store_type;	/* The type of store needed for this operation */
 #ifdef CONFIG_LOCKDEP
 	u32 ld_seq;
@@ -1095,8 +1114,10 @@ static inline bool mt_external_lock(const struct maple_tree *mt)
  */
 static inline void mt_init_flags(struct maple_tree *mt, unsigned int flags)
 {
-	WARN_ON_ONCE((flags & MT_FLAGS_SECONDARY_STORAGE) ==
-			 MT_FLAGS_SECONDARY_STORAGE);
+	/* A node holds gaps or marks, not both: the tree gets neither */
+	if (WARN_ON_ONCE((flags & MT_FLAGS_SECONDARY_STORAGE) ==
+			 MT_FLAGS_SECONDARY_STORAGE))
+		flags &= ~MT_FLAGS_SECONDARY_STORAGE;
 
 	mt->ma_flags = flags;
 	if (!mt_external_lock(mt))
@@ -1130,6 +1151,13 @@ static inline bool mt_has_marks(struct maple_tree *mt)
 static inline bool mt_has_secondary_storage(struct maple_tree *mt)
 {
 	return mt->ma_flags & MT_FLAGS_SECONDARY_STORAGE;
+}
+
+/* The type bits the tree adds to its nodes' base types. */
+static inline unsigned char mt_tree_type(const struct maple_tree *mt)
+{
+	return (mt->ma_flags >> MT_FLAGS_TYPE_SHIFT) &
+	       (MAPLE_TYPE_ALLOC | MAPLE_TYPE_MARKS);
 }
 
 /**
