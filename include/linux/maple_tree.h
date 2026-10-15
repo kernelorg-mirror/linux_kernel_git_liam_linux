@@ -113,7 +113,8 @@ struct maple_metadata {
  * indicate that the tree is specifying ranges,  Pivots may appear in the
  * subtree with an entry attached to the value whereas keys are unique to a
  * specific position of a B-tree.  Pivot values are inclusive of the slot with
- * the same index.
+ * the same index.  A pivot is stored as its delta from the node's implied
+ * minimum, so a 32-bit pivot node is one whose range fits in 32 bits.
  */
 
 struct maple_range_64 {
@@ -163,9 +164,9 @@ struct maple_mrange_64 {
 };
 
 /*
- * A range node whose pivots fit in 32 bits.  Used for trees whose index space
- * is currently within U32_MAX; a store of a larger index promotes the node to
- * the maple_range_64 layout.
+ * A range node whose pivots, deltas from its minimum, fit in 32 bits.  Used
+ * where a node's range is within U32_MAX; a node that must hold a wider range
+ * takes the maple_range_64 layout.
  */
 struct maple_range_32 {
 	struct maple_pnode *parent;

@@ -21,6 +21,11 @@
  * specific position of a B-tree.  Pivot values are inclusive of the slot with
  * the same index.
  *
+ * A pivot is stored as its delta from the node's implied minimum, in every
+ * range node type.  A node's contents are then the same wherever its range
+ * sits in the index space, and a node whose range fits in 32 bits can store
+ * its pivots as u32: the 32-bit node types.
+ *
  *
  * The following illustrates the layout of a range64 nodes slots and pivots.
  *
@@ -42,8 +47,8 @@
  *  Leaf nodes contain entries.
  *
  * The location of interest is often referred to as an offset.  All offsets have
- * a slot, but the last offset has an implied pivot from the node above (or
- * U32_MAX for the root node.
+ * a slot, but the last offset has an implied pivot from the node above (or the
+ * tree's ceiling for the root node).
  *
  * Ranges complicate certain write activities.  When modifying any of
  * the B-tree variants, it is known that one entry will either be added or
@@ -783,11 +788,12 @@ u32 *ma_gaps32(struct maple_node *node, enum maple_type type)
 }
 
 /*
- * ma_pivot() - Read pivot @offset of @node width-aware.  A 32-bit node stores
- * u32 pivots that zero-extend into the u64 the maple state runs in.
+ * ma_delta() - Read the delta stored at pivot @offset of @node width-aware.
+ * A 32-bit node stores u32 deltas that zero-extend into the u64 the maple
+ * state runs in.
  */
 static __always_inline
-u64 ma_pivot(struct maple_node *node, enum maple_type type,
+u64 ma_delta(struct maple_node *node, enum maple_type type,
 		unsigned char offset)
 {
 	switch (type) {
@@ -809,6 +815,34 @@ u64 ma_pivot(struct maple_node *node, enum maple_type type,
 	case maple_mleaf_32:
 	case maple_mrange_32:
 		return node->mm32.pivot[offset];
+	default:
+		return 0;
+	}
+}
+
+/*
+ * ma_pivot() - The last index of slot @offset of @node: the node minimum @min
+ * plus the delta stored at the pivot.
+ */
+static __always_inline
+u64 ma_pivot(struct maple_node *node, enum maple_type type,
+		unsigned char offset, u64 min)
+{
+	return min + ma_delta(node, type, offset);
+}
+
+/* ma_gap() - Read the arange gap at @offset of @node width-aware. */
+static __always_inline
+u64 ma_gap(struct maple_node *node, enum maple_type type,
+		unsigned char offset)
+{
+	switch (type) {
+	case maple_arange_64:
+		return node->ma64.gap[offset];
+	case maple_arange_32:
+		return node->ma32.gap[offset];
+	case maple_copy:
+		return node->cp.gap[offset];
 	default:
 		return 0;
 	}
@@ -866,8 +900,8 @@ u64 ma_pivs_last(const struct ma_pivs *p, unsigned char offset)
 	if (p->dense)
 		return p->min + offset;
 	if (p->is32)
-		return p->p32[offset];
-	return p->p64[offset];
+		return p->min + p->p32[offset];
+	return p->min + p->p64[offset];
 }
 
 /* The first index of slot @offset. */
@@ -888,47 +922,38 @@ u64 ma_pivs_gap(const struct ma_pivs *p, unsigned char offset)
 	return p->g64[offset];
 }
 
-/* ma_gap() - Read the arange gap at @offset of @node width-aware. */
-static __always_inline
-u64 ma_gap(struct maple_node *node, enum maple_type type,
-		unsigned char offset)
-{
-	switch (type) {
-	case maple_arange_64:
-		return node->ma64.gap[offset];
-	case maple_arange_32:
-		return node->ma32.gap[offset];
-	case maple_copy:
-		return node->cp.gap[offset];
-	default:
-		return 0;
-	}
-}
-
 /*
- * A 32-bit node cannot hold a value above U32_MAX; a store that needs one
- * promotes to 64-bit first, so narrowing a larger value here loses data.  The
- * debug build cries if that ever happens.
+ * A 32-bit node cannot hold a delta or a gap above U32_MAX; a store that needs
+ * one gets a 64-bit node first, so narrowing a larger value here loses data.
+ * A pivot below the node minimum is a caller with the wrong minimum.  The
+ * debug build cries if either ever happens.
  */
 #if defined(CONFIG_DEBUG_MAPLE_TREE)
 #define ma_warn_narrow(type, val) \
 	WARN_ON_ONCE(node_is_32b(type) && (val) > U32_MAX)
+#define ma_warn_pivot(type, min, val) \
+	WARN_ON_ONCE((val) < (min) || \
+		     (node_is_32b(type) && (val) - (min) > U32_MAX))
 #define ma_pivs_warn(p, val) \
-	WARN_ON_ONCE((p)->is32 && (val) > U32_MAX)
+	WARN_ON_ONCE((val) < (p)->min || \
+		     ((p)->is32 && (val) - (p)->min > U32_MAX))
 #else
 #define ma_warn_narrow(type, val) do { } while (0)
+#define ma_warn_pivot(type, min, val) do { } while (0)
 #define ma_pivs_warn(p, val) do { } while (0)
 #endif
 
-/* Set pivot @offset of the node of @p to @val. */
+/* Set pivot @offset of the node of @p to @val: its delta from the minimum. */
 static __always_inline
 void ma_pivs_set(const struct ma_pivs *p, unsigned char offset, u64 val)
 {
+	u64 delta = val - p->min;
+
 	ma_pivs_warn(p, val);
 	if (p->is32)
-		p->p32[offset] = val;
+		p->p32[offset] = delta;
 	else
-		p->p64[offset] = val;
+		p->p64[offset] = delta;
 }
 
 /* ma_set_gap() - Write the arange gap at @offset of @node width-aware. */
@@ -952,38 +977,42 @@ void ma_set_gap(struct maple_node *node, enum maple_type type,
 	}
 }
 
-/* ma_set_pivot() - Write pivot @offset of @node width-aware, narrowing to u32
- * for a 32-bit node. */
+/*
+ * ma_set_pivot() - Write pivot @offset of @node width-aware: the delta of @val
+ * from the node minimum @min, narrowed to u32 for a 32-bit node.
+ */
 static inline
 void ma_set_pivot(struct maple_node *node, enum maple_type type,
-		unsigned char offset, u64 val)
+		unsigned char offset, u64 min, u64 val)
 {
-	ma_warn_narrow(type, val);
+	u64 delta = val - min;
+
+	ma_warn_pivot(type, min, val);
 	switch (type) {
 	case maple_arange_64:
-		node->ma64.pivot[offset] = val;
+		node->ma64.pivot[offset] = delta;
 		break;
 	case maple_mleaf_64:
 	case maple_mrange_64:
-		node->mm64.pivot[offset] = val;
+		node->mm64.pivot[offset] = delta;
 		break;
 	case maple_range_64:
 	case maple_leaf_64:
-		node->mr64.pivot[offset] = val;
+		node->mr64.pivot[offset] = delta;
 		break;
 	case maple_copy:
-		node->cp.pivot[offset] = val;
+		node->cp.pivot[offset] = delta;
 		break;
 	case maple_arange_32:
-		node->ma32.pivot[offset] = (u32)val;
+		node->ma32.pivot[offset] = (u32)delta;
 		break;
 	case maple_range_32:
 	case maple_leaf_32:
-		node->mr32.pivot[offset] = (u32)val;
+		node->mr32.pivot[offset] = (u32)delta;
 		break;
 	case maple_mleaf_32:
 	case maple_mrange_32:
-		node->mm32.pivot[offset] = (u32)val;
+		node->mm32.pivot[offset] = (u32)delta;
 		break;
 	default:
 		break;
@@ -1104,7 +1133,7 @@ u64 mas_safe_pivot(const struct ma_state *mas, struct maple_node *node,
 	if (piv >= mt_pivots[type])
 		return mas->max;
 
-	return ma_pivot(node, type, piv);
+	return ma_pivot(node, type, piv, mas->min);
 }
 
 /*
@@ -1121,7 +1150,7 @@ u64 mas_safe_min(struct ma_state *mas, struct maple_node *node,
 		enum maple_type type, unsigned char offset)
 {
 	if (likely(offset))
-		return ma_pivot(node, type, offset - 1) + 1;
+		return ma_pivot(node, type, offset - 1, mas->min) + 1;
 
 	return mas->min;
 }
@@ -1139,7 +1168,7 @@ u64 mas_leaf_pivot(const struct ma_state *mas, struct maple_node *node,
 	case maple_mdense:
 		return mas->min + offset;
 	default:
-		return ma_pivot(node, type, offset);
+		return ma_pivot(node, type, offset, mas->min);
 	}
 }
 
@@ -1159,15 +1188,16 @@ u64 mas_leaf_min(const struct ma_state *mas, struct maple_node *node,
  * @mn: The encoded maple node
  * @mt: The maple tree
  * @piv: The pivot offset
+ * @min: The node minimum
  * @val: The value of the pivot
  */
 static inline void mte_set_pivot(struct maple_enode *mn, struct maple_tree *mt,
-				unsigned char piv, u64 val)
+				unsigned char piv, u64 min, u64 val)
 {
 	enum maple_type type = mt_node_type(mt, mn);
 
 	BUG_ON(piv >= mt_pivots[type]);
-	ma_set_pivot(mte_to_node(mn), type, piv, val);
+	ma_set_pivot(mte_to_node(mn), type, piv, min, val);
 }
 
 /*
@@ -1352,7 +1382,7 @@ static __always_inline unsigned char ma_meta_end(struct maple_node *mn,
  * @mn: The maple node
  * @mt: The maple node type
  */
-static inline unsigned char ma_meta_gap(struct maple_node *mn,
+static __always_inline unsigned char ma_meta_gap(struct maple_node *mn,
 		enum maple_type mt)
 {
 	return ma_meta(mn, mt)->gap;
@@ -1434,8 +1464,7 @@ static const struct ma_type_layout mt_layouts[] = {
  * The arrays of one node, resolved from its type once, for a copy, a clear or
  * a scan that then runs on them: no switch per array, none per element.  An
  * array is the node plus its offset, which the addressing folds.  @min and
- * @max are the node's range, set where its slots are placed or its pivots
- * read.
+ * @max are the node's range, set where its pivots are read or written.
  */
 struct ma_layout {
 	struct maple_node *node;
@@ -1493,8 +1522,8 @@ static __always_inline
 u64 ma_layout_pivot(const struct ma_layout *l, unsigned char offset)
 {
 	if (l->t.is32)
-		return ma_layout_p32(l)[offset];
-	return ma_layout_p64(l)[offset];
+		return l->min + ma_layout_p32(l)[offset];
+	return l->min + ma_layout_p64(l)[offset];
 }
 
 /* Set pivot @offset of a node laid out as @l to @val. */
@@ -1502,11 +1531,11 @@ static __always_inline
 void ma_layout_set_pivot(const struct ma_layout *l, unsigned char offset,
 		u64 val)
 {
-	ma_warn_narrow(l->t.type, val);
+	ma_warn_pivot(l->t.type, l->min, val);
 	if (l->t.is32)
-		ma_layout_p32(l)[offset] = val;
+		ma_layout_p32(l)[offset] = val - l->min;
 	else
-		ma_layout_p64(l)[offset] = val;
+		ma_layout_p64(l)[offset] = val - l->min;
 }
 
 /* The gap of slot @offset of an allocation node laid out as @l. */
@@ -1635,14 +1664,17 @@ static __always_inline void mas_descend(struct ma_state *mas)
 	enum maple_type type;
 	struct maple_node *node;
 	void __rcu **slots;
+	u64 min = mas->min;
 
 	node = mas_mn(mas);
 	type = mas_node_type(mas, mas->node);
 	slots = ma_slots(node, type);
 
+	/* Both pivots are deltas from this node's minimum. */
 	if (mas->offset)
-		mas->min = ma_pivot(node, type, mas->offset - 1) + 1;
+		min = ma_pivot(node, type, mas->offset - 1, mas->min) + 1;
 	mas->max = mas_safe_pivot(mas, node, type, mas->offset);
+	mas->min = min;
 	mas->node = mas_slot(mas, slots, mas->offset);
 }
 
@@ -1650,8 +1682,10 @@ static __always_inline void mas_descend(struct ma_state *mas)
  * mas_ascend() - Walk up a level of the tree.
  * @mas: The maple state
  *
- * Sets the @mas->max and @mas->min for the parent node of mas->node.  This
- * may cause several levels of walking up to find the correct min and max.
+ * Sets the @mas->max and @mas->min for the parent node of mas->node.  The
+ * parent's minimum is the child's less the pivot before the child's slot;
+ * the max may take several levels of walking up to find, each level's
+ * minimum following from the one below the same way.
  * May find a dead node which will cause a premature return.
  * Return: 1 on dead node, 0 otherwise
  */
@@ -1663,8 +1697,7 @@ static int mas_ascend(struct ma_state *mas)
 	struct maple_node *p_node; /* parent node. */
 	unsigned char a_slot;
 	enum maple_type a_type;
-	u64 min, max;
-	bool set_max = false, set_min = false;
+	u64 min, max, a_min;
 
 	a_node = mas_mn(mas);
 	if (ma_is_root(a_node)) {
@@ -1677,7 +1710,6 @@ static int mas_ascend(struct ma_state *mas)
 		return 1;
 
 	a_type = mas_parent_type(mas, mas->node);
-	max = mt_max[a_type];
 	mas->offset = mte_parent_slot(mas->node);
 	a_enode = mt_mk_node(p_node, a_type);
 
@@ -1686,6 +1718,7 @@ static int mas_ascend(struct ma_state *mas)
 		return 1;
 
 	mas->node = a_enode;
+	max = mas_tree_max(mas);
 
 	if (mte_is_root(a_enode)) {
 		mas->max = max;
@@ -1693,21 +1726,16 @@ static int mas_ascend(struct ma_state *mas)
 		return 0;
 	}
 
-	min = 0;
+	min = mas->min;
+	if (mas->offset)
+		min -= ma_delta(p_node, a_type, mas->offset - 1) + 1;
 
-	/*
-	 * !mas->offset implies that parent node min == mas->min.
-	 * mas->offset > 0 implies that we need to walk up to find the
-	 * implied pivot min.
-	 */
-	if (!mas->offset) {
-		min = mas->min;
-		set_min = true;
-	}
-
+	/* The right-most spine ends at the ceiling. */
 	if (mas->max == max)
-		set_max = true;
+		goto done;
 
+	/* Walk up to the first ancestor that stores the parent's max. */
+	a_min = min;
 	do {
 		p_enode = a_enode;
 		a_type = mas_parent_type(mas, p_enode);
@@ -1718,24 +1746,18 @@ static int mas_ascend(struct ma_state *mas)
 		if (unlikely(ma_dead_node(a_node)))
 			return 1;
 
-		if (!set_min && a_slot) {
-			set_min = true;
-			min = ma_pivot(a_node, a_type, a_slot - 1) + 1;
-		}
+		if (a_slot)
+			a_min -= ma_delta(a_node, a_type, a_slot - 1) + 1;
 
-		if (!set_max && a_slot < mt_pivots[a_type]) {
-			set_max = true;
-			max = ma_pivot(a_node, a_type, a_slot);
-		}
+		if (a_slot < mt_pivots[a_type])
+			max = ma_pivot(a_node, a_type, a_slot, a_min);
 
 		if (unlikely(ma_dead_node(a_node)))
 			return 1;
 
-		if (unlikely(ma_is_root(a_node)))
-			break;
+	} while (a_slot >= mt_pivots[a_type] && !ma_is_root(a_node));
 
-	} while (!set_min || !set_max);
-
+done:
 	mas->max = max;
 	mas->min = min;
 	return 0;
@@ -2049,14 +2071,14 @@ static inline struct maple_enode *mas_start_wr(struct ma_state *mas)
  * @node: The maple node
  * @type: The maple node type
  * @pivots: The array of pivots in the node
- * @max: The maximum value in the node
+ * @span: The maximum value in the node, as a delta from its minimum
  *
  * Uses metadata to find the end of the data when possible.
  * Return: The zero indexed last slot with data (may be null).
  */
 static __always_inline
 unsigned char ma_data_end64(struct maple_node *node,
-		enum maple_type type, u64 *pivots, u64 max)
+		enum maple_type type, u64 *pivots, u64 span)
 {
 	unsigned char offset;
 	u64 last;
@@ -2072,7 +2094,7 @@ unsigned char ma_data_end64(struct maple_node *node,
 	if (likely(!last))
 		return ma_meta_end(node, type);
 
-	if (likely(last == max))
+	if (likely(last == span))
 		return offset;
 
 	return mt_pivots[type];
@@ -2080,7 +2102,7 @@ unsigned char ma_data_end64(struct maple_node *node,
 
 static __always_inline
 unsigned char ma_data_end32(struct maple_node *node,
-		enum maple_type type, u32 *pivots, u32 max)
+		enum maple_type type, u32 *pivots, u32 span)
 {
 	unsigned char offset;
 	u32 last;
@@ -2096,20 +2118,21 @@ unsigned char ma_data_end32(struct maple_node *node,
 	if (likely(!last))
 		return ma_meta_end(node, type);
 
-	if (likely(last == max))
+	if (likely(last == span))
 		return offset;
 
 	return mt_pivots[type];
 }
-/* ma_data_end() - Width-aware data end for @node. */
+/* ma_data_end() - Width-aware data end for @node, from its range. */
 static __always_inline
 unsigned char ma_data_end(struct maple_node *node, enum maple_type type,
-		u64 max)
+		u64 min, u64 max)
 {
 	if (node_is_32b(type))
-		return ma_data_end32(node, type, ma_pivots32(node, type), max);
+		return ma_data_end32(node, type, ma_pivots32(node, type),
+				     max - min);
 
-	return ma_data_end64(node, type, ma_pivots(node, type), max);
+	return ma_data_end64(node, type, ma_pivots(node, type), max - min);
 }
 
 /*
@@ -2129,7 +2152,7 @@ static __always_inline unsigned char mas_data_end(struct ma_state *mas)
 	if (unlikely(ma_is_dense(type)))
 		return mas->max - mas->min;
 
-	return ma_data_end(node, type, mas->max);
+	return ma_data_end(node, type, mas->min, mas->max);
 }
 
 static inline
@@ -2155,7 +2178,7 @@ void wr_mas_ascend(struct ma_wr_state *wr_mas)
 
 	mas_ascend(mas);
 	wr_mas_setup(wr_mas, mas);
-	mas->end = ma_data_end(wr_mas->node, wr_mas->type, mas->max);
+	mas->end = ma_data_end(wr_mas->node, wr_mas->type, mas->min, mas->max);
 	/* Careful, this may be wrong.. */
 	wr_mas->end_piv = wr_mas->r_max;
 	wr_mas->offset_end = mas->offset;
@@ -2165,48 +2188,51 @@ void wr_mas_ascend(struct ma_wr_state *wr_mas)
 static inline u64 wr_piv(const struct ma_wr_state *wr_mas, unsigned char offset)
 {
 	if (node_is_32b(wr_mas->type))
-		return wr_mas->pivots32[offset];
-	return wr_mas->pivots[offset];
+		return wr_mas->mas->min + wr_mas->pivots32[offset];
+	return wr_mas->mas->min + wr_mas->pivots[offset];
 }
 
 /* Write a pivot into the write state's cached node, width-aware. */
 static inline
 void wr_set_piv(struct ma_wr_state *wr_mas, unsigned char offset, u64 val)
 {
+	u64 delta = val - wr_mas->mas->min;
+
+	ma_warn_pivot(wr_mas->type, wr_mas->mas->min, val);
 	if (node_is_32b(wr_mas->type))
-		wr_mas->pivots32[offset] = (u32)val;
+		wr_mas->pivots32[offset] = (u32)delta;
 	else
-		wr_mas->pivots[offset] = val;
+		wr_mas->pivots[offset] = delta;
 }
 
 /*
  * ma_leaf_max_gap64() / ma_leaf_max_gap32() - Largest gap in a non-dense leaf.
  *
- * The first implied pivot optimizes the loop; slot 1 may be skipped on a gap in
- * slot 0.  The end implied pivot runs to the node max, or to the node's own
- * ceiling when the right-most node is walked with the tree ceiling.
+ * The pivots are deltas from the node minimum, so a gap is the difference of
+ * two of them, or of the first and 0, or of the span and the last.  The first
+ * implied pivot optimizes the loop; slot 1 may be skipped on a gap in slot 0.
  */
 static inline u64 ma_leaf_max_gap64(struct maple_node *mn, enum maple_type mt,
 		u64 min, u64 max, u64 *pivots, void __rcu **slots)
 {
-	u64 ceiling = mt_max[mt];
+	u64 span = max - min;
 	u64 pstart, gap, max_gap = 0;
 	unsigned char i, max_piv;
 
 	if (likely(!slots[0])) {
-		max_gap = pivots[0] - min + 1;
+		max_gap = pivots[0] + 1;
 		i = 2;
 	} else {
 		i = 1;
 	}
 
-	max_piv = ma_data_end64(mn, mt, pivots, max) - 1;
+	max_piv = ma_data_end64(mn, mt, pivots, span) - 1;
 	if (!slots[max_piv + 1]) {
-		gap = (max < ceiling ? max : ceiling) - pivots[max_piv];
+		gap = span - pivots[max_piv];
 		if (gap > max_gap)
 			max_gap = gap;
 
-		if (max_gap > pivots[max_piv] - min)
+		if (max_gap > pivots[max_piv])
 			return max_gap;
 	}
 
@@ -2226,24 +2252,25 @@ static inline u64 ma_leaf_max_gap64(struct maple_node *mn, enum maple_type mt,
 static inline u64 ma_leaf_max_gap32(struct maple_node *mn, enum maple_type mt,
 		u64 min, u64 max, u32 *pivots, void __rcu **slots)
 {
-	u64 ceiling = mt_max[mt];
+	u64 span = max - min;
 	u64 pstart, gap, max_gap = 0;
 	unsigned char i, max_piv;
 
+	ma_warn_narrow(mt, span);
 	if (likely(!slots[0])) {
-		max_gap = pivots[0] - min + 1;
+		max_gap = pivots[0] + 1;
 		i = 2;
 	} else {
 		i = 1;
 	}
 
-	max_piv = ma_data_end32(mn, mt, pivots, max) - 1;
+	max_piv = ma_data_end32(mn, mt, pivots, span) - 1;
 	if (!slots[max_piv + 1]) {
-		gap = (max < ceiling ? max : ceiling) - pivots[max_piv];
+		gap = span - pivots[max_piv];
 		if (gap > max_gap)
 			max_gap = gap;
 
-		if (max_gap > pivots[max_piv] - min)
+		if (max_gap > pivots[max_piv])
 			return max_gap;
 	}
 
@@ -2436,7 +2463,7 @@ static bool ma_has_null(struct maple_tree *mt, struct maple_node *node,
 	if (ma_is_dense(type))
 		end = max - min;
 	else
-		end = ma_data_end(node, type, max);
+		end = ma_data_end(node, type, min, max);
 
 	if (ma_is_leaf(type)) {
 		for (i = 0; i <= end; i++) {
@@ -2797,7 +2824,7 @@ static inline void mas_adopt_children(struct ma_state *mas,
 	void __rcu **slots = ma_slots(node, type);
 	unsigned char end;
 
-	end = ma_data_end(node, type, mas->max);
+	end = ma_data_end(node, type, mas->min, mas->max);
 	mas_set_parent_slots(mas, parent, slots, 0, end + 1);
 }
 
@@ -2876,7 +2903,7 @@ static inline bool mas_find_child(struct ma_state *mas, struct ma_state *child)
 	mt = mas_node_type(mas, mas->node);
 	node = mas_mn(mas);
 	slots = ma_slots(node, mt);
-	end = ma_data_end(node, mt, mas->max);
+	end = ma_data_end(node, mt, mas->min, mas->max);
 	for (offset = mas->offset; offset <= end; offset++) {
 		entry = mas_slot_locked(mas, slots, offset);
 		if (mte_parent(entry) == node) {
@@ -3065,26 +3092,38 @@ void ma_wr_node_walk(struct ma_wr_state *wr_mas, enum maple_type type)
 {
 	struct ma_state *mas = wr_mas->mas;
 	unsigned char count, offset;
+	u64 rel;
 
 	wr_mas->node = mas_mn(mas);
-	count = mas->end = ma_data_end(wr_mas->node, type, mas->max);
+	count = mas->end = ma_data_end(wr_mas->node, type, mas->min, mas->max);
 	offset = mas->offset;
+
+	/*
+	 * The pivots are deltas from the node minimum, so compare the index as
+	 * one.  A promoting store lies above a 32-bit node's range, so the
+	 * compare stays u64 here.
+	 */
+	rel = mas->index - mas->min;
 	if (node_is_32b(type)) {
 		u32 *pivots = ma_pivots32(wr_mas->node, type);
 
 		wr_mas->pivots32 = pivots;
-		while (offset < count && mas->index > pivots[offset])
+		while (offset < count && rel > pivots[offset])
 			offset++;
-		wr_mas->r_max = offset < count ? pivots[offset] : mas->max;
-		wr_mas->r_min = offset ? pivots[offset - 1] + 1 : mas->min;
+		wr_mas->r_max = offset < count ?
+				mas->min + pivots[offset] : mas->max;
+		wr_mas->r_min = offset ?
+				mas->min + pivots[offset - 1] + 1 : mas->min;
 	} else {
 		u64 *pivots = ma_pivots(wr_mas->node, type);
 
 		wr_mas->pivots = pivots;
-		while (offset < count && mas->index > pivots[offset])
+		while (offset < count && rel > pivots[offset])
 			offset++;
-		wr_mas->r_max = offset < count ? pivots[offset] : mas->max;
-		wr_mas->r_min = offset ? pivots[offset - 1] + 1 : mas->min;
+		wr_mas->r_max = offset < count ?
+				mas->min + pivots[offset] : mas->max;
+		wr_mas->r_min = offset ?
+				mas->min + pivots[offset - 1] + 1 : mas->min;
 	}
 	wr_mas->offset_end = mas->offset = offset;
 }
@@ -3292,11 +3331,12 @@ static inline void mas_topiary_replace(struct ma_state *mas,
  * @s: The source node's arrays and range
  * @start: The offset into the source to start copying
  * @size: The size to copy (non-zero)
- * @d: The destination's arrays
+ * @d: The destination's arrays and range
  * @d_start: The start location in the destination node
  *
  * The slots copy as they are, the pivots and the gaps too between nodes of one
- * width; otherwise each is moved to the destination's.
+ * width and, for the pivots, one minimum; otherwise each is moved to the
+ * destination's.
  */
 static inline
 u64 node_copy(struct ma_state *mas, const struct ma_layout *s,
@@ -3343,16 +3383,27 @@ u64 node_copy(struct ma_state *mas, const struct ma_layout *s,
 	if (!size)
 		return d_max;
 
-	if (s->t.is32 != d->t.is32) {
+	if (s->t.is32 == d->t.is32 && s->min == d->min) {
+		if (d->t.is32)
+			memcpy(ma_layout_p32(d) + d_start,
+			       ma_layout_p32(s) + start, size * sizeof(u32));
+		else
+			memcpy(ma_layout_p64(d) + d_start,
+			       ma_layout_p64(s) + start, size * sizeof(u64));
+	} else if (!s->t.is32 && !d->t.is32) {
+		/* The right half of a split: the deltas move by the minimums. */
+		u64 *sp = ma_layout_p64(s) + start;
+		u64 *dp = ma_layout_p64(d) + d_start;
+		u64 shift = s->min - d->min;
+
+		for (i = 0; i < size; i++) {
+			ma_warn_pivot(d->t.type, d->min, s->min + sp[i]);
+			dp[i] = sp[i] + shift;
+		}
+	} else {
 		for (i = 0; i < size; i++)
 			ma_layout_set_pivot(d, d_start + i,
 					    ma_layout_pivot(s, start + i));
-	} else if (d->t.is32) {
-		memcpy(ma_layout_p32(d) + d_start, ma_layout_p32(s) + start,
-		       size * sizeof(u32));
-	} else {
-		memcpy(ma_layout_p64(d) + d_start, ma_layout_p64(s) + start,
-		       size * sizeof(u64));
 	}
 
 	return d_max;
@@ -3493,36 +3544,42 @@ struct ma_walk ma_walk_node(struct maple_tree *mt, struct maple_node *node,
 		enum maple_type type, u64 index, u64 min, u64 max)
 {
 	struct ma_walk w = { .min = min, .max = max, .offset = 0 };
+	u64 rel = index - min;
 
+	/*
+	 * The pivots are deltas from @min, so @index is compared as one; the
+	 * walk only enters a node holding @index, so it fits a 32-bit node's u32.
+	 */
 	if (node_is_32b(type)) {
 		u32 *pivots = ma_pivots32(node, type);
+		u32 r = (u32)rel;
 
-		w.end = ma_data_end32(node, type, pivots, max);
-		if (pivots[0] >= index) {
-			w.max = pivots[0];
+		w.end = ma_data_end32(node, type, pivots, max - min);
+		if (pivots[0] >= r) {
+			w.max = min + pivots[0];
 		} else {
 			for (w.offset = 1; w.offset < w.end; w.offset++) {
-				if (pivots[w.offset] >= index) {
-					w.max = pivots[w.offset];
+				if (pivots[w.offset] >= r) {
+					w.max = min + pivots[w.offset];
 					break;
 				}
 			}
-			w.min = pivots[w.offset - 1] + 1;
+			w.min = min + pivots[w.offset - 1] + 1;
 		}
 	} else {
 		u64 *pivots = ma_pivots(node, type);
 
-		w.end = ma_data_end64(node, type, pivots, max);
-		if (pivots[0] >= index) {
-			w.max = pivots[0];
+		w.end = ma_data_end64(node, type, pivots, max - min);
+		if (pivots[0] >= rel) {
+			w.max = min + pivots[0];
 		} else {
 			for (w.offset = 1; w.offset < w.end; w.offset++) {
-				if (pivots[w.offset] >= index) {
-					w.max = pivots[w.offset];
+				if (pivots[w.offset] >= rel) {
+					w.max = min + pivots[w.offset];
 					break;
 				}
 			}
-			w.min = pivots[w.offset - 1] + 1;
+			w.min = min + pivots[w.offset - 1] + 1;
 		}
 	}
 
@@ -3954,6 +4011,34 @@ static inline void spanning_data(struct maple_copy *cp,
 	}
 }
 
+/*
+ * cp_src_min() - The minimum of source @s, whose pivots are deltas from it.
+ * @cp: The maple copy node
+ * @s: The source
+ * @index: The first index of the source's entry at its start
+ *
+ * The sources have no room for a minimum, so it is derived: the copy node
+ * holds absolute pivots, a dense leaf is a slot an index, and a range node's
+ * start entry begins one past the pivot before it.
+ */
+static inline u64 cp_src_min(struct maple_copy *cp, unsigned char s, u64 index)
+{
+	struct maple_node *node = cp->src[s].node;
+	enum maple_type type = cp->src[s].mt;
+	unsigned char start = cp->src[s].start;
+
+	if (type == maple_copy)
+		return 0;
+
+	if (ma_is_dense(type))
+		return index - start;
+
+	if (!start)
+		return index;
+
+	return index - ma_delta(node, type, start - 1) - 1;
+}
+
 /* A position in the entries of the sources, taken in order. */
 struct cp_iter {
 	u64 next;		/* The first index of the next entry */
@@ -3969,6 +4054,7 @@ static void cp_iter_start(struct cp_iter *it, struct maple_copy *cp, u64 min)
 	it->s = 0;
 	it->offset = cp->src[0].start;
 	ma_layout_of(&it->l, cp->src[0].node, cp->src[0].mt);
+	it->l.min = cp_src_min(cp, 0, min);
 	it->l.max = cp->src[0].max;
 }
 
@@ -4008,6 +4094,7 @@ static u64 cp_iter_next(struct maple_copy *cp, struct maple_tree *mt,
 	if (it->offset++ == end && ++it->s < cp->s_count) {
 		it->offset = cp->src[it->s].start;
 		ma_layout_of(&it->l, cp->src[it->s].node, cp->src[it->s].mt);
+		it->l.min = cp_src_min(cp, it->s, it->next);
 		it->l.max = cp->src[it->s].max;
 	}
 
@@ -4048,7 +4135,7 @@ static bool cp_dense_ends(struct maple_copy *cp, u64 min, unsigned char cap,
 	typeof(cp->src[0]) *first = &cp->src[0];
 	typeof(cp->src[0]) *last = &cp->src[cp->s_count - 1];
 	unsigned char off;
-	u64 piv;
+	u64 piv, last_index;
 
 	if (ma_is_dense(first->mt))
 		return true;
@@ -4056,7 +4143,8 @@ static bool cp_dense_ends(struct maple_copy *cp, u64 min, unsigned char cap,
 	if (first->end - first->start >= cap) {
 		off = first->start + cap;
 		piv = off < mt_pivots[first->mt] ?
-		      ma_pivot(first->node, first->mt, off) : first->max;
+		      ma_pivot(first->node, first->mt, off,
+			       cp_src_min(cp, 0, min)) : first->max;
 	} else {
 		piv = first->max;
 	}
@@ -4067,12 +4155,13 @@ static bool cp_dense_ends(struct maple_copy *cp, u64 min, unsigned char cap,
 	if (ma_is_dense(last->mt))
 		return true;
 
+	/* The first index of the last source's start entry. */
+	last_index = cp->s_count > 1 ? cp->src[cp->s_count - 2].max + 1 : min;
 	if (last->end - last->start > cap)
-		piv = ma_pivot(last->node, last->mt, last->end - cap - 1) + 1;
-	else if (cp->s_count > 1)
-		piv = cp->src[cp->s_count - 2].max + 1;
+		piv = ma_pivot(last->node, last->mt, last->end - cap - 1,
+			       cp_src_min(cp, cp->s_count - 1, last_index)) + 1;
 	else
-		piv = min;
+		piv = last_index;
 
 	return last->max - piv < slots;
 }
@@ -4272,6 +4361,7 @@ static inline unsigned char cp_data_32b(struct maple_copy *cp,
 {
 	struct ma_layout l;
 	unsigned char n = 0;
+	u64 index = min;
 	unsigned char s, off;
 
 	if (min > U32_MAX)
@@ -4288,9 +4378,11 @@ static inline unsigned char cp_data_32b(struct maple_copy *cp,
 			break;
 
 		n += cp->src[s].end - cp->src[s].start + 1;
+		index = cp->src[s].max + 1;
 	}
 
 	ma_layout_of(&l, cp->src[s].node, cp->src[s].mt);
+	l.min = cp_src_min(cp, s, index);
 	for (off = cp->src[s].start; off < cp->src[s].end; off++) {
 		if (ma_layout_pivot(&l, off) > U32_MAX)
 			break;
@@ -4432,7 +4524,7 @@ static inline void append_mas_cp(struct maple_copy *cp,
 	if (mas->end <= end)
 		cp->src[count].max = mas->max;
 	else
-		cp->src[count].max = ma_pivot(node, mt, end);
+		cp->src[count].max = ma_pivot(node, mt, end, mas->min);
 
 	cp->src[count].start = start;
 	cp->src[count].end = end;
@@ -4562,7 +4654,7 @@ struct dense_copied {
  * @room: The entries the destination has room for (non-zero)
  * @s_end: The last slot of the source
  * @index: The index of @start
- * @d: The destination's arrays
+ * @d: The destination's arrays and range
  * @d_start: The start location in the destination node
  *
  * Copies to the end of the source or until the destination is full.
@@ -4683,6 +4775,7 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas, u64 min)
 	src_end = cp->src[s].end;
 	s_mt = cp->src[s].mt;
 	ma_layout_of(&sl, cp->src[s].node, s_mt);
+	sl.min = cp_src_min(cp, s, min);
 	sl.max = cp->src[s].max;
 	d_mt = cp->dst[d].mt;
 	do {
@@ -4741,11 +4834,12 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas, u64 min)
 							dst_offset, d_max);
 					return;
 				}
-				/* Reset local src */
+				/* Reset local src; min is its start entry's index */
 				s_offset = cp->src[s].start;
 				src_end = cp->src[s].end;
 				s_mt = cp->src[s].mt;
 				ma_layout_of(&sl, cp->src[s].node, s_mt);
+				sl.min = cp_src_min(cp, s, min);
 				sl.max = cp->src[s].max;
 			}
 
@@ -4848,8 +4942,10 @@ static inline bool cp_is_new_root(struct maple_copy *cp, struct ma_state *mas)
 		dst_setup(cp, mas, mt, cp->min);
 		mt = cp->dst[0].mt;
 		ma_layout_of(&sl, cp->src[0].node, maple_copy);
+		sl.min = 0;
 		sl.max = cp->max;
 		ma_layout_of(&dl, cp->dst[0].node, mt);
+		dl.min = 0;
 		node_copy(mas, &sl, 0, cp->data, &dl, 0);
 		ma_finalise(&dl, cp->end + 1);
 		enode = mt_mk_node(cp->dst[0].node, mt);
@@ -5008,6 +5104,7 @@ static inline void mas_root_expand(struct ma_state *mas, void *entry)
 	mas->root_64b = !node_is_32b(type);
 	node = mas_pop_node(mas);
 	ma_layout_of(&l, node, type);
+	l.min = 0;
 	slots = ma_layout_slots(&l);
 	node->parent = ma_parent_ptr(mas_tree_parent(mas));
 	mas->node = mt_mk_node(node, type);
@@ -5399,10 +5496,12 @@ struct ma_lookup {
  * ma_lookup_node() - The slot of @node holding @index: its content and the
  * minimum of its range, given the node's @min.
  *
- * Resolve the node's pivot width once so the scan loop is branch-free.  A
- * rebalance can leave a 64-bit node under a 32-bit parent, so the width is read
- * from @node, never assumed from the descent.  The slot is the last one when
- * every pivot is below @index.
+ * The pivots are deltas from @min, so @index is compared as one; the lookup
+ * only enters a node holding @index, so within a 32-bit node it fits u32 and
+ * the scan compares one word.  Resolve the node's pivot width once so the scan
+ * loop is branch-free.  A rebalance can leave a 64-bit node under a 32-bit
+ * parent, so the width is read from @node, never assumed from the descent.
+ * The slot is the last one when every pivot is below @index.
  *
  * The layout of a node follows from its type, so the callers pass @type as a
  * constant and the pivot count and the slot offset are immediates.
@@ -5414,24 +5513,26 @@ struct ma_lookup ma_lookup_node(struct maple_tree *mt, struct maple_node *node,
 	struct ma_lookup l = { .min = min };
 	unsigned char end = mt_pivots[type];
 	unsigned char offset = 0;
+	u64 rel = index - min;
 
 	if (node_is_32b(type)) {
 		u32 *pivots = ma_pivots32(node, type);
+		u32 r = (u32)rel;
 
-		if (pivots[0] < index) {
+		if (pivots[0] < r) {
 			offset = 1;
-			while (offset < end && pivots[offset] < index)
+			while (offset < end && pivots[offset] < r)
 				offset++;
-			l.min = (u64)pivots[offset - 1] + 1;
+			l.min = min + pivots[offset - 1] + 1;
 		}
 	} else {
 		u64 *pivots = ma_pivots(node, type);
 
-		if (pivots[0] < index) {
+		if (pivots[0] < rel) {
 			offset = 1;
-			while (offset < end && pivots[offset] < index)
+			while (offset < end && pivots[offset] < rel)
 				offset++;
-			l.min = pivots[offset - 1] + 1;
+			l.min = min + pivots[offset - 1] + 1;
 		}
 	}
 
@@ -5547,6 +5648,7 @@ static inline void mas_new_root(struct ma_state *mas, void *entry)
 	mas->root_64b = !node_is_32b(type);
 	node = mas_pop_node(mas);
 	ma_layout_of(&l, node, type);
+	l.min = 0;
 	slots = ma_layout_slots(&l);
 	node->parent = ma_parent_ptr(mas_tree_parent(mas));
 	mas->node = mt_mk_node(node, type);
@@ -5773,13 +5875,13 @@ static inline u8 mas_wr_node_shift(struct ma_wr_state *wr_mas,
 	}
 
 	if (entry_offset != old_offset)
-		ma_set_pivot(node, type, old_offset, mas->index - 1);
+		ma_set_pivot(node, type, old_offset, mas->min, mas->index - 1);
 
 	if (entry_offset < node_pivots)
-		ma_set_pivot(node, type, entry_offset, mas->last);
+		ma_set_pivot(node, type, entry_offset, mas->min, mas->last);
 	rcu_assign_pointer(slots[entry_offset], wr_mas->entry);
 	if (suffix_len && new_end < node_pivots)
-		ma_set_pivot(node, type, new_end, mas->max);
+		ma_set_pivot(node, type, new_end, mas->min, mas->max);
 	if (marks)
 		marks[entry_offset] = wr_mas->entry ? entry_marks : 0;
 
@@ -6052,6 +6154,7 @@ static inline void mas_wr_end_piv(struct ma_wr_state *wr_mas)
 	struct ma_state *mas = wr_mas->mas;
 	unsigned char offset = wr_mas->offset_end;
 	unsigned char end = mas->end;
+	u64 rel;
 
 	if (unlikely(ma_is_dense(wr_mas->type))) {
 		mas_wr_dense_end_piv(wr_mas);
@@ -6062,19 +6165,22 @@ static inline void mas_wr_end_piv(struct ma_wr_state *wr_mas)
 		return;
 	}
 
-	/* The pivot width is read once, not in every turn of the scan. */
+	/* The pivots are deltas from the node minimum; the width is read once. */
+	rel = mas->last - mas->min;
 	if (node_is_32b(wr_mas->type)) {
 		u32 *pivots = wr_mas->pivots32;
 
-		while (offset < end && mas->last > pivots[offset])
+		while (offset < end && rel > pivots[offset])
 			offset++;
-		wr_mas->end_piv = offset < end ? pivots[offset] : mas->max;
+		wr_mas->end_piv = offset < end ? mas->min + pivots[offset] :
+						 mas->max;
 	} else {
 		u64 *pivots = wr_mas->pivots;
 
-		while (offset < end && mas->last > pivots[offset])
+		while (offset < end && rel > pivots[offset])
 			offset++;
-		wr_mas->end_piv = offset < end ? pivots[offset] : mas->max;
+		wr_mas->end_piv = offset < end ? mas->min + pivots[offset] :
+						 mas->max;
 	}
 	wr_mas->offset_end = offset;
 }
@@ -7266,26 +7372,26 @@ static __always_inline bool mas_rewalk_if_dead(struct ma_state *mas,
  * tree.  The prev value will be mas->node[mas->offset] or the status will be
  * ma_none.
  * @mas: The maple state
- * @min: The lower limit to search
+ * @limit: The lower limit to search
  *
  * The prev node value will be mas->node[mas->offset] or the status will be
  * ma_none.
  * Return: 1 if the node is dead, 0 otherwise.
  */
-static int mas_prev_node(struct ma_state *mas, u64 min)
+static int mas_prev_node(struct ma_state *mas, u64 limit)
 {
 	enum maple_type mt;
 	int offset, level;
 	void __rcu **slots;
 	struct maple_node *node;
-	u64 max;
+	u64 min, max;
 
 	node = mas_mn(mas);
 	if (!mas->min)
 		goto no_entry;
 
 	max = mas->min - 1;
-	if (max < min)
+	if (max < limit)
 		goto no_entry;
 
 	level = 0;
@@ -7303,16 +7409,20 @@ static int mas_prev_node(struct ma_state *mas, u64 min)
 
 	offset--;
 	mt = mas_node_type(mas, mas->node);
+	min = mas->min;
 	while (level > 1) {
 		level--;
 		slots = ma_slots(node, mt);
+		/* The child's minimum, from this node's pivot before it. */
+		if (offset)
+			min += ma_delta(node, mt, offset - 1) + 1;
 		mas->node = mas_slot(mas, slots, offset);
 		if (unlikely(ma_dead_node(node)))
 			return 1;
 
 		mt = mas_node_type(mas, mas->node);
 		node = mas_mn(mas);
-		offset = ma_data_end(node, mt, max);
+		offset = ma_data_end(node, mt, min, max);
 		if (unlikely(ma_dead_node(node)))
 			return 1;
 	}
@@ -7323,7 +7433,8 @@ static int mas_prev_node(struct ma_state *mas, u64 min)
 		return 1;
 
 	if (likely(offset))
-		mas->min = ma_pivot(node, mt, offset - 1) + 1;
+		min += ma_delta(node, mt, offset - 1) + 1;
+	mas->min = min;
 	mas->max = max;
 	mas->offset = mas_data_end(mas);
 	if (unlikely(mte_dead_node(mas->node)))
@@ -7455,7 +7566,7 @@ underflow:
 static int mas_next_node(struct ma_state *mas, struct maple_node *node,
 		u64 max)
 {
-	u64 min;
+	u64 min, node_min;
 	struct maple_enode *enode;
 	struct maple_node *tmp;
 	int level = 0;
@@ -7479,7 +7590,7 @@ static int mas_next_node(struct ma_state *mas, struct maple_node *node,
 		level++;
 		node = mas_mn(mas);
 		mt = mas_node_type(mas, mas->node);
-		node_end = ma_data_end(node, mt, mas->max);
+		node_end = ma_data_end(node, mt, mas->min, mas->max);
 		if (unlikely(ma_dead_node(node)))
 			return 1;
 
@@ -7491,13 +7602,16 @@ static int mas_next_node(struct ma_state *mas, struct maple_node *node,
 	if (unlikely(ma_dead_node(node)))
 		return 1;
 
+	node_min = mas->min;
 	if (level > 1)
 		mas->offset = 0;
 
+	/* Every node from here down starts at @min. */
 	while (unlikely(level > 1)) {
 		level--;
 		mas->node = enode;
 		node = mas_mn(mas);
+		node_min = min;
 		mt = mas_node_type(mas, mas->node);
 		slots = ma_slots(node, mt);
 		enode = mas_slot(mas, slots, 0);
@@ -7505,10 +7619,11 @@ static int mas_next_node(struct ma_state *mas, struct maple_node *node,
 			return 1;
 	}
 
-	mas->max = mas_safe_pivot(mas, node, mt, mas->offset);
+	if (mas->offset < mt_pivots[mt])
+		mas->max = ma_pivot(node, mt, mas->offset, node_min);
 	tmp = mte_to_node(enode);
 	mt = mas_node_type(mas, enode);
-	mas->end = ma_data_end(tmp, mt, mas->max);
+	mas->end = ma_data_end(tmp, mt, min, mas->max);
 	if (unlikely(ma_is_dense(mt)))
 		mas->end = mas->max - min;
 
@@ -7715,7 +7830,7 @@ int ma_rev_gap_node(struct ma_state *mas, struct maple_node *node,
 	unsigned char end;
 	void *entry;
 
-	end = ma_data_end(node, type, mas->max);
+	end = ma_data_end(node, type, mas->min, mas->max);
 	if (offset > end)
 		offset = end;
 
@@ -7933,7 +8048,7 @@ int ma_gap_node(struct ma_state *mas, struct maple_node *node,
 	pivs = ma_pivs_of(node, type, mas->min);
 	if (gap_array)
 		ma_pivs_gaps(&pivs, node, type);
-	end = ma_data_end(node, type, mas->max);
+	end = ma_data_end(node, type, mas->min, mas->max);
 	pivot = 0;
 	min = ma_pivs_first(&pivs, offset);
 	for (; offset <= end; offset++, min = pivot + 1) {
@@ -8252,7 +8367,7 @@ retry:
 	type = mas_node_type(mas, mas->node);
 	marks = ma_marks(node, type);
 	slots = ma_slots(node, type);
-	end = ma_data_end(node, type, mas->max);
+	end = ma_data_end(node, type, mas->min, mas->max);
 	if (unlikely(ma_is_dense(type)))
 		end = mas->max - mas->min;
 	if (unlikely(mas_rewalk_if_dead(mas, node, mas->index)))
@@ -8350,7 +8465,7 @@ retry:
 	type = mas_node_type(mas, mas->node);
 	marks = ma_marks(node, type);
 	slots = ma_slots(node, type);
-	end = ma_data_end(node, type, mas->max);
+	end = ma_data_end(node, type, mas->min, mas->max);
 	if (unlikely(ma_is_dense(type)))
 		end = mas->max - mas->min;
 	if (unlikely(mas_rewalk_if_dead(mas, node, mas->last)))
@@ -11014,6 +11129,7 @@ static void mas_dfs_postorder(struct ma_state *mas, u64 max)
 
 	struct maple_enode *p, *mn = mas->node;
 	u64 p_min, p_max;
+	u64 mn_min = mas->min, mn_max = mas->max;
 
 	mas_next_node(mas, mas_mn(mas), max);
 	if (!mas_is_overflow(mas))
@@ -11022,7 +11138,10 @@ static void mas_dfs_postorder(struct ma_state *mas, u64 max)
 	if (mte_is_root(mn))
 		return;
 
+	/* The overflow climbed; mas_ascend() needs the node's own range. */
 	mas->node = mn;
+	mas->min = mn_min;
+	mas->max = mn_max;
 	mas_ascend(mas);
 	do {
 		p = mas->node;
@@ -11120,11 +11239,11 @@ static void mt_dump_range64(const struct maple_tree *mt, void *entry,
 	for (i = 0; i < MAPLE_RANGE64_SLOTS; i++) {
 		unsigned long last = max;
 
-		if (i < (MAPLE_RANGE64_SLOTS - 1))
-			last = node->pivot[i];
-		else if (!node->slot[i] && max != mt_node_max(mt, entry))
-			break;
-		if (last == 0 && i > 0)
+		if (i < (MAPLE_RANGE64_SLOTS - 1)) {
+			if (!node->pivot[i] && i > 0)
+				break;
+			last = min + node->pivot[i];
+		} else if (!node->slot[i] && max != mt_node_max(mt, entry))
 			break;
 		if (leaf)
 			mt_dump_entry(mt_slot(mt, node->slot, i),
@@ -11168,11 +11287,11 @@ static void mt_dump_mrange64(const struct maple_tree *mt, void *entry,
 	for (i = 0; i < MAPLE_MRANGE64_SLOTS; i++) {
 		unsigned long last = max;
 
-		if (i < (MAPLE_MRANGE64_SLOTS - 1))
-			last = node->pivot[i];
-		else if (!node->slot[i] && max != mt_node_max(mt, entry))
-			break;
-		if (last == 0 && i > 0)
+		if (i < (MAPLE_MRANGE64_SLOTS - 1)) {
+			if (!node->pivot[i] && i > 0)
+				break;
+			last = min + node->pivot[i];
+		} else if (!node->slot[i] && max != mt_node_max(mt, entry))
 			break;
 
 		for (m = 0; m <= MT_MARK_MAX; m++) {
@@ -11212,11 +11331,11 @@ static void mt_dump_mrange64(const struct maple_tree *mt, void *entry,
 		unsigned long last = max;
 		void *child;
 
-		if (i < (MAPLE_MRANGE64_SLOTS - 1))
-			last = node->pivot[i];
-		else if (!node->slot[i] && max != mt_node_max(mt, entry))
-			break;
-		if (last == 0 && i > 0)
+		if (i < (MAPLE_MRANGE64_SLOTS - 1)) {
+			if (!node->pivot[i] && i > 0)
+				break;
+			last = min + node->pivot[i];
+		} else if (!node->slot[i] && max != mt_node_max(mt, entry))
 			break;
 
 		child = mt_slot(mt, node->slot, i);
@@ -11289,11 +11408,11 @@ static void mt_dump_arange64(const struct maple_tree *mt, void *entry,
 	for (i = 0; i < MAPLE_ARANGE64_SLOTS; i++) {
 		unsigned long last = max;
 
-		if (i < (MAPLE_ARANGE64_SLOTS - 1))
-			last = node->pivot[i];
-		else if (!node->slot[i])
-			break;
-		if (last == 0 && i > 0)
+		if (i < (MAPLE_ARANGE64_SLOTS - 1)) {
+			if (!node->pivot[i] && i > 0)
+				break;
+			last = min + node->pivot[i];
+		} else if (!node->slot[i])
 			break;
 		if (node->slot[i])
 			mt_dump_node(mt, mt_slot(mt, node->slot, i),
@@ -11339,11 +11458,11 @@ static void mt_dump_range32(const struct maple_tree *mt, void *entry,
 	for (i = 0; i < MAPLE_RANGE32_SLOTS; i++) {
 		unsigned long last = max;
 
-		if (i < (MAPLE_RANGE32_SLOTS - 1))
-			last = node->pivot[i];
-		else if (!node->slot[i] && max != mt_node_max(mt, entry))
-			break;
-		if (last == 0 && i > 0)
+		if (i < (MAPLE_RANGE32_SLOTS - 1)) {
+			if (!node->pivot[i] && i > 0)
+				break;
+			last = min + node->pivot[i];
+		} else if (!node->slot[i] && max != mt_node_max(mt, entry))
 			break;
 		if (leaf)
 			mt_dump_entry(mt_slot(mt, node->slot, i),
@@ -11385,11 +11504,11 @@ static void mt_dump_mrange32(const struct maple_tree *mt, void *entry,
 	for (i = 0; i < MAPLE_MRANGE32_SLOTS; i++) {
 		unsigned long last = max;
 
-		if (i < (MAPLE_MRANGE32_SLOTS - 1))
-			last = node->pivot[i];
-		else if (!node->slot[i] && max != mt_node_max(mt, entry))
-			break;
-		if (last == 0 && i > 0)
+		if (i < (MAPLE_MRANGE32_SLOTS - 1)) {
+			if (!node->pivot[i] && i > 0)
+				break;
+			last = min + node->pivot[i];
+		} else if (!node->slot[i] && max != mt_node_max(mt, entry))
 			break;
 
 		for (m = 0; m <= MT_MARK_MAX; m++) {
@@ -11427,11 +11546,11 @@ static void mt_dump_mrange32(const struct maple_tree *mt, void *entry,
 		unsigned long last = max;
 		char marks[12];
 
-		if (i < (MAPLE_MRANGE32_SLOTS - 1))
-			last = node->pivot[i];
-		else if (!node->slot[i] && max != mt_node_max(mt, entry))
-			break;
-		if (last == 0 && i > 0)
+		if (i < (MAPLE_MRANGE32_SLOTS - 1)) {
+			if (!node->pivot[i] && i > 0)
+				break;
+			last = min + node->pivot[i];
+		} else if (!node->slot[i] && max != mt_node_max(mt, entry))
 			break;
 
 		marks[0] = '[';
@@ -11503,11 +11622,11 @@ static void mt_dump_arange32(const struct maple_tree *mt, void *entry,
 	for (i = 0; i < MAPLE_ARANGE32_SLOTS; i++) {
 		unsigned long last = max;
 
-		if (i < (MAPLE_ARANGE32_SLOTS - 1))
-			last = node->pivot[i];
-		else if (!node->slot[i])
-			break;
-		if (last == 0 && i > 0)
+		if (i < (MAPLE_ARANGE32_SLOTS - 1)) {
+			if (!node->pivot[i] && i > 0)
+				break;
+			last = min + node->pivot[i];
+		} else if (!node->slot[i])
 			break;
 		if (node->slot[i])
 			mt_dump_node(mt, mt_slot(mt, node->slot, i),
@@ -11816,7 +11935,8 @@ static void mas_validate_child_slot(struct ma_state *mas)
 		}
 
 		if (i < mt_pivots[type] &&
-		    ma_pivot(mte_to_node(mas->node), type, i) == mas->max)
+		    ma_pivot(mte_to_node(mas->node), type, i, mas->min) ==
+		    mas->max)
 			break;
 	}
 }
@@ -11824,7 +11944,8 @@ static void mas_validate_child_slot(struct ma_state *mas)
 /*
  * Validate all pivots are within mas->min and mas->max, check metadata ends
  * where the maximum ends and ensure there is no slots or pivots set outside of
- * the end of the data.
+ * the end of the data.  The pivots are deltas from mas->min, so a 32-bit node
+ * must span no more than U32_MAX.
  */
 static void mas_validate_limits(struct ma_state *mas)
 {
@@ -11832,6 +11953,13 @@ static void mas_validate_limits(struct ma_state *mas)
 	u64 prev_piv = 0;
 	enum maple_type type = mas_node_type(mas, mas->node);
 	void __rcu **slots = ma_slots(mte_to_node(mas->node), type);
+
+	if (node_is_32b(type) && mas->max - mas->min > U32_MAX) {
+		pr_err(PTR_FMT " is 32-bit but spans %llx to %llx\n",
+		       mas_mn(mas), (unsigned long long)mas->min,
+		       (unsigned long long)mas->max);
+		MAS_WARN_ON(mas, 1);
+	}
 
 	for (i = 0; i < mt_slots[type]; i++) {
 		u64 piv;
@@ -11841,7 +11969,7 @@ static void mas_validate_limits(struct ma_state *mas)
 		else
 			piv = mas_safe_pivot(mas, mas_mn(mas), type, i);
 
-		if (!piv && (i != 0)) {
+		if (i && i < mt_pivots[type] && !ma_delta(mas_mn(mas), type, i)) {
 			pr_err("Missing node limit pivot at " PTR_FMT "[%u]",
 			       mas_mn(mas), i);
 			MAS_WARN_ON(mas, 1);
@@ -11885,7 +12013,7 @@ static void mas_validate_limits(struct ma_state *mas)
 		}
 
 		if (i < mt_pivots[type]) {
-			u64 piv = ma_pivot(mas_mn(mas), type, i);
+			u64 piv = ma_delta(mas_mn(mas), type, i);
 
 			if (!piv)
 				continue;

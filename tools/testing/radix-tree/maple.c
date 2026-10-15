@@ -210,7 +210,7 @@ static noinline void __init test_mas_node_depth(struct ma_state *mas,
 		while (offset < count &&
 		       mas->index > ma_pivot(mas_mn(mas),
 					      mas_node_type(mas, mas->node),
-					      offset)) {
+					      offset, mas->min)) {
 			offset++;
 		}
 		mas->offset = offset;
@@ -298,7 +298,7 @@ static void __maybe_unused mas_fill_node_at_depth(struct maple_tree *mt,
 	    !ma_slots(mas_mn(&mas), mas_node_type(&mas, mas.node))[end]) {
 		unsigned long start = end ? ma_pivot(mas_mn(&mas),
 				mas_node_type(&mas, mas.node),
-				end - 1) + 1 : node_min;
+				end - 1, mas.min) + 1 : node_min;
 
 		mas_set_range(&mas, start, node_max);
 		mas_store_gfp(&mas, xa_mk_value(start), GFP_KERNEL);
@@ -309,10 +309,10 @@ static void __maybe_unused mas_fill_node_at_depth(struct maple_tree *mt,
 
 	if (descending)
 		v = end ? ma_pivot(mas_mn(&mas), mas_node_type(&mas, mas.node),
-				   end - 1) : node_max - 1;
+				   end - 1, mas.min) : node_max - 1;
 	else
 		v = (end ? ma_pivot(mas_mn(&mas),
-				    mas_node_type(&mas, mas.node), 0) :
+				    mas_node_type(&mas, mas.node), 0, mas.min) :
 			   node_min) + 1;
 
 	for (;;) {
@@ -345,7 +345,7 @@ static void __maybe_unused fill_root_branches(struct maple_tree *mt,
 
 	mas_start(&mas);
 	boundary = ma_pivot(mas_mn(&mas), mas_node_type(&mas, mas.node),
-			    offset);
+			    offset, mas.min);
 	height = mt_height(mt);
 
 	for (d = 1; d <= height; d++) {
@@ -821,7 +821,7 @@ static inline void mas_node_walk(struct ma_state *mas, struct maple_node *node,
 
 {
 	unsigned char count;
-	unsigned long prev, max;
+	unsigned long prev, max, delta;
 	unsigned char offset;
 	unsigned long index;
 
@@ -834,7 +834,7 @@ static inline void mas_node_walk(struct ma_state *mas, struct maple_node *node,
 		return;
 	}
 
-	max = ma_pivot(node, type, 0);
+	max = ma_pivot(node, type, 0, mas->min);
 	if (unlikely(ma_dead_node(node)))
 		return;
 
@@ -847,14 +847,16 @@ static inline void mas_node_walk(struct ma_state *mas, struct maple_node *node,
 	count = mt_pivots[type];
 	while (++offset < count) {
 		prev = max;
-		max = ma_pivot(node, type, offset);
+		/* A zero delta past slot 0 is an unused pivot. */
+		delta = ma_delta(node, type, offset);
+		max = mas->min + delta;
 		if (unlikely(ma_dead_node(node)))
 			return;
 
+		if (unlikely(!delta))
+			goto mas_max;
 		if (index <= max)
 			goto offset_found;
-		else if (unlikely(!max))
-			goto mas_max;
 	}
 
 	prev = max;
@@ -37237,20 +37239,25 @@ static unsigned char get_vacant_height(struct ma_wr_state *wr_mas, void *entry)
 	wr_mas->type = type;
 	wr_mas->sufficient_height = 0;
 	while (!ma_is_leaf(type)) {
+		unsigned long node_min = mas->min, node_max = mas->max;
+
 		mas_node_walk(mas, mte_to_node(mas->node), type, &min, &max);
 		offset = mas->offset;
+		/* The walk moved the range to the child; the pivots are the node's. */
+		mas->min = node_min;
+		mas->max = node_max;
 		mas->end = mas_data_end(mas);
 
 		if (!ma_is_dense(type)) {
 			if (offset)
 				min = ma_pivot(mte_to_node(mas->node), type,
-					       mas->offset - 1);
+					       mas->offset - 1, mas->min);
 			if (offset < mas->end)
 				max = ma_pivot(mte_to_node(mas->node), type,
-					       mas->offset);
+					       mas->offset, mas->min);
 		}
 		wr_mas->r_max = offset < mas->end ?
-			ma_pivot(mte_to_node(mas->node), type, offset) :
+			ma_pivot(mte_to_node(mas->node), type, offset, mas->min) :
 			mas->max;
 
 		/* detect spanning write */
@@ -37661,7 +37668,7 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 		mas_set(&mas, 0);
 		mas_start(&mas);
 		boundary = ma_pivot(mas_mn(&mas),
-				    mas_node_type(&mas, mas.node), 0);
+				    mas_node_type(&mas, mas.node), 0, mas.min);
 
 		/* Ensure the parent node at the boundary is full. */
 		mas_set(&mas, boundary);
@@ -37839,7 +37846,7 @@ static noinline void __init check_spanning_write(struct maple_tree *mt)
 	fill_root_branches(mt, 0);
 	mas_set(&mas, 0);
 	mas_start(&mas);
-	i = ma_pivot(mas_mn(&mas), mas_node_type(&mas, mas.node), 0);
+	i = ma_pivot(mas_mn(&mas), mas_node_type(&mas, mas.node), 0, mas.min);
 	/* The leaf ending on the first root pivot is full and ends in a value. */
 	mas_set(&mas, i);
 	MT_BUG_ON(mt, mas_walk(&mas) == NULL);
@@ -38791,7 +38798,7 @@ static noinline void __init check_multilevel_triple_split(struct maple_tree *mt)
 	/* Fill the second-to-last subtree of the root. */
 	mas_start(&mas);
 	index = ma_pivot(mas_mn(&mas), mas_node_type(&mas, mas.node),
-			 mas_data_end(&mas) - 2) + 1;
+			 mas_data_end(&mas) - 2, mas.min) + 1;
 	mas_set(&mas, index);
 	mas_start(&mas);
 	mas_internal_levels_fill(&mas);
@@ -38799,7 +38806,7 @@ static noinline void __init check_multilevel_triple_split(struct maple_tree *mt)
 	/* Fill the last subtree of the root */
 	mas_start(&mas);
 	index = ma_pivot(mas_mn(&mas), mas_node_type(&mas, mas.node),
-			 mas_data_end(&mas) - 1) + 1;
+			 mas_data_end(&mas) - 1, mas.min) + 1;
 	mas_set(&mas, index);
 	mas_start(&mas);
 	mas_internal_levels_fill(&mas);
@@ -39746,7 +39753,7 @@ static unsigned long get_last_index(struct ma_state *mas)
 
 	BUG_ON(last_index == 0);
 
-	return ma_pivot(node, mt, last_index - 1) + 1;
+	return ma_pivot(node, mt, last_index - 1, mas->min) + 1;
 }
 
 /*
