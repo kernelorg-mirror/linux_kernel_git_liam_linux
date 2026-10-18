@@ -4569,12 +4569,13 @@ int mas_empty_area(struct ma_state *mas, unsigned long min,
 	if (size == 0 || max - min < size - 1)
 		return -EINVAL;
 
+	/* Continue from the node of the last result, two slots back. */
 	if (mas_is_start(mas))
 		mas_start(mas);
 	else if (mas->offset >= 2)
 		mas->offset -= 2;
-	else if (!mas_skip_node(mas))
-		return -EBUSY;
+	else
+		mas->offset = 0;
 
 	/* Empty set */
 	if (mas_is_none(mas) || mas_is_ptr(mas))
