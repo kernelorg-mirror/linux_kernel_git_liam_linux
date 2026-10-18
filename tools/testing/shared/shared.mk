@@ -21,7 +21,8 @@ SHARED_DEPS = Makefile ../shared/shared.mk ../shared/*.h generated/map-shift.h \
 	../../../lib/radix-tree.h \
 	../../../include/linux/idr.h \
 	../../../lib/maple_tree.c \
-	../../../lib/test_maple_tree.c
+	../../../lib/test_maple_tree.c \
+	../shared/maple-shim.c
 
 ifndef SHIFT
 	SHIFT=3
