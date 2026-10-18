@@ -9725,7 +9725,7 @@ int mtree_alloc_range(struct maple_tree *mt, unsigned long *startp,
 
 	ret = mtree_alloc_range_u64(mt, &start, entry, size, min, max, gfp);
 	if (!ret)
-		*startp = start;
+		*startp = (unsigned long)start;
 
 	return ret;
 }
@@ -9807,8 +9807,8 @@ int mtree_alloc_cyclic(struct maple_tree *mt, unsigned long *startp,
 	ret = mas_alloc_cyclic(&mas, &start, entry, range_lo, range_hi,
 			       &next64, gfp);
 	if (ret >= 0) {
-		*startp = start;
-		*next = next64;
+		*startp = (unsigned long)start;
+		*next = (unsigned long)next64;
 		/* Wrapped at the caller's width. */
 		if (!*next)
 			mt->ma_flags |= MT_FLAGS_ALLOC_WRAPPED;
@@ -9844,7 +9844,7 @@ int mtree_alloc_rrange(struct maple_tree *mt, unsigned long *startp,
 
 	ret = mtree_alloc_rrange_u64(mt, &start, entry, size, min, max, gfp);
 	if (!ret)
-		*startp = start;
+		*startp = (unsigned long)start;
 
 	return ret;
 }
