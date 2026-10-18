@@ -80,8 +80,10 @@ freshly-initialised maple tree contains a ``NULL`` pointer for the range ``0``
 allocation, and marks.  The regular tree has a higher branching factor for
 internal nodes.  The allocation tree has a lower branching factor but allows
 the user to search for a gap of a given size or larger from either ``0``
-upwards or ``ULONG_MAX`` down.  A marks-enabled tree tracks per-entry marks to
-optimize marked searches.  An allocation tree can be used by passing in
+upwards or ``ULONG_MAX`` down.  Any tree finds a single free index, which is
+all mtree_alloc_cyclic() needs, since every node records whether a ``NULL``
+lies below it.  A marks-enabled tree tracks per-entry marks to optimize marked
+searches.  An allocation tree can be used by passing in
 ``MT_FLAGS_ALLOC_RANGE`` when initialising the tree.  A marks-enabled tree can
 be used by passing in ``MT_FLAGS_MARKS``.
 
@@ -273,12 +275,14 @@ and mas_clear_mark() set the maple state to -EINVAL.
 If the user needs to yield the lock during an operation, then the maple state
 must be paused using mas_pause().
 
-There are a few extra interfaces provided when using an allocation tree.
 If you wish to search for a gap within a range, then mas_empty_area()
 or mas_empty_area_rev() can be used.  mas_empty_area() searches for a gap
 starting at the lowest index given up to the maximum of the range.
 mas_empty_area_rev() searches for a gap starting at the highest index given
-and continues downward to the lower bound of the range.
+and continues downward to the lower bound of the range.  On a regular or marks
+tree the search follows the ``NULL`` bits of the nodes, which say that a gap
+lies below but not how large, so a gap of more than one index is found quickly
+only on an allocation tree.
 
 .. _maple-tree-advanced-alloc:
 

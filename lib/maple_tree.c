@@ -9782,15 +9782,15 @@ EXPORT_SYMBOL(mtree_alloc_range_u64);
  * Finds an empty entry in @mt after @next, stores the new index into
  * the @id pointer, stores the entry at that index, then updates @next.
  *
- * @mt must be initialized with the MT_FLAGS_ALLOC_RANGE flag.
+ * Any tree will do: a single free index is found by the NULL bits alone.
  *
  * Context: Any context.  Takes and releases the mt.lock.  May sleep if
  * the @gfp flags permit.
  *
  * Return: 0 if the allocation succeeded without wrapping, 1 if the
  * allocation succeeded after wrapping, -ENOMEM if memory could not be
- * allocated, -EINVAL if @mt cannot be used, or -EBUSY if there are no
- * free entries.
+ * allocated, -EINVAL if @entry is reserved or the range is inverted, or
+ * -EBUSY if there are no free entries.
  */
 int mtree_alloc_cyclic(struct maple_tree *mt, unsigned long *startp,
 		void *entry, unsigned long range_lo, unsigned long range_hi,
@@ -9801,8 +9801,6 @@ int mtree_alloc_cyclic(struct maple_tree *mt, unsigned long *startp,
 
 	MA_STATE(mas, mt, 0, 0);
 
-	if (!mt_is_alloc(mt))
-		return -EINVAL;
 	if (WARN_ON_ONCE(mt_is_reserved(entry)))
 		return -EINVAL;
 	mtree_lock(mt);
@@ -9827,8 +9825,6 @@ int mtree_alloc_cyclic_u64(struct maple_tree *mt, u64 *startp, void *entry,
 
 	MA_STATE(mas, mt, 0, 0);
 
-	if (!mt_is_alloc(mt))
-		return -EINVAL;
 	if (WARN_ON_ONCE(mt_is_reserved(entry)))
 		return -EINVAL;
 	mtree_lock(mt);
