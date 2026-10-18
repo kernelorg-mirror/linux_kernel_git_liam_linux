@@ -395,7 +395,8 @@ static inline int vma_iter_store_gfp(struct vma_iterator *vmi,
 
 {
 	if (vmi->mas.status != ma_start &&
-	    ((vmi->mas.index > vma->vm_start) || (vmi->mas.last < vma->vm_start)))
+	    ((mas_index_ulong(&vmi->mas) > vma->vm_start) ||
+	     (mas_last_ulong(&vmi->mas) < vma->vm_start)))
 		vma_iter_invalidate(vmi);
 
 	__mas_set_range(&vmi->mas, vma->vm_start, vma->vm_end - 1);
@@ -716,21 +717,24 @@ static inline void vma_iter_store_overwrite(struct vma_iterator *vmi,
 
 #if defined(CONFIG_DEBUG_VM_MAPLE_TREE)
 	if (MAS_WARN_ON(&vmi->mas, vmi->mas.status != ma_start &&
-			vmi->mas.index > vma->vm_start)) {
+			mas_index_ulong(&vmi->mas) > vma->vm_start)) {
 		pr_warn("%lx > %lx\n store vma %lx-%lx\n into slot %lx-%lx\n",
-			vmi->mas.index, vma->vm_start, vma->vm_start,
-			vma->vm_end, vmi->mas.index, vmi->mas.last);
+			mas_index_ulong(&vmi->mas), vma->vm_start,
+			vma->vm_start, vma->vm_end, mas_index_ulong(&vmi->mas),
+			mas_last_ulong(&vmi->mas));
 	}
 	if (MAS_WARN_ON(&vmi->mas, vmi->mas.status != ma_start &&
-			vmi->mas.last <  vma->vm_start)) {
+			mas_last_ulong(&vmi->mas) <  vma->vm_start)) {
 		pr_warn("%lx < %lx\nstore vma %lx-%lx\ninto slot %lx-%lx\n",
-		       vmi->mas.last, vma->vm_start, vma->vm_start, vma->vm_end,
-		       vmi->mas.index, vmi->mas.last);
+		       mas_last_ulong(&vmi->mas), vma->vm_start,
+		       vma->vm_start, vma->vm_end, mas_index_ulong(&vmi->mas),
+		       mas_last_ulong(&vmi->mas));
 	}
 #endif
 
 	if (vmi->mas.status != ma_start &&
-	    ((vmi->mas.index > vma->vm_start) || (vmi->mas.last < vma->vm_start)))
+	    ((mas_index_ulong(&vmi->mas) > vma->vm_start) ||
+	     (mas_last_ulong(&vmi->mas) < vma->vm_start)))
 		vma_iter_invalidate(vmi);
 
 	__mas_set_range(&vmi->mas, vma->vm_start, vma->vm_end - 1);
@@ -746,12 +750,12 @@ static inline void vma_iter_store_new(struct vma_iterator *vmi,
 
 static inline unsigned long vma_iter_addr(struct vma_iterator *vmi)
 {
-	return vmi->mas.index;
+	return mas_index_ulong(&vmi->mas);
 }
 
 static inline unsigned long vma_iter_end(struct vma_iterator *vmi)
 {
-	return vmi->mas.last + 1;
+	return mas_last_ulong(&vmi->mas) + 1;
 }
 
 static inline
