@@ -28,7 +28,7 @@ static int regcache_maple_read(struct regmap *map,
 		return -ENOENT;
 	}
 
-	*value = entry[reg - mas.index];
+	*value = entry[reg - mas_index_ulong(&mas)];
 
 	rcu_read_unlock();
 
@@ -49,7 +49,7 @@ static int regcache_maple_write(struct regmap *map, unsigned int reg,
 
 	entry = mas_walk(&mas);
 	if (entry) {
-		entry[reg - mas.index] = val;
+		entry[reg - mas_index_ulong(&mas)] = val;
 		rcu_read_unlock();
 		return 0;
 	}
@@ -61,14 +61,14 @@ static int regcache_maple_write(struct regmap *map, unsigned int reg,
 
 	lower = mas_find(&mas, reg - 1);
 	if (lower) {
-		index = mas.index;
-		lower_sz = (mas.last - mas.index + 1) * sizeof(unsigned long);
+		index = mas_index_ulong(&mas);
+		lower_sz = (mas_last_ulong(&mas) - index + 1) * sizeof(unsigned long);
 	}
 
 	upper = mas_find(&mas, reg + 1);
 	if (upper) {
-		last = mas.last;
-		upper_sz = (mas.last - mas.index + 1) * sizeof(unsigned long);
+		last = mas_last_ulong(&mas);
+		upper_sz = (last - mas_index_ulong(&mas) + 1) * sizeof(unsigned long);
 	}
 
 	rcu_read_unlock();
@@ -121,6 +121,8 @@ static int regcache_maple_drop(struct regmap *map, unsigned int min,
 	mas_lock(&mas);
 
 	mas_for_each(&mas, entry, max) {
+		unsigned long index, last;
+
 		/*
 		 * This is safe because the regmap lock means the
 		 * Maple lock is redundant, but we need to take it due
@@ -128,13 +130,16 @@ static int regcache_maple_drop(struct regmap *map, unsigned int min,
 		 */
 		mas_unlock(&mas);
 
+		index = mas_index_ulong(&mas);
+		last = mas_last_ulong(&mas);
+
 		/* Do we need to save any of this entry? */
-		if (mas.index < min) {
-			lower_index = mas.index;
+		if (index < min) {
+			lower_index = index;
 			lower_last = min -1;
 
 			lower = kmemdup_array(entry,
-					      min - mas.index, sizeof(*lower),
+					      min - index, sizeof(*lower),
 					      map->alloc_flags);
 			if (!lower) {
 				ret = -ENOMEM;
@@ -142,12 +147,12 @@ static int regcache_maple_drop(struct regmap *map, unsigned int min,
 			}
 		}
 
-		if (mas.last > max) {
+		if (last > max) {
 			upper_index = max + 1;
-			upper_last = mas.last;
+			upper_last = last;
 
-			upper = kmemdup_array(&entry[max - mas.index + 1],
-					      mas.last - max, sizeof(*upper),
+			upper = kmemdup_array(&entry[max - index + 1],
+					      last - max, sizeof(*upper),
 					      map->alloc_flags);
 			if (!upper) {
 				ret = -ENOMEM;
@@ -191,10 +196,11 @@ static int regcache_maple_sync_block(struct regmap *map, unsigned long *entry,
 				     unsigned int min, unsigned int max)
 {
 	void *buf;
-	unsigned long r;
+	unsigned long r, index;
 	size_t val_bytes = map->format.val_bytes;
 	int ret = 0;
 
+	index = mas_index_ulong(mas);
 	mas_pause(mas);
 	rcu_read_unlock();
 
@@ -213,7 +219,7 @@ static int regcache_maple_sync_block(struct regmap *map, unsigned long *entry,
 		/* Render the data for a raw write */
 		for (r = min; r < max; r++) {
 			regcache_set_val(map, buf, r - min,
-					 entry[r - mas->index]);
+					 entry[r - index]);
 		}
 
 		ret = _regmap_raw_write(map, min, buf, (max - min) * val_bytes,
@@ -223,7 +229,7 @@ static int regcache_maple_sync_block(struct regmap *map, unsigned long *entry,
 	} else {
 		for (r = min; r < max; r++) {
 			ret = _regmap_write(map, r,
-					    entry[r - mas->index]);
+					    entry[r - index]);
 			if (ret != 0)
 				goto out;
 		}
@@ -252,8 +258,12 @@ static int regcache_maple_sync(struct regmap *map, unsigned int min,
 	rcu_read_lock();
 
 	mas_for_each(&mas, entry, max) {
-		for (r = max(mas.index, lmin); r <= min(mas.last, lmax); r++) {
-			v = entry[r - mas.index];
+		unsigned long index, last;
+
+		index = mas_index_ulong(&mas);
+		last = mas_last_ulong(&mas);
+		for (r = max(index, lmin); r <= min(last, lmax); r++) {
+			v = entry[r - index];
 
 			if (regcache_reg_needs_sync(map, r, v)) {
 				if (!sync_needed) {
