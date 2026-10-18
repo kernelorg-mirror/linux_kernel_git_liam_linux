@@ -3741,6 +3741,31 @@ static noinline void __init check_range64_in_rcu(struct maple_tree *mt)
 }
 
 /*
+ * A reverse gap search over the whole space must reach a gap under the root's
+ * first slot, where the window is every index: one more than a long holds.
+ */
+static noinline void __init check_rev_gap_first(struct maple_tree *mt)
+{
+	unsigned long top = ULONG_MAX - 4096, i;
+	unsigned long size = 1UL << (BITS_PER_LONG - 4);
+	MA_STATE(mas, mt, 0, 0);
+
+	/* Singletons fill the top; the one gap of size is below them. */
+	for (i = 0; i < 2000; i++)
+		MT_BUG_ON(mt, mtree_store(mt, top + i * 2, xa_mk_value(i),
+					  GFP_KERNEL));
+
+	mtree_lock(mt);
+	MT_BUG_ON(mt, mas_empty_area_rev(&mas, 0, ULONG_MAX, size));
+	MT_BUG_ON(mt, mas.last != top - 1);
+	MT_BUG_ON(mt, mas.index != top - size);
+	mas_reset(&mas);
+	MT_BUG_ON(mt, mas_empty_area(&mas, 0, ULONG_MAX, size));
+	MT_BUG_ON(mt, mas.index != 0);
+	mtree_unlock(mt);
+}
+
+/*
  * mas_empty_area() continues from the state it is given.  From the first or
  * second slot of a leaf it skipped the rest of the leaf, so an allocator
  * reusing its state missed the gap right after what it just stored.
@@ -4067,6 +4092,10 @@ static int __init maple_tree_seed(void)
 
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
 	check_empty_area_resume(&tree);
+	mtree_destroy(&tree);
+
+	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_rev_gap_first(&tree);
 	mtree_destroy(&tree);
 
 
