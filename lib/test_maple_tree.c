@@ -1850,6 +1850,31 @@ static noinline void __init bench_mas_find_marked(struct maple_tree *mt)
 }
 #endif
 
+#if defined(BENCH_CYCLIC) || defined(BENCH_CYCLIC_ALLOC)
+/*
+ * A directory's offset map: entries allocated by the cursor and the oldest
+ * removed as new ones come, so the map holds @n while @count churn through.
+ */
+static noinline void __init bench_cyclic(struct maple_tree *mt)
+{
+	unsigned long n = 1000000, count = 2000000, i, index, next = 2;
+	int ret;
+
+	for (i = 0; i < n; i++) {
+		ret = mtree_alloc_cyclic(mt, &index, xa_mk_value(i), 2, ULONG_MAX,
+					 &next, GFP_KERNEL);
+		MT_BUG_ON(mt, ret);
+	}
+
+	for (i = 0; i < count; i++) {
+		mtree_erase(mt, 2 + i);
+		ret = mtree_alloc_cyclic(mt, &index, xa_mk_value(i), 2, ULONG_MAX,
+					 &next, GFP_KERNEL);
+		MT_BUG_ON(mt, ret);
+	}
+}
+#endif
+
 /* check_forking - simulate the kernel forking sequence with the tree. */
 static noinline void __init check_forking(void)
 {
@@ -3660,7 +3685,7 @@ static noinline void __init alloc_cyclic_testing(struct maple_tree *mt)
 {
 	unsigned long location;
 	unsigned long next;
-	u64 location64, next64;
+	u64 location64, next64, hi = (u64)U32_MAX + 1;
 	int ret = 0;
 	MA_STATE(mas, mt, 0, 0);
 
@@ -3678,7 +3703,6 @@ static noinline void __init alloc_cyclic_testing(struct maple_tree *mt)
 	mtree_unlock(mt);
 	mtree_destroy(mt);
 	next = 0;
-	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
 	for (int i = 0; i < 100; i++) {
 		mtree_alloc_cyclic(mt, &location, mt, 2, ULONG_MAX, &next, GFP_KERNEL);
 		MT_BUG_ON(mt, i != location - 2);
@@ -3695,7 +3719,6 @@ static noinline void __init alloc_cyclic_testing(struct maple_tree *mt)
 	 * mas_reset() in mas_alloc_cyclic().
 	 */
 	next = 0;
-	mt_init_flags(mt, MT_FLAGS_ALLOC_RANGE);
 	for (int i = 0; i < 1023; i++) {
 		mtree_alloc_cyclic(mt, &location, mt, 2, 1024, &next, GFP_KERNEL);
 		MT_BUG_ON(mt, i != location - 2);
@@ -3723,6 +3746,26 @@ static noinline void __init alloc_cyclic_testing(struct maple_tree *mt)
 	MT_BUG_ON(mt, ret != 0);
 	ret = mtree_alloc_cyclic(mt, &location, mt, 2, ULONG_MAX, &next, GFP_KERNEL);
 	MT_BUG_ON(mt, ret != 1);
+
+	/* A range across the 4G seam: the second allocation promotes the tree. */
+	mtree_destroy(mt);
+	next64 = hi - 1;
+	for (int i = 0; i < 4; i++) {
+		ret = mtree_alloc_cyclic_u64(mt, &location64, mt, hi - 1, hi + 2,
+					     &next64, GFP_KERNEL);
+		MT_BUG_ON(mt, ret != 0);
+		MT_BUG_ON(mt, location64 != hi - 1 + i);
+		MT_BUG_ON(mt, mtree_load_u64(mt, location64) != mt);
+	}
+	ret = mtree_alloc_cyclic_u64(mt, &location64, mt, hi - 1, hi + 2, &next64,
+				     GFP_KERNEL);
+	MT_BUG_ON(mt, ret != -EBUSY);
+	mtree_erase_u64(mt, U32_MAX);
+	ret = mtree_alloc_cyclic_u64(mt, &location64, mt, hi - 1, hi + 2, &next64,
+				     GFP_KERNEL);
+	MT_BUG_ON(mt, ret != 1);
+	MT_BUG_ON(mt, location64 != U32_MAX);
+	mt_validate(mt);
 }
 
 /*
@@ -4492,6 +4535,20 @@ static int __init maple_tree_seed(void)
 	mtree_destroy(&tree);
 	goto skip;
 #endif
+#if defined(BENCH_CYCLIC)
+#define BENCH
+	mt_init_flags(&tree, 0);
+	bench_cyclic(&tree);
+	mtree_destroy(&tree);
+	goto skip;
+#endif
+#if defined(BENCH_CYCLIC_ALLOC)
+#define BENCH
+	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	bench_cyclic(&tree);
+	mtree_destroy(&tree);
+	goto skip;
+#endif
 	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
 	check_deficient_node(&tree);
 	mtree_destroy(&tree);
@@ -4716,6 +4773,11 @@ static int __init maple_tree_seed(void)
 
 	/* The cursor allocation on a regular tree, by the NULL bits. */
 	mt_init_flags(&tree, 0);
+	alloc_cyclic_testing(&tree);
+	mtree_destroy(&tree);
+
+	/* A marks tree has no gap arrays either. */
+	mt_init_flags(&tree, MT_FLAGS_MARKS);
 	alloc_cyclic_testing(&tree);
 	mtree_destroy(&tree);
 
