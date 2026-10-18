@@ -111,7 +111,7 @@ static struct execmem_cache execmem_cache = {
 
 static inline unsigned long mas_range_len(struct ma_state *mas)
 {
-	return mas->last - mas->index + 1;
+	return mas_last_ulong(mas) - mas_index_ulong(mas) + 1;
 }
 
 static int execmem_force_rw(void *ptr, size_t size)
@@ -147,7 +147,7 @@ static void execmem_cache_clean(struct work_struct *work)
 		size_t size = mas_range_len(&mas);
 
 		if (vm && get_vm_area_size(vm) == size) {
-			VM_WARN_ON_ONCE(!IS_ALIGNED(mas.index, PMD_SIZE) ||
+			VM_WARN_ON_ONCE(!IS_ALIGNED(mas_index_ulong(&mas), PMD_SIZE) ||
 					!IS_ALIGNED(size, PMD_SIZE));
 
 			/*
@@ -178,12 +178,12 @@ static int execmem_cache_add_locked(void *ptr, size_t size, gfp_t gfp_mask)
 	upper = addr + size - 1;
 
 	area = mas_walk(&mas);
-	if (area && mas.last == addr - 1)
-		lower = mas.index;
+	if (area && mas_last_ulong(&mas) == addr - 1)
+		lower = mas_index_ulong(&mas);
 
 	area = mas_next(&mas, ULONG_MAX);
-	if (area && mas.index == addr + size)
-		upper = mas.last;
+	if (area && mas_index_ulong(&mas) == addr + size)
+		upper = mas_last_ulong(&mas);
 
 	mas_set_range(&mas, lower, upper);
 	return mas_store_gfp(&mas, (void *)lower, gfp_mask);
@@ -192,7 +192,7 @@ static int execmem_cache_add_locked(void *ptr, size_t size, gfp_t gfp_mask)
 static bool within_range(struct execmem_range *range, struct ma_state *mas,
 			 size_t size)
 {
-	unsigned long addr = mas->index;
+	unsigned long addr = mas_index_ulong(mas);
 
 	if (addr >= range->start && addr + size < range->end)
 		return true;
@@ -224,8 +224,8 @@ static void *execmem_cache_alloc_locked(struct execmem_range *range, size_t size
 	if (area_size < size)
 		return NULL;
 
-	addr = mas_free.index;
-	last = mas_free.last;
+	addr = mas_index_ulong(&mas_free);
+	last = mas_last_ulong(&mas_free);
 
 	mas_set_range(&mas_free, addr, addr + size - 1);
 	if (mas_preallocate(&mas_free, NULL, GFP_KERNEL))
