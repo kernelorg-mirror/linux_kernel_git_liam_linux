@@ -34455,7 +34455,7 @@ int eval_rcu_entry(struct rcu_test_struct *test, void *entry, bool *update_2,
 		if (!(*update_2)) {
 			uatomic_inc(&test->seen_entry2);
 			*update_2 = true;
-			if (update_3)
+			if (*update_3)
 				uatomic_inc(&test->seen_both);
 		}
 		return 0;
@@ -34465,7 +34465,7 @@ int eval_rcu_entry(struct rcu_test_struct *test, void *entry, bool *update_2,
 		if (!(*update_3)) {
 			uatomic_inc(&test->seen_entry3);
 			*update_3 = true;
-			if (update_2)
+			if (*update_2)
 				uatomic_inc(&test->seen_both);
 		}
 		return 0;
@@ -34938,9 +34938,9 @@ static noinline void __init check_rcu_threaded(struct maple_tree *mt)
 	vals.mt = mt;
 	vals.index = 4390;
 	vals.last = 4398;
-	vals.entry1 = xa_mk_value(4390);
-	vals.entry2 = xa_mk_value(439);
-	vals.entry3 = xa_mk_value(4391);
+	vals.entry1 = xa_mk_value(439);
+	vals.entry2 = xa_mk_value(4391);
+	vals.entry3 = xa_mk_value(438);
 	vals.seen_toggle = 0;
 	vals.seen_added = 0;
 	vals.seen_removed = 0;
@@ -34954,7 +34954,6 @@ static noinline void __init check_rcu_threaded(struct maple_tree *mt)
 	vals.seen_entry2 = 0;
 	vals.seen_entry3 = 0;
 	vals.seen_both = 0;
-	vals.entry3 = xa_mk_value(438);
 
 	run_check_rcu_slowread(mt, &vals);
 	rcu_unregister_thread();
