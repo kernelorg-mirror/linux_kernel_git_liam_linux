@@ -3816,6 +3816,32 @@ static noinline void __init check_range64_in_rcu(struct maple_tree *mt)
 	rcu_barrier();
 }
 
+/* A tree without marks, or a mark above MT_MARK_MAX, refuses the mark. */
+static noinline void __init check_mark_einval(struct maple_tree *mt)
+{
+	MA_STATE(mas, mt, 5, 5);
+
+	mt_init_flags(mt, 0);
+	MT_BUG_ON(mt, mtree_store(mt, 5, xa_mk_value(5), GFP_KERNEL));
+	MT_BUG_ON(mt, mtree_set_mark(mt, 5, MT_MARK_0) != -EINVAL);
+	MT_BUG_ON(mt, mtree_clear_mark(mt, 5, MT_MARK_0) != -EINVAL);
+	MT_BUG_ON(mt, mtree_get_mark(mt, 5, MT_MARK_0));
+	mtree_lock(mt);
+	mas_set_mark(&mas, MT_MARK_0);
+	MT_BUG_ON(mt, !mas_is_err(&mas) || xa_err(mas.node) != -EINVAL);
+	mtree_unlock(mt);
+	mtree_destroy(mt);
+
+	mt_init_flags(mt, MT_FLAGS_MARKS);
+	MT_BUG_ON(mt, mtree_store(mt, 5, xa_mk_value(5), GFP_KERNEL));
+	MT_BUG_ON(mt, mtree_set_mark(mt, 5, MT_MARK_MAX + 1) != -EINVAL);
+	MT_BUG_ON(mt, mtree_set_mark(mt, 5, MT_MARK_0));
+	MT_BUG_ON(mt, !mtree_get_mark(mt, 5, MT_MARK_0));
+	MT_BUG_ON(mt, mtree_clear_mark(mt, 5, MT_MARK_0));
+	MT_BUG_ON(mt, mtree_get_mark(mt, 5, MT_MARK_0));
+	mtree_destroy(mt);
+}
+
 static DEFINE_MTREE(tree);
 static int __init maple_tree_seed(void)
 {
@@ -4114,6 +4140,8 @@ static int __init maple_tree_seed(void)
 
 	check_range64_in_rcu(&tree);
 
+
+	check_mark_einval(&tree);
 
 #if defined(BENCH)
 skip:
