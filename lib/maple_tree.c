@@ -10336,6 +10336,16 @@ void mtree_destroy(struct maple_tree *mt)
 }
 EXPORT_SYMBOL(mtree_destroy);
 
+/* The caller's next index; a range ending past ULONG_MAX ends its walk. */
+static inline unsigned long mt_find_index(u64 next)
+{
+#ifndef CONFIG_64BIT
+	if (WARN_ON_ONCE(next - 1 > ULONG_MAX))
+		return 0;
+#endif
+	return (unsigned long)next;
+}
+
 /**
  * mt_find() - Search from the start up until an entry is found.
  * @mt: The maple tree
@@ -10359,7 +10369,7 @@ void *mt_find(struct maple_tree *mt, unsigned long *index, unsigned long max)
 
 	entry = mt_find_u64(mt, &idx, max);
 	if (entry)
-		*index = idx;
+		*index = mt_find_index(idx);
 
 	return entry;
 }
@@ -10430,7 +10440,7 @@ void *mt_find_marked(struct maple_tree *mt, unsigned long *index,
 
 	entry = mt_find_marked_u64(mt, &idx, max, mark);
 	if (entry)
-		*index = idx;
+		*index = mt_find_index(idx);
 
 	return entry;
 }
