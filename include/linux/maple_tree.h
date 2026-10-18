@@ -114,7 +114,9 @@ struct maple_metadata {
  * subtree with an entry attached to the value whereas keys are unique to a
  * specific position of a B-tree.  Pivot values are inclusive of the slot with
  * the same index.  A pivot is stored as its delta from the node's implied
- * minimum, so a 32-bit pivot node is one whose range fits in 32 bits.
+ * minimum, so a 32-bit pivot node is one whose range fits in 32 bits.  An
+ * unused pivot holds all ones, above any delta, so a scan of the pivots stops
+ * on it.
  */
 
 struct maple_range_64 {

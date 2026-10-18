@@ -64,6 +64,7 @@
 #include <linux/export.h>
 #include <linux/slab.h>
 #include <linux/limits.h>
+#include <linux/unroll.h>
 #include <asm/barrier.h>
 
 #define CREATE_TRACE_POINTS
@@ -2074,55 +2075,42 @@ static inline struct maple_enode *mas_start_wr(struct ma_state *mas)
  * @pivots: The array of pivots in the node
  * @span: The maximum value in the node, as a delta from its minimum
  *
- * Uses metadata to find the end of the data when possible.
+ * A full node's last pivot is below its span, the implied last slot holding
+ * the rest; any other node ends at the span, on its last entry's pivot or an
+ * unused one, and its metadata holds the end.
  * Return: The zero indexed last slot with data (may be null).
  */
 static __always_inline
 unsigned char ma_data_end64(struct maple_node *node,
 		enum maple_type type, u64 *pivots, u64 span)
 {
-	unsigned char offset;
-	u64 last;
-
 	if (!pivots)
 		return 0;
 
 	if (type == maple_arange_64)
 		return ma_meta_end(node, type);
 
-	offset = mt_pivots[type] - 1;
-	last = pivots[offset];
-	if (likely(!last))
-		return ma_meta_end(node, type);
+	if (pivots[mt_pivots[type] - 1] < span)
+		return mt_pivots[type];
 
-	if (likely(last == span))
-		return offset;
-
-	return mt_pivots[type];
+	return ma_meta_end(node, type);
 }
 
 static __always_inline
 unsigned char ma_data_end32(struct maple_node *node,
 		enum maple_type type, u32 *pivots, u32 span)
 {
-	unsigned char offset;
-	u32 last;
-
 	if (!pivots)
 		return 0;
 
 	if (type == maple_arange_32)
 		return ma_meta_end(node, type);
 
-	offset = mt_pivots[type] - 1;
-	last = pivots[offset];
-	if (likely(!last))
-		return ma_meta_end(node, type);
+	/* A full node's last pivot is below its span; see ma_data_end64(). */
+	if (pivots[mt_pivots[type] - 1] < span)
+		return mt_pivots[type];
 
-	if (likely(last == span))
-		return offset;
-
-	return mt_pivots[type];
+	return ma_meta_end(node, type);
 }
 /* ma_data_end() - Width-aware data end for @node, from its range. */
 static __always_inline
@@ -3051,6 +3039,52 @@ static inline unsigned char ma_dense_cnt_ranges(struct maple_tree *mt,
 }
 
 /*
+ * ma_scan32() - The slot of @r in a 32-bit node: the first pivot at or above it.
+ * @pivots: The node's pivots
+ * @count: Their number, a constant at the call
+ * @r: The index as a delta from the node minimum
+ *
+ * An unused pivot holds all ones, so the scan stops on one in a node that is
+ * not full and needs no data end; a full node's last slot is implied, the
+ * count itself.  Either way no pivot beyond @count is read, which a dead node
+ * needs.  The scan is unrolled: a compare and a branch per pivot, no counter,
+ * and the exit is the only taken branch, predicted wherever the index repeats
+ * a path, as the faults of one mapping do.  A count of the pivots below the
+ * index would take no branch, but the next node's load would then wait for
+ * every compare where the predicted exit has it in flight at once.  The
+ * unroll is capped at the slots of a node, which a constant count never
+ * reaches, so that a variable one could not unroll without bound.
+ */
+static __always_inline
+unsigned int ma_scan32(const u32 *pivots, unsigned int count, u32 r)
+{
+	unsigned int offset;
+
+	unrolled_count(MAPLE_NODE_SLOTS)
+	for (offset = 0; offset < count; offset++) {
+		if (pivots[offset] >= r)
+			break;
+	}
+
+	return offset;
+}
+
+/* ma_scan32() for a 64-bit node. */
+static __always_inline
+unsigned int ma_scan64(const u64 *pivots, unsigned int count, u64 r)
+{
+	unsigned int offset;
+
+	unrolled_count(MAPLE_NODE_SLOTS)
+	for (offset = 0; offset < count; offset++) {
+		if (pivots[offset] >= r)
+			break;
+	}
+
+	return offset;
+}
+
+/*
  * mas_wr_dense_walk() - Find the entry holding @mas->index in a dense leaf.
  * @wr_mas: The maple write state
  *
@@ -3415,7 +3449,8 @@ u64 node_copy(struct ma_state *mas, const struct ma_layout *s,
 
 /*
  * ma_clear_range() - Clear slots @from to @to of a node laid out as @l, with
- * their pivots and their gaps or marks.
+ * their gaps or marks, and set their pivots to all ones: an unused pivot is
+ * above any index, so a scan of the pivots stops on it.
  */
 static inline void ma_clear_range(const struct ma_layout *l, unsigned char from,
 		unsigned char to)
@@ -3438,9 +3473,9 @@ static inline void ma_clear_range(const struct ma_layout *l, unsigned char from,
 		return;
 
 	if (l->t.is32)
-		memset(ma_layout_p32(l) + from, 0, size * sizeof(u32));
+		memset(ma_layout_p32(l) + from, 0xff, size * sizeof(u32));
 	else
-		memset(ma_layout_p64(l) + from, 0, size * sizeof(u64));
+		memset(ma_layout_p64(l) + from, 0xff, size * sizeof(u64));
 }
 
 static inline void node_clear_range(struct maple_node *node,
@@ -3453,7 +3488,7 @@ static inline void node_clear_range(struct maple_node *node,
 }
 
 /*
- * ma_finalise() - Zero out the unused area of a node laid out as @l and
+ * ma_finalise() - Clear the unused area of a node laid out as @l and
  * populate its metadata.
  * @l: The layout
  * @end: the first offset that is not used.
@@ -3534,10 +3569,13 @@ struct ma_walk {
  *
  * The pivot width (32-bit / 64-bit) is resolved once and each arm reads through
  * the correctly-typed pointer - never a u32 array viewed as u64.  Returns the
- * slot holding @index: its content and offset, the node's data end, and
+ * slot holding @index: its content and offset, the data end of a leaf, and
  * [min, max] narrowed to its range.  A rebalance can leave a 64-bit node under
  * a 32-bit parent, so the width is read from @node, not assumed from the
  * descent.  Not for dense leaves.
+ *
+ * ma_scan32() or ma_scan64() finds the slot.  Its range is read from the
+ * pivots on either side of it without a branch.
  *
  * The layout of a node follows from its type, so the callers pass @type as a
  * constant and the pivot count and the slot and metadata offsets are
@@ -3547,7 +3585,9 @@ static __always_inline
 struct ma_walk ma_walk_node(struct maple_tree *mt, struct maple_node *node,
 		enum maple_type type, u64 index, u64 min, u64 max)
 {
-	struct ma_walk w = { .min = min, .max = max, .offset = 0 };
+	struct ma_walk w;
+	unsigned int count = mt_pivots[type];
+	unsigned int offset, i;
 	u64 rel = index - min;
 
 	/*
@@ -3556,38 +3596,34 @@ struct ma_walk ma_walk_node(struct maple_tree *mt, struct maple_node *node,
 	 */
 	if (node_is_32b(type)) {
 		u32 *pivots = ma_pivots32(node, type);
-		u32 r = (u32)rel;
 
-		w.end = ma_data_end32(node, type, pivots, max - min);
-		if (pivots[0] >= r) {
-			w.max = min + pivots[0];
-		} else {
-			for (w.offset = 1; w.offset < w.end; w.offset++) {
-				if (pivots[w.offset] >= r) {
-					w.max = min + pivots[w.offset];
-					break;
-				}
-			}
-			w.min = min + pivots[w.offset - 1] + 1;
+		offset = ma_scan32(pivots, count, rel);
+		i = offset - (offset != 0);
+		w.min = offset ? min + pivots[i] + 1 : min;
+		i = offset - (offset == count);
+		w.max = offset < count ? min + pivots[i] : max;
+		if (ma_is_leaf(type)) {
+			unsigned char end = ma_meta_end(node, type);
+
+			w.end = pivots[count - 1] < max - min ? count : end;
 		}
 	} else {
 		u64 *pivots = ma_pivots(node, type);
 
-		w.end = ma_data_end64(node, type, pivots, max - min);
-		if (pivots[0] >= rel) {
-			w.max = min + pivots[0];
-		} else {
-			for (w.offset = 1; w.offset < w.end; w.offset++) {
-				if (pivots[w.offset] >= rel) {
-					w.max = min + pivots[w.offset];
-					break;
-				}
-			}
-			w.min = min + pivots[w.offset - 1] + 1;
+		offset = ma_scan64(pivots, count, rel);
+		i = offset - (offset != 0);
+		w.min = offset ? min + pivots[i] + 1 : min;
+		i = offset - (offset == count);
+		w.max = offset < count ? min + pivots[i] : max;
+		if (ma_is_leaf(type)) {
+			unsigned char end = ma_meta_end(node, type);
+
+			w.end = pivots[count - 1] < max - min ? count : end;
 		}
 	}
 
-	w.entry = mt_slot(mt, ma_slots(node, type), w.offset);
+	w.offset = offset;
+	w.entry = mt_slot(mt, ma_slots(node, type), offset);
 	return w;
 }
 
@@ -5561,30 +5597,23 @@ static __always_inline
 struct ma_lookup ma_lookup_node(struct maple_tree *mt, struct maple_node *node,
 		enum maple_type type, u64 index, u64 min)
 {
-	struct ma_lookup l = { .min = min };
-	unsigned char end = mt_pivots[type];
-	unsigned char offset = 0;
+	struct ma_lookup l;
+	unsigned int count = mt_pivots[type];
+	unsigned int offset, i;
 	u64 rel = index - min;
 
 	if (node_is_32b(type)) {
 		u32 *pivots = ma_pivots32(node, type);
-		u32 r = (u32)rel;
 
-		if (pivots[0] < r) {
-			offset = 1;
-			while (offset < end && pivots[offset] < r)
-				offset++;
-			l.min = min + pivots[offset - 1] + 1;
-		}
+		offset = ma_scan32(pivots, count, rel);
+		i = offset - (offset != 0);
+		l.min = offset ? min + pivots[i] + 1 : min;
 	} else {
 		u64 *pivots = ma_pivots(node, type);
 
-		if (pivots[0] < rel) {
-			offset = 1;
-			while (offset < end && pivots[offset] < rel)
-				offset++;
-			l.min = min + pivots[offset - 1] + 1;
-		}
+		offset = ma_scan64(pivots, count, rel);
+		i = offset - (offset != 0);
+		l.min = offset ? min + pivots[i] + 1 : min;
 	}
 
 	l.entry = mt_slot(mt, ma_slots(node, type), offset);
@@ -11353,9 +11382,9 @@ static void mt_dump_range64(const struct maple_tree *mt, void *entry,
 		unsigned long last = max;
 
 		if (i < (MAPLE_RANGE64_SLOTS - 1)) {
-			if (!node->pivot[i] && i > 0)
-				break;
 			last = min + node->pivot[i];
+			if (i > 0 && node->pivot[i] == U64_MAX && last != max)
+				break;
 		} else if (!node->slot[i] && max != mt_node_max(mt, entry))
 			break;
 		if (leaf)
@@ -11401,9 +11430,9 @@ static void mt_dump_mrange64(const struct maple_tree *mt, void *entry,
 		unsigned long last = max;
 
 		if (i < (MAPLE_MRANGE64_SLOTS - 1)) {
-			if (!node->pivot[i] && i > 0)
-				break;
 			last = min + node->pivot[i];
+			if (i > 0 && node->pivot[i] == U64_MAX && last != max)
+				break;
 		} else if (!node->slot[i] && max != mt_node_max(mt, entry))
 			break;
 
@@ -11445,9 +11474,9 @@ static void mt_dump_mrange64(const struct maple_tree *mt, void *entry,
 		void *child;
 
 		if (i < (MAPLE_MRANGE64_SLOTS - 1)) {
-			if (!node->pivot[i] && i > 0)
-				break;
 			last = min + node->pivot[i];
+			if (i > 0 && node->pivot[i] == U64_MAX && last != max)
+				break;
 		} else if (!node->slot[i] && max != mt_node_max(mt, entry))
 			break;
 
@@ -11522,9 +11551,9 @@ static void mt_dump_arange64(const struct maple_tree *mt, void *entry,
 		unsigned long last = max;
 
 		if (i < (MAPLE_ARANGE64_SLOTS - 1)) {
-			if (!node->pivot[i] && i > 0)
-				break;
 			last = min + node->pivot[i];
+			if (i > 0 && node->pivot[i] == U64_MAX && last != max)
+				break;
 		} else if (!node->slot[i])
 			break;
 		if (node->slot[i])
@@ -11572,9 +11601,9 @@ static void mt_dump_range32(const struct maple_tree *mt, void *entry,
 		unsigned long last = max;
 
 		if (i < (MAPLE_RANGE32_SLOTS - 1)) {
-			if (!node->pivot[i] && i > 0)
-				break;
 			last = min + node->pivot[i];
+			if (i > 0 && node->pivot[i] == U32_MAX && last != max)
+				break;
 		} else if (!node->slot[i] && max != mt_node_max(mt, entry))
 			break;
 		if (leaf)
@@ -11618,9 +11647,9 @@ static void mt_dump_mrange32(const struct maple_tree *mt, void *entry,
 		unsigned long last = max;
 
 		if (i < (MAPLE_MRANGE32_SLOTS - 1)) {
-			if (!node->pivot[i] && i > 0)
-				break;
 			last = min + node->pivot[i];
+			if (i > 0 && node->pivot[i] == U32_MAX && last != max)
+				break;
 		} else if (!node->slot[i] && max != mt_node_max(mt, entry))
 			break;
 
@@ -11660,9 +11689,9 @@ static void mt_dump_mrange32(const struct maple_tree *mt, void *entry,
 		char marks[12];
 
 		if (i < (MAPLE_MRANGE32_SLOTS - 1)) {
-			if (!node->pivot[i] && i > 0)
-				break;
 			last = min + node->pivot[i];
+			if (i > 0 && node->pivot[i] == U32_MAX && last != max)
+				break;
 		} else if (!node->slot[i] && max != mt_node_max(mt, entry))
 			break;
 
@@ -11736,9 +11765,9 @@ static void mt_dump_arange32(const struct maple_tree *mt, void *entry,
 		unsigned long last = max;
 
 		if (i < (MAPLE_ARANGE32_SLOTS - 1)) {
-			if (!node->pivot[i] && i > 0)
-				break;
 			last = min + node->pivot[i];
+			if (i > 0 && node->pivot[i] == U32_MAX && last != max)
+				break;
 		} else if (!node->slot[i])
 			break;
 		if (node->slot[i])
@@ -12128,7 +12157,8 @@ static void mas_validate_limits(struct ma_state *mas)
 		if (i < mt_pivots[type]) {
 			u64 piv = ma_delta(mas_mn(mas), type, i);
 
-			if (!piv)
+			/* An unused pivot is all ones. */
+			if (piv == (node_is_32b(type) ? U32_MAX : U64_MAX))
 				continue;
 
 			pr_err(PTR_FMT "[%u] should not have piv %llu\n",
