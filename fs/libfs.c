@@ -272,7 +272,8 @@ static struct lock_class_key simple_offset_lock_class;
  */
 void simple_offset_init(struct offset_ctx *octx)
 {
-	mt_init_flags(&octx->mt, MT_FLAGS_ALLOC_RANGE);
+	/* Single offsets: the cursor allocation needs no gap tracking. */
+	mt_init(&octx->mt);
 	lockdep_set_class(&octx->mt.ma_lock, &simple_offset_lock_class);
 	octx->next_offset = DIR_OFFSET_MIN;
 }
