@@ -178,7 +178,7 @@ static int irq_find_free_area(unsigned int from, unsigned int cnt)
 
 	if (mas_empty_area(&mas, from, MAX_SPARSE_IRQS, cnt))
 		return -ENOSPC;
-	return mas.index;
+	return mas_index_ulong(&mas);
 }
 
 struct irq_desc *irq_find_desc_at_or_after(unsigned int offset)
