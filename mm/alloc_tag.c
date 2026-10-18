@@ -737,8 +737,10 @@ static void clean_unused_module_areas_locked(void)
 			continue;
 
 		/* Release area if all tags are unused */
-		start_tag = (struct alloc_tag *)(module_tags.start_addr + mas.index);
-		end_tag = (struct alloc_tag *)(module_tags.start_addr + mas.last);
+		start_tag = (struct alloc_tag *)(module_tags.start_addr +
+						 mas_index_ulong(&mas));
+		end_tag = (struct alloc_tag *)(module_tags.start_addr +
+					       mas_last_ulong(&mas));
 		if (clean_unused_counters(start_tag, end_tag))
 			mas_erase(&mas);
 	}
@@ -753,7 +755,7 @@ static bool find_aligned_area(struct ma_state *mas, unsigned long section_size,
 repeat:
 	/* Try finding exact size and hope the start is aligned */
 	if (!mas_empty_area(mas, 0, section_size - 1, prepend + size)) {
-		if (IS_ALIGNED(mas->index + prepend, align))
+		if (IS_ALIGNED(mas_index_ulong(mas) + prepend, align))
 			return true;
 
 		/* Try finding larger area to align later */
@@ -868,11 +870,11 @@ static void *reserve_module_tags(struct module *mod, unsigned long size,
 	}
 
 	/* Mark found area as reserved */
-	offset = mas.index;
+	offset = mas_index_ulong(&mas);
 	offset += prepend;
 	offset = ALIGN(offset, align);
-	if (offset != mas.index) {
-		unsigned long pad_start = mas.index;
+	if (offset != mas_index_ulong(&mas)) {
+		unsigned long pad_start = mas_index_ulong(&mas);
 
 		mas.last = offset - 1;
 		mas_store(&mas, &prepend_mod);
@@ -940,8 +942,10 @@ static void release_module_tags(struct module *mod, bool used)
 	if (!used)
 		goto release_area;
 
-	start_tag = (struct alloc_tag *)(module_tags.start_addr + mas.index);
-	end_tag = (struct alloc_tag *)(module_tags.start_addr + mas.last);
+	start_tag = (struct alloc_tag *)(module_tags.start_addr +
+					 mas_index_ulong(&mas));
+	end_tag = (struct alloc_tag *)(module_tags.start_addr +
+				       mas_last_ulong(&mas));
 	if (!clean_unused_counters(start_tag, end_tag)) {
 		struct alloc_tag *tag;
 
