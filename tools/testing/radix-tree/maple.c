@@ -17,6 +17,58 @@
 
 #include "test.h"
 
+/*
+ * The warnings of the code built in here are counted.  One a test expects
+ * (mt_warn_expected) counts in mt_warnings and is not printed; any other is
+ * printed as usual, counts in mt_unexpected and fails the run.
+ */
+static bool mt_warn_expected;
+static unsigned int mt_warnings;
+static unsigned int mt_unexpected;
+
+/* Count a warning; true when no test expects it, for it to be printed. */
+static bool mt_warned(void)
+{
+	if (mt_warn_expected) {
+		mt_warnings++;
+		return false;
+	}
+
+	mt_unexpected++;
+	return true;
+}
+
+#include <linux/bug.h>
+#undef WARN
+#undef WARN_ON
+#undef WARN_ONCE
+#undef WARN_ON_ONCE
+
+#define WARN(condition, format...) ({				\
+	int __ret_warn_on = !!(condition);			\
+								\
+	if (unlikely(__ret_warn_on) && mt_warned())		\
+		__WARN_printf(format);				\
+	unlikely(__ret_warn_on);				\
+})
+
+#define WARN_ONCE(condition, format...) ({			\
+	static int __warned;					\
+	int __ret_warn_once = !!(condition);			\
+								\
+	if (unlikely(__ret_warn_once) &&			\
+	    (mt_warn_expected || !__warned) && mt_warned()) {	\
+		__warned = true;				\
+		__WARN_printf(format);				\
+	}							\
+	unlikely(__ret_warn_once);				\
+})
+
+#define WARN_ON(condition)					\
+	WARN(condition, "assertion failed at %s:%d\n", __FILE__, __LINE__)
+#define WARN_ON_ONCE(condition)					\
+	WARN_ONCE(condition, "assertion failed at %s:%d\n", __FILE__, __LINE__)
+
 #include "../shared/maple-shim.c"
 #include "../../../lib/test_maple_tree.c"
 
@@ -39710,11 +39762,17 @@ void maple_tree_tests(void)
 #else
 int __weak main(void)
 {
+	unsigned int run, passed;
+	bool ok;
+
 	maple_tree_init();
 	maple_tree_tests();
 	rcu_barrier();
-	if (nr_allocated)
-		printf("nr_allocated = %d\n", nr_allocated);
-	return 0;
+	run = atomic_read(&maple_tree_tests_run);
+	passed = atomic_read(&maple_tree_tests_passed);
+	ok = passed == run && !mt_unexpected && !nr_allocated;
+	printf("maple_tree: %u of %u tests passed, %u unexpected warnings, %d objects leaked: %s\n",
+	       passed, run, mt_unexpected, nr_allocated, ok ? "OK" : "FAIL");
+	return ok ? 0 : EXIT_FAILURE;
 }
 #endif

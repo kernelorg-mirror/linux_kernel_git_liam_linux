@@ -2607,6 +2607,13 @@ static void mf_readers_stop(void)
 		mf_fail("%s", mf_reader_msg);
 }
 
+/* A warning nobody expected fails the run where it showed up. */
+static void mf_check_warnings(void)
+{
+	if (mt_unexpected)
+		mf_fail("%u unexpected warnings", mt_unexpected);
+}
+
 static void mf_pass(void)
 {
 	unsigned int k, h;
@@ -2697,6 +2704,7 @@ static void mf_pass(void)
 			mf_check_gaps();
 			break;
 		}
+		mf_check_warnings();
 		/* Not after every op, but before the one that broke it leaves the ring. */
 		mf.since++;
 		if (mf.rebuilt && mf.since >= MF_CHECK_EVERY)
@@ -2709,6 +2717,7 @@ static void mf_pass(void)
 	mf_readers_stop();
 	mf_validate();
 	mf_sweep_vmas();
+	mf_check_warnings();
 	h = mt_height(&mf.mt);
 	if (mf.pass == 1 || h < mf.hmin)
 		mf.hmin = h;
@@ -2786,6 +2795,7 @@ static void mf_run(unsigned int flags, bool pfn, unsigned int passes)
 	mf.target = mf.n;
 	mf.pass = 0;
 	mf_validate();
+	mf_check_warnings();
 	for (mf.pass = 1; !passes || mf.pass <= passes; mf.pass++) {
 		mf.seq = 0;
 		if (mf.pass > mf.promote && mf.top < full) {
@@ -2803,6 +2813,7 @@ static void mf_run(unsigned int flags, bool pfn, unsigned int passes)
 	rcu_barrier();
 	if (mt_nr_allocated())
 		mf_fail("%u nodes leaked", mt_nr_allocated());
+	mf_check_warnings();
 	for (i = 0; i < mf.nvmas; i++)
 		free(mf.vmas[i]);
 	mf.nvmas = 0;
