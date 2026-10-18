@@ -4295,7 +4295,8 @@ static bool mas_rev_awalk(struct ma_state *mas, unsigned long size,
 			gap = max - min + 1;
 
 		if (gap) {
-			if ((size <= gap) && (size <= mas->last - min + 1))
+			/* The window may be the whole space: no + 1. */
+			if (size <= gap && size - 1 <= mas->last - min)
 				break;
 
 			if (!gaps) {
