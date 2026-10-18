@@ -3740,6 +3740,40 @@ static noinline void __init check_range64_in_rcu(struct maple_tree *mt)
 	rcu_barrier();
 }
 
+/*
+ * mas_empty_area() continues from the state it is given.  From the first or
+ * second slot of a leaf it skipped the rest of the leaf, so an allocator
+ * reusing its state missed the gap right after what it just stored.
+ */
+static noinline void __init check_empty_area_resume(struct maple_tree *mt)
+{
+	unsigned long i, loc, next = 0;
+	MA_STATE(mas, mt, 0, 0);
+
+	for (i = 0; i < 1000; i++)
+		mtree_store(mt, i * 2, xa_mk_value(i), GFP_KERNEL);
+
+	/* From the slot of each value, the gap right after it. */
+	mtree_lock(mt);
+	for (i = 0; i < 1000; i++) {
+		mas_set(&mas, i * 2);
+		MT_BUG_ON(mt, mas_walk(&mas) != xa_mk_value(i));
+		MT_BUG_ON(mt, mas_empty_area(&mas, i * 2 + 1, ULONG_MAX, 1));
+		MT_BUG_ON(mt, mas.index != i * 2 + 1);
+	}
+
+	/* The IDs between the values, in order, from one state. */
+	mas_reset(&mas);
+	for (i = 0; i < 1000; i++) {
+		MT_BUG_ON(mt, mas_alloc_cyclic(&mas, &loc, xa_mk_value(i), 0, 1999,
+					       &next, GFP_KERNEL));
+		MT_BUG_ON(mt, loc != i * 2 + 1);
+	}
+	MT_BUG_ON(mt, mas_alloc_cyclic(&mas, &loc, mt, 0, 1999, &next,
+				       GFP_KERNEL) != -EBUSY);
+	mtree_unlock(mt);
+}
+
 static DEFINE_MTREE(tree);
 static int __init maple_tree_seed(void)
 {
@@ -4030,6 +4064,10 @@ static int __init maple_tree_seed(void)
 	mtree_destroy(&tree);
 
 	check_range64_in_rcu(&tree);
+
+	mt_init_flags(&tree, MT_FLAGS_ALLOC_RANGE);
+	check_empty_area_resume(&tree);
+	mtree_destroy(&tree);
 
 
 #if defined(BENCH)
