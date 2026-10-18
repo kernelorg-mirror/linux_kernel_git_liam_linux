@@ -932,6 +932,34 @@ static inline void mas_set(struct ma_state *mas, unsigned long index)
 	mas_set_range(mas, index, index);
 }
 
+/**
+ * mas_index_ulong() - The start of the range as an unsigned long.
+ * @mas: Maple Tree operation state.
+ *
+ * On 32-bit, an index above ULONG_MAX warns once and is truncated.
+ */
+static inline unsigned long mas_index_ulong(const struct ma_state *mas)
+{
+#ifndef CONFIG_64BIT
+	WARN_ON_ONCE(mas->index > ULONG_MAX);
+#endif
+	return (unsigned long)mas->index;
+}
+
+/**
+ * mas_last_ulong() - The end of the range as an unsigned long.
+ * @mas: Maple Tree operation state.
+ *
+ * On 32-bit, an end above ULONG_MAX warns once and is truncated.
+ */
+static inline unsigned long mas_last_ulong(const struct ma_state *mas)
+{
+#ifndef CONFIG_64BIT
+	WARN_ON_ONCE(mas->last > ULONG_MAX);
+#endif
+	return (unsigned long)mas->last;
+}
+
 static inline bool mt_external_lock(const struct maple_tree *mt)
 {
 	return (mt->ma_flags & MT_FLAGS_LOCK_MASK) == MT_FLAGS_LOCK_EXTERN;

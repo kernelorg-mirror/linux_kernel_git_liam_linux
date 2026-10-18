@@ -213,7 +213,8 @@ Initialising the maple tree is the same as in the :ref:`maple-tree-normal-api`.
 Please see above.
 
 The maple state keeps track of the range start and end in mas->index and
-mas->last, respectively.
+mas->last, respectively.  Callers working in unsigned long read them with
+mas_index_ulong() and mas_last_ulong().
 
 mas_walk() will walk the tree to the location of mas->index and set the
 mas->index and mas->last according to the range for the entry.
