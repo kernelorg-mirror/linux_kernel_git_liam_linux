@@ -299,13 +299,14 @@ node_transition_type(const enum maple_type type)
 
 /*
  * node_born_type() - The width to use for a node: the 32-bit variant of @type
- * unless the node itself must store an index above U32_MAX.
+ * unless the node spans more than U32_MAX, as its pivots are deltas from its
+ * minimum.  @type may be of either width.
  */
 static __always_inline enum maple_type
-node_born_type(const enum maple_type type, u64 max)
+node_born_type(const enum maple_type type, u64 span)
 {
-	if (max > U32_MAX)
-		return type;
+	if (span > U32_MAX)
+		return node_transition_type(type);
 
 	switch (type) {
 	case maple_leaf_64:
@@ -2975,13 +2976,16 @@ static inline bool mas_next_sibling(struct ma_state *mas)
 	return true;
 }
 
-/* The range leaf type of @mt for a leaf with a maximum of @max. */
-static inline enum maple_type mt_leaf_type(struct maple_tree *mt, u64 max)
+/*
+ * The range leaf type a dense leaf of @mt collapses to: its range is within its
+ * slots, so the 32-bit leaf.
+ */
+static inline enum maple_type mt_leaf_type(struct maple_tree *mt)
 {
 	if (mt_has_marks(mt))
-		return node_born_type(maple_mleaf_64, max);
+		return maple_mleaf_32;
 
-	return node_born_type(maple_leaf_64, max);
+	return maple_leaf_32;
 }
 
 /* The dense leaf type of @mt. */
@@ -3018,10 +3022,10 @@ static unsigned char ma_dense_count(struct maple_tree *mt, void __rcu **slots,
  * they are from fitting the range leaf it collapses to with a slot to spare.
  * A dense leaf with no excess becomes that range leaf.
  */
-static inline unsigned char mt_dense_excess(struct maple_tree *mt, u64 max,
+static inline unsigned char mt_dense_excess(struct maple_tree *mt,
 		unsigned char count)
 {
-	unsigned char fit = mt_slots[mt_leaf_type(mt, max)] - 1;
+	unsigned char fit = mt_slots[mt_leaf_type(mt)] - 1;
 
 	return count > fit ? count - fit : 0;
 }
@@ -3041,9 +3045,9 @@ static inline void ma_set_excess(struct maple_node *node, enum maple_type type,
 
 /* The ranges in a dense leaf, a run of NULLs being one, from its excess. */
 static inline unsigned char ma_dense_cnt_ranges(struct maple_tree *mt,
-		struct maple_node *node, enum maple_type type, u64 max)
+		struct maple_node *node, enum maple_type type)
 {
-	return ma_excess(node, type) + mt_slots[mt_leaf_type(mt, max)] - 1;
+	return ma_excess(node, type) + mt_slots[mt_leaf_type(mt)] - 1;
 }
 
 /*
@@ -3873,7 +3877,7 @@ static inline void cp_data_calc(struct maple_copy *cp,
 
 		/* All its entries but those the write replaces. */
 		cp->data = ma_dense_cnt_ranges(mas->tree, l_wr_mas->node,
-					       l_wr_mas->type, mas->max);
+					       l_wr_mas->type);
 		cp->data -= ma_dense_count(mas->tree, l_wr_mas->slots,
 					   mas->offset, l_wr_mas->offset_end);
 		cp->data += cp->end + 1;
@@ -3903,80 +3907,9 @@ static inline unsigned char mas_data_count(struct ma_state *mas)
 	enum maple_type type = mas_node_type(mas, mas->node);
 
 	if (unlikely(ma_is_dense(type)))
-		return ma_dense_cnt_ranges(mas->tree, mas_mn(mas), type,
-					   mas->max);
+		return ma_dense_cnt_ranges(mas->tree, mas_mn(mas), type);
 
 	return mas->end + 1;
-}
-
-static bool data_fits(struct ma_state *sib, struct ma_state *mas,
-		struct maple_copy *cp)
-{
-	unsigned char new_data;
-	enum maple_type type;
-	unsigned char space;
-	unsigned char end;
-
-	type = mas_node_type(mas, mas->node);
-	/* Data is not pushed into or out of a dense leaf. */
-	if (ma_is_dense(type) || ma_is_dense(mas_node_type(sib, sib->node)))
-		return false;
-
-	/* Nor across the 4G seam: mixed widths can take three nodes. */
-	if (node_is_32b(type) != node_is_32b(mas_node_type(sib, sib->node)))
-		return false;
-
-	end = sib->end;
-	new_data = end + 1 + cp->data;
-	space = 2 * mt_slots[type];
-	if (new_data > space)
-		return false;
-
-	/*
-	 * This is off by one by design.  The extra space is left to reduce
-	 * jitter in operations that add then remove two entries.
-	 *
-	 * end is an index while new space and data are both sizes.  Adding one
-	 * to end to convert the index to a size means that the below
-	 * calculation should be <=, but we want to keep an extra space in nodes
-	 * to reduce jitter.
-	 */
-	if (new_data < space)
-		return true;
-
-	return false;
-}
-
-static inline void push_data_sib(struct maple_copy *cp, struct ma_state *mas,
-		struct ma_state *sib, struct ma_state *parent)
-{
-
-	if (mte_is_root(mas->node))
-		goto no_push;
-
-
-	*sib = *parent;
-	if (sib->offset) {
-		sib->offset--;
-		mas_descend(sib);
-		sib->end = mas_data_end(sib);
-		if (data_fits(sib, mas, cp))	/* Push left */
-			return;
-
-		*sib = *parent;
-	}
-
-	if (sib->offset >= sib->end)
-		goto no_push;
-
-	sib->offset++;
-	mas_descend(sib);
-	sib->end = mas_data_end(sib);
-	if (data_fits(sib, mas, cp))		/* Push right*/
-		return;
-
-no_push:
-	sib->end = 0;
 }
 
 /*
@@ -3996,10 +3929,10 @@ static inline void spanning_data(struct maple_copy *cp,
 	enum maple_type type = r_wr_mas->type;
 
 	if (unlikely(ma_is_dense(type)))
-		type = mt_leaf_type(r_wr_mas->mas->tree, r_wr_mas->mas->max);
+		type = mt_leaf_type(r_wr_mas->mas->tree);
 
-	/* Data below the 4G seam may be born 32-bit: that minimum applies. */
-	type = node_born_type(type, r_wr_mas->mas->max);
+	/* The data is born to the width of its range: that minimum applies. */
+	type = node_born_type(type, r_wr_mas->mas->max - l_wr_mas->mas->min);
 	cp_data_calc(cp, l_wr_mas, r_wr_mas);
 	if (((l_wr_mas->mas->min != 0) ||
 	     (r_wr_mas->mas->max != mas_tree_max(r_wr_mas->mas))) &&
@@ -4101,23 +4034,6 @@ static u64 cp_iter_next(struct maple_copy *cp, struct maple_tree *mt,
 	return last;
 }
 
-/* cp_data_32b() for sources that include a dense leaf. */
-static unsigned char cp_data_32b_dense(struct maple_copy *cp,
-		struct maple_tree *mt, u64 min)
-{
-	struct cp_iter it;
-	unsigned char n;
-	bool null;
-
-	cp_iter_start(&it, cp, min);
-	for (n = 0; n < cp->data; n++) {
-		if (cp_iter_next(cp, mt, &it, &null) > U32_MAX)
-			break;
-	}
-
-	return n;
-}
-
 /*
  * cp_dense_ends() - Could the leading or the trailing entries be dense?
  * @cp: The maple copy node
@@ -4171,8 +4087,10 @@ static bool cp_dense_ends(struct maple_copy *cp, u64 min, unsigned char cap,
  * leaf holds, with dense leaves where the entries allow.
  * @cp: The maple copy node
  * @mas: The maple state
- * @mt: The range leaf type
+ * @mt: The range leaf type the data is sized to
  * @min: The first index of the data
+ * @lead32: The leading entries a 32-bit leaf holds
+ * @trail32: The trailing entries a 32-bit leaf holds
  *
  * A dense leaf takes single indexes and NULLs that together cover no more than
  * its slots, and only when they are more entries than the range leaf holds.
@@ -4187,15 +4105,16 @@ static bool cp_dense_ends(struct maple_copy *cp, u64 min, unsigned char cap,
  * which is out of line: its iterators are not in the frame of every split.
  */
 static noinline bool dst_size_dense(struct maple_copy *cp, struct ma_state *mas,
-		enum maple_type mt, u64 min, unsigned char n32)
+		enum maple_type mt, u64 min, unsigned char lead32,
+		unsigned char trail32)
 {
 	enum maple_type dense = mt_dense_type(mas->tree);
 	unsigned char slots = mt_slots[dense];
 	/* A range leaf is left with room to lose an entry. */
 	int low = mt_min_slots[mt] + 2;
 	int cap = mt_slots[mt];
-	/* Leading entries below 4G would collapse to a 32-bit leaf. */
-	int cap32 = mt_slots[node_born_type(node_transition_type(mt), 0)];
+	/* A dense group is within 4G of its end: it would be a 32-bit leaf. */
+	int cap32 = mt_slots[node_born_type(mt, 0)];
 	int data = cp->data;
 	int lead = 0, trail, a, b, r;
 	struct cp_iter head, tail;
@@ -4237,10 +4156,10 @@ static noinline bool dst_size_dense(struct maple_copy *cp, struct ma_state *mas,
 		return true;
 	}
 
-	/* Dense then range. */
+	/* Dense then range; a range leaf within 4G of its end is 32-bit. */
 	cp->d_count = 2;
 	a = min(lead, data - low);
-	if (a > (a <= n32 ? cap32 : cap) && data - a <= cap) {
+	if (a > cap32 && data - a <= (data - a <= trail32 ? cap32 : cap)) {
 		cp->dst[0].mt = dense;
 		cp->dst[0].size = a;
 		cp->dst[1].size = data - a;
@@ -4249,7 +4168,7 @@ static noinline bool dst_size_dense(struct maple_copy *cp, struct ma_state *mas,
 
 	/* Range then dense. */
 	b = min(trail, data - low);
-	if (b > cap && data - b <= cap) {
+	if (b > cap32 && data - b <= (data - b <= lead32 ? cap32 : cap)) {
 		cp->dst[1].mt = dense;
 		cp->dst[0].size = data - b;
 		cp->dst[1].size = b;
@@ -4257,8 +4176,8 @@ static noinline bool dst_size_dense(struct maple_copy *cp, struct ma_state *mas,
 	}
 
 	/* Two dense leaves. */
-	a = min(lead, data - cap - 1);
-	if (a > (a <= n32 ? cap32 : cap) && data - a <= trail) {
+	a = min(lead, data - cap32 - 1);
+	if (a > cap32 && data - a <= trail) {
 		cp->dst[0].mt = dense;
 		cp->dst[1].mt = dense;
 		cp->dst[0].size = a;
@@ -4271,10 +4190,10 @@ static noinline bool dst_size_dense(struct maple_copy *cp, struct ma_state *mas,
 
 	/* Dense, range, dense. */
 	cp->d_count = 3;
-	a = min(lead, data - low - cap - 1);
+	a = min(lead, data - low - cap32 - 1);
 	b = min(trail, data - a - low);
 	r = data - a - b;
-	if (a > (a <= n32 ? cap32 : cap) && b > cap && r <= cap) {
+	if (a > cap32 && b > cap32 && r <= cap) {
 		cp->dst[0].mt = dense;
 		cp->dst[2].mt = dense;
 		cp->dst[0].size = a;
@@ -4286,7 +4205,7 @@ static noinline bool dst_size_dense(struct maple_copy *cp, struct ma_state *mas,
 	/* Dense then two range leaves. */
 	a = min(lead, data - 2 * low);
 	r = data - a;
-	if (a > (a <= n32 ? cap32 : cap) && r <= 2 * cap) {
+	if (a > cap32 && r <= 2 * cap) {
 		cp->dst[0].mt = dense;
 		cp->dst[0].size = a;
 		cp->dst[1].size = (r + 1) / 2;
@@ -4297,7 +4216,7 @@ static noinline bool dst_size_dense(struct maple_copy *cp, struct ma_state *mas,
 	/* Two range leaves then dense. */
 	b = min(trail, data - 2 * low);
 	r = data - b;
-	if (b > cap && r <= 2 * cap) {
+	if (b > cap32 && r <= 2 * cap) {
 		cp->dst[2].mt = dense;
 		cp->dst[0].size = (r + 1) / 2;
 		cp->dst[1].size = r / 2;
@@ -4309,7 +4228,18 @@ static noinline bool dst_size_dense(struct maple_copy *cp, struct ma_state *mas,
 	if (data == 2 * cap + 1)
 		return false;
 
-	/* More than that only comes out of a dense leaf: three range leaves. */
+	/*
+	 * More than that out of range leaves is data over 4G pushed with the
+	 * 32-bit room, which the wide layout sizes; out of a dense leaf it is
+	 * three range leaves.
+	 */
+	for (k = 0; k < cp->s_count; k++) {
+		if (ma_is_dense(cp->src[k].mt))
+			break;
+	}
+	if (k == cp->s_count)
+		return false;
+
 	WARN_ON_ONCE(data > 3 * cap);
 	cp->dst[0].size = (data + 2) / 3;
 	cp->dst[1].size = (data + 1) / 3;
@@ -4345,51 +4275,169 @@ static inline bool cp_data_null(struct maple_copy *cp, struct maple_tree *mt,
 }
 
 /*
- * cp_data_32b() - The leading entries, across the sources, whose pivot fits a
- * 32-bit node.
+ * cp_ends_32b() - The leading and the trailing entries, across the sources,
+ * that a 32-bit node holds, for data that spans more than 4G.
  * @cp: The maple copy node
  * @mt: The maple tree
  * @min: The first index of the data
+ * @lead: Set to the leading entries ending within U32_MAX of @min
+ * @trail: Set to the trailing entries starting within U32_MAX of the data max
  *
- * Data starting above the 4G seam has none and data ending below it is all of
- * them.  Otherwise a source below the seam counts whole and the pivots of the
- * one across it are read; the entries are counted where a source is a dense
- * leaf.
+ * A node's range grows with its entries, so the entries that fit a 32-bit node
+ * are a prefix and a suffix of the data; the two can overlap.  The walk stops
+ * once both are known.
  */
-static inline unsigned char cp_data_32b(struct maple_copy *cp,
-		struct maple_tree *mt, u64 min)
+static void cp_ends_32b(struct maple_copy *cp, struct maple_tree *mt, u64 min,
+		unsigned char *lead, unsigned char *trail)
 {
-	struct ma_layout l;
-	unsigned char n = 0;
-	u64 index = min;
-	unsigned char s, off;
+	u64 max = cp->src[cp->s_count - 1].max;
+	struct cp_iter it;
+	unsigned char k;
+	u64 first, last;
+	bool null;
 
-	if (min > U32_MAX)
-		return 0;
-
-	if (cp->src[cp->s_count - 1].max <= U32_MAX)
-		return cp->data;
-
-	for (s = 0; ; s++) {
-		if (unlikely(ma_is_dense(cp->src[s].mt)))
-			return cp_data_32b_dense(cp, mt, min);
-
-		if (cp->src[s].max > U32_MAX)
+	*lead = 0;
+	*trail = 0;
+	cp_iter_start(&it, cp, min);
+	for (k = 0; k < cp->data; k++) {
+		first = it.next;
+		last = cp_iter_next(cp, mt, &it, &null);
+		if (last - min <= U32_MAX)
+			*lead = k + 1;
+		else if (*trail)
 			break;
 
-		n += cp->src[s].end - cp->src[s].start + 1;
-		index = cp->src[s].max + 1;
+		if (!*trail && first >= max - U32_MAX)
+			*trail = cp->data - k;
+	}
+}
+
+/*
+ * cp_span() - The range of entries @from to @to of the data, across the
+ * sources.
+ */
+static u64 cp_span(struct maple_copy *cp, struct maple_tree *mt, u64 min,
+		unsigned char from, unsigned char to)
+{
+	struct cp_iter it;
+	u64 first, last;
+	unsigned char k;
+	bool null;
+
+	cp_iter_start(&it, cp, min);
+	for (k = 0; k < from; k++)
+		cp_iter_next(cp, mt, &it, &null);
+
+	first = it.next;
+	do
+		last = cp_iter_next(cp, mt, &it, &null);
+	while (++k <= to);
+
+	return last - first;
+}
+
+/*
+ * dst_size_wide() - Size the destinations for data that spans more than 4G
+ * with 32-bit nodes at its ends.
+ * @cp: The maple copy node
+ * @mas: The maple state
+ * @mt: The 64-bit type
+ * @min: The first index of the data
+ * @lead32: The leading entries a 32-bit node holds
+ * @trail32: The trailing entries a 32-bit node holds
+ *
+ * An end is a 32-bit node when it holds more than the 32-bit minimum, the
+ * larger one first; the rest between them keeps the 64-bit minimum, taking
+ * entries from the ends when it must, and is 64-bit unless its own range is
+ * within 4G and it holds more than the 32-bit minimum too.  The nodes are as
+ * many as 64-bit nodes of the data would be: two, or three when the data is
+ * more than two hold.  The types are set here.  Out of line: the data at a
+ * gap over 4G is the only caller.
+ *
+ * Return: true if the destinations are sized, false to size 64-bit nodes the
+ * usual way.
+ */
+static noinline bool dst_size_wide(struct maple_copy *cp, struct ma_state *mas,
+		enum maple_type mt, u64 min, unsigned char lead32,
+		unsigned char trail32)
+{
+	enum maple_type mt32 = node_born_type(mt, 0);
+	bool mid32;
+	/* The fewest entries a node is made with. */
+	int low32 = mt_min_slots[mt32] + 1;
+	int low = mt_min_slots[mt] + 1;
+	int cap = mt_slots[mt];
+	int data = cp->data;
+	bool two = false;	/* The rest is two nodes */
+	int a, b, m, i;
+
+	a = min_t(int, lead32, mt_slots[mt32] - 1);
+	b = min_t(int, trail32, mt_slots[mt32] - 1);
+	if (a < low32)
+		a = 0;
+	if (b < low32)
+		b = 0;
+
+	if (a + b >= data && data >= 2 * low32) {
+		/* Two 32-bit nodes, as even as the ends allow. */
+		a = clamp((data + 1) / 2, max(data - b, low32),
+			  min(a, data - low32));
+		b = data - a;
+		m = 0;
+	} else if (a && b && data > 2 * cap && a + b >= data - cap) {
+		/* Both ends, the rest between them; the larger end gives. */
+		m = max(low, data - a - b);
+		if (a >= b) {
+			a = max(data - m - b, low32);
+			b = data - m - a;
+		} else {
+			b = max(data - m - a, low32);
+			a = data - m - b;
+		}
+	} else {
+		/* The larger end, the rest in one 64-bit node or in two. */
+		bool left = a >= b;
+		int end = left ? a : b;
+
+		if (!end)
+			return false;
+
+		end = min(end, data - low);
+		m = data - end;
+		if (m > cap && data > 2 * cap) {
+			end = min(end, data - 2 * low);
+			m = data - end;
+			two = true;
+		}
+		if (end < low32 || m > (two ? 2 : 1) * cap)
+			return false;
+
+		a = left ? end : 0;
+		b = left ? 0 : end;
 	}
 
-	ma_layout_of(&l, cp->src[s].node, cp->src[s].mt);
-	l.min = cp_src_min(cp, s, index);
-	for (off = cp->src[s].start; off < cp->src[s].end; off++) {
-		if (ma_layout_pivot(&l, off) > U32_MAX)
-			break;
-		n++;
+	mid32 = m && cp_span(cp, mas->tree, min, a, data - b - 1) <= U32_MAX;
+	i = 0;
+	if (a) {
+		cp->dst[i].mt = mt32;
+		cp->dst[i++].size = a;
 	}
-
-	return n;
+	if (two) {
+		cp->dst[i].mt = mid32 && (m + 1) / 2 > mt_min_slots[mt32] ?
+				mt32 : mt;
+		cp->dst[i++].size = (m + 1) / 2;
+		cp->dst[i].mt = mid32 && m / 2 > mt_min_slots[mt32] ? mt32 : mt;
+		cp->dst[i++].size = m / 2;
+	} else if (m) {
+		cp->dst[i].mt = mid32 && m > mt_min_slots[mt32] ? mt32 : mt;
+		cp->dst[i++].size = m;
+	}
+	if (b) {
+		cp->dst[i].mt = mt32;
+		cp->dst[i++].size = b;
+	}
+	cp->d_count = i;
+	return true;
 }
 
 /*
@@ -4398,36 +4446,50 @@ static inline unsigned char cp_data_32b(struct maple_copy *cp,
  * @mas: The maple state
  * @mt: The source node type
  * @min: The first index of the data
+ *
+ * A destination is 32-bit when its range is within 4G and it holds more than
+ * the 32-bit minimum, or when every source was 32-bit: a node short of that
+ * minimum is 64-bit, whose minimum it meets, so a rebalance finds every node
+ * sufficient; the root alone may be under its minimum.  Data within 4G is
+ * sized to the 32-bit slots.  Data over 4G is sized to the 64-bit slots, with
+ * as much of it as can be in 32-bit nodes at its ends: only then are the
+ * entries walked to count what those hold.
  */
 static inline
 void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt,
 		u64 min)
 {
 	enum maple_type mt64, mt32;
-	unsigned char n32;
+	unsigned char lead32, trail32;
 	bool src32;
 	unsigned char i, n;
 
 	/* A dense leaf is rebuilt from the range leaf type of the tree. */
 	if (unlikely(ma_is_dense(mt)))
-		mt = mt_leaf_type(mas->tree, U64_MAX);
+		mt = mt_leaf_type(mas->tree);
 
 	/* Only dst_size_dense() makes a destination dense. */
 	cp->dst[0].mt = cp->dst[1].mt = cp->dst[2].mt = mt;
 	mt64 = node_transition_type(mt);
 	mt32 = node_born_type(mt64, 0);
-	n32 = cp_data_32b(cp, mas->tree, min);
 	/* Data is 1 indexed, every src has +1 added.  */
 
+	/* Size by the width of the data's range; each dst is born to its own. */
+	if (cp->src[cp->s_count - 1].max - min <= U32_MAX) {
+		lead32 = trail32 = cp->data;
+		mt = mt32;
+	} else {
+		cp_ends_32b(cp, mas->tree, min, &lead32, &trail32);
+		mt = mt64;
+	}
+
 	/* Widths only stay as they are when the whole write is 32-bit. */
-	src32 = n32 == cp->data;
+	src32 = mt == mt32;
 	for (i = 0; src32 && i < cp->s_count; i++) {
 		if (cp->src[i].mt != maple_copy && !node_is_32b(cp->src[i].mt))
 			src32 = false;
 	}
 
-	/* Size by the width of the last entry; each dst is born to its own max. */
-	mt = (n32 == cp->data) ? mt32 : mt64;
 	if (cp->data <= mt_slots[mt]) {
 		cp->split = cp->data - 1;
 		cp->d_count = 1;
@@ -4435,10 +4497,13 @@ void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt,
 	}
 
 	if (ma_is_leaf(mt) &&
-	    cp_dense_ends(cp, min, mt_slots[mt],
+	    cp_dense_ends(cp, min, mt_slots[mt32],
 			  mt_slots[mt_dense_type(mas->tree)]) &&
-	    dst_size_dense(cp, mas, mt, min, n32))
-		goto alloc;
+	    dst_size_dense(cp, mas, mt, min, lead32, trail32))
+		goto widths;
+
+	if (mt == mt64 && dst_size_wide(cp, mas, mt, min, lead32, trail32))
+		return;
 
 	cp->split = (cp->data - 1) / 2;
 	cp->d_count = 2;
@@ -4454,33 +4519,6 @@ void dst_setup(struct maple_copy *cp, struct ma_state *mas, enum maple_type mt,
 		goto node_setup;
 	}
 
-	/* A 32-bit prefix insufficient for a node of its own goes with the rest. */
-	if (n32 > mt_min_slots[mt32] && n32 != cp->data) {
-		/*
-		 * Mixed widths only straddle the 4G seam: keep what fits 32-bit
-		 * in one node and split just the 64-bit remainder, which is at
-		 * most mt_slots[mt64] + 2.
-		 */
-		unsigned char a = n32, r;
-
-		if (a > mt_slots[mt32] - 1)
-			a = mt_slots[mt32] - 1;
-		/* The 64-bit rest needs its own minimum too. */
-		if (a > cp->data - mt_min_slots[mt64] - 1)
-			a = cp->data - mt_min_slots[mt64] - 1;
-		r = cp->data - a;
-		cp->dst[0].size = a;
-		if (r < mt_slots[mt64]) {
-			cp->d_count = 2;
-			cp->dst[1].size = r;
-		} else {
-			cp->d_count = 3;
-			cp->dst[1].size = (r - 1) / 2 + 1;
-			cp->dst[2].size = r - cp->dst[1].size;
-		}
-		goto alloc;
-	}
-
 	/*
 	 * 3-way only happens on a triple-split spanning store of two full
 	 * same-type nodes, so cp->data == 2 * mt_slots[mt] + 1.  Fill the left
@@ -4494,18 +4532,18 @@ node_setup:
 		cp->dst[i].size = cp->split + 1;
 	cp->dst[i].size = cp->data - i * (cp->split + 1);
 
-alloc:
+widths:
 	n = 0;
 	for (i = 0; i < cp->d_count; i++) {
-		n += cp->dst[i].size;
-		/* Otherwise a 32-bit node needs its own minimum. */
-		if (likely(!ma_is_dense(cp->dst[i].mt)))
-			cp->dst[i].mt = (n <= n32 &&
-					 (src32 || cp->dst[i].size >
-						   mt_min_slots[mt32])) ?
-					mt32 : mt64;
+		unsigned char size = cp->dst[i].size;
 
-		cp->dst[i].node = ma_mnode_ptr(mas_pop_node(mas));
+		n += size;
+		/* Within 4G of its end of the data, with its own minimum. */
+		if (likely(!ma_is_dense(cp->dst[i].mt)))
+			cp->dst[i].mt = ((n <= lead32 ||
+					  n - size >= cp->data - trail32) &&
+					 (src32 || size > mt_min_slots[mt32])) ?
+					mt32 : mt64;
 	}
 }
 
@@ -4751,7 +4789,7 @@ static inline void cp_dst_finalise(struct maple_tree *mt,
 		const struct ma_layout *l, unsigned char count, u64 max)
 {
 	if (unlikely(ma_is_dense(l->t.type)))
-		ma_layout_set_meta(l, 0, mt_dense_excess(mt, max, count));
+		ma_layout_set_meta(l, 0, mt_dense_excess(mt, count));
 	else
 		ma_finalise(l, count);
 }
@@ -4783,6 +4821,8 @@ void cp_data_write(struct maple_copy *cp, struct ma_state *mas, u64 min)
 		d_max = 0;
 		d_mt = cp->dst[d].mt;
 		dst_size = cp->dst[d].size;
+		/* The sizing may be tried and undone, so the node is taken here. */
+		cp->dst[d].node = ma_mnode_ptr(mas_pop_node(mas));
 		ma_layout_of(&dl, cp->dst[d].node, d_mt);
 		dl.min = min;
 		if (unlikely(ma_is_dense(d_mt)))
@@ -4922,6 +4962,16 @@ static inline u64 cp_data_min(struct ma_state *mas, struct ma_state *sib)
 	return mas->min;
 }
 
+/* Set the sources up, @sib among them when its end is set, and size the dsts. */
+static inline void cp_size(struct maple_copy *cp, struct ma_wr_state *wr_mas,
+		struct ma_state *sib)
+{
+	struct ma_state *mas = wr_mas->mas;
+
+	multi_src_setup(cp, wr_mas, wr_mas, sib);
+	dst_setup(cp, mas, wr_mas->type, cp_data_min(mas, sib));
+}
+
 static inline bool cp_is_new_root(struct maple_copy *cp, struct ma_state *mas)
 {
 	/* Whole tree = 0..physical ceiling; U64_MAX also = a promoting root. */
@@ -4941,6 +4991,7 @@ static inline bool cp_is_new_root(struct maple_copy *cp, struct ma_state *mas)
 		/* A new root is born to the width of its data. */
 		dst_setup(cp, mas, mt, cp->min);
 		mt = cp->dst[0].mt;
+		cp->dst[0].node = ma_mnode_ptr(mas_pop_node(mas));
 		ma_layout_of(&sl, cp->src[0].node, maple_copy);
 		sl.min = 0;
 		sl.max = cp->max;
@@ -5998,54 +6049,108 @@ static inline void mas_wr_slot_store(struct ma_wr_state *wr_mas)
 }
 
 /*
- * mas_dense_sib() - Is the leaf before or the leaf after @mas->node dense?
- * @mas: The maple state of the write, which stays where it is
+ * mas_wr_span_walk() - Walk both sides of a spanning store in step.
+ * @l_wr: The left write state, at the node the write spans
+ * @r_wr: The right write state, at the same node with the right index
  *
- * Out of line, as mas_wr_lookup(), for the state it walks with.
+ * Return: true if a level has a 32-bit node on either side while the two sides
+ * together span more than 4G.  Only such a level can need three nodes without
+ * both sides being full: its data can be more than two 64-bit nodes hold, and
+ * no 32-bit node holds it all.
  */
-static noinline bool mas_dense_sib(struct ma_state *mas)
+static bool mas_wr_span_walk(struct ma_wr_state *l_wr, struct ma_wr_state *r_wr)
 {
-	MA_STATE(sib, mas->tree, 0, 0);
+	struct ma_state *l_mas = l_wr->mas;
+	struct ma_state *r_mas = r_wr->mas;
+	bool mixed = false;
 
-	if (mas->max != mas_tree_max(mas)) {
-		mas_set(&sib, mas->max + 1);
-		mas_walk(&sib);
-		if (mte_base_type(sib.node) == maple_dense)
-			return true;
+	while (true) {
+		mas_wr_walk_descend(l_wr);
+		mas_wr_walk_descend(r_wr);
+		if ((node_is_32b(l_wr->type) || node_is_32b(r_wr->type)) &&
+		    r_mas->max - l_mas->min > U32_MAX)
+			mixed = true;
+
+		l_wr->content = mas_slot_locked(l_mas, l_wr->slots, l_mas->offset);
+		r_wr->content = mas_slot_locked(r_mas, r_wr->slots, r_mas->offset);
+		if (ma_is_leaf(l_wr->type))
+			return mixed;
+
+		mas_wr_walk_traverse(l_wr);
+		mas_wr_walk_traverse(r_wr);
 	}
-
-	if (!mas->min)
-		return false;
-
-	mas_set(&sib, mas->min - 1);
-	mas_walk(&sib);
-	return mte_base_type(sib.node) == maple_dense;
 }
 
 /*
- * mas_wr_spans_seam() - Does the data of a spanning store lie on both sides
- * of the 4G seam?
- * @wr_mas: The maple write state, at the node the write spans
+ * mas_wr_span_setup() - Settle the range and path of a spanning store.
+ * @wr_mas: The maple write state, stopped at the node the write spans
  *
- * Every level below holds data from the two children at the ends of the
- * write, so only then can a level mix widths and come out as three nodes.
+ * The store takes the node holding last + 1 as its right side, to join a NULL
+ * there and to replace a node the write ends on; a NULL also grows over a NULL
+ * ending the previous node.  Do the same here so the heights recorded by the
+ * walk, and the nodes per level, are those the store will use.  Only a write
+ * into the last slot of a full left leaf whose right side starts a full node
+ * can 3-way split; a level whose sides mix widths over more than 4G is treated
+ * as if it could.
  */
-static bool mas_wr_spans_seam(struct ma_wr_state *wr_mas)
+static void mas_wr_span_setup(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
-	unsigned char offset = mas->offset;
+	struct ma_state l_mas, r_mas;
+	MA_WR_STATE(l_wr, &l_mas, wr_mas->entry);
+	MA_WR_STATE(r_wr, &r_mas, wr_mas->entry);
+	u64 last = mas->last;
+	bool mixed;
 
-	if (!mas->root_64b || wr_mas->r_min > U32_MAX)
-		return false;
+	if (mas->last < mas_tree_max(mas))
+		mas->last++;
 
-	/* The right side is the child holding the entry after the write. */
-	while (offset < mas->end && wr_piv(wr_mas, offset) <= mas->last)
-		offset++;
+walk:
+	/* Walk to the right side the store will use for the true heights. */
+	mas_reset(mas);
+	wr_mas->sufficient_height = 0;
+	wr_mas->vacant_height = 0;
+	wr_mas->content = mas_start_wr(mas);
+	mas_wr_walk(wr_mas);
+	l_mas = *mas;
+	r_mas = *mas;
+	r_mas.index = r_mas.last;
+	mixed = mas_wr_span_walk(&l_wr, &r_wr);
 
-	if (offset < mas->end)
-		return wr_piv(wr_mas, offset) > U32_MAX;
+	if (!wr_mas->entry) {
+		if (!r_wr.content && r_wr.r_max > last) {
+			last = r_wr.r_max;
+			/*
+			 * The NULL ends the node, so the store's right side is the
+			 * node after it: size from there.
+			 */
+			if (last == r_mas.max && last < mas_tree_max(mas)) {
+				mas->last = last + 1;
+				goto walk;
+			}
+		}
 
-	return mas->max > U32_MAX;
+		/* Growing left into the previous node may move the span up. */
+		if (l_wr.content && !l_mas.offset &&
+		    l_mas.index == l_wr.r_min && l_mas.index &&
+		    mas_prev_is_null(&l_mas)) {
+			mas->index = l_mas.index;
+			goto walk;
+		}
+	}
+	mas->last = last;
+
+	/* A dense leaf can hold three range leaves of entries. */
+	if (mixed || ma_is_dense(l_wr.type) || ma_is_dense(r_wr.type))
+		wr_mas->span_nodes = 3;
+	else if (l_mas.offset == l_mas.end &&
+		 l_mas.end == mt_slots[l_wr.type] - 1 &&
+		 !r_mas.offset && r_mas.end == mt_slots[r_wr.type] - 1 &&
+		 l_wr.r_min < mas->index &&
+		 (wr_mas->entry || (l_wr.content && r_wr.content)))
+		wr_mas->span_nodes = 3;
+	else
+		wr_mas->span_nodes = 2;
 }
 
 /*
@@ -6098,22 +6203,9 @@ static noinline bool mas_wr_extend_null(struct ma_wr_state *wr_mas)
 		}
 	}
 
-	if (spanning) {
-		/* NULL expansion cannot cause two inserts */
-		wr_mas->span_nodes = 2;
-		/* A dense leaf can hold three range leaves of entries. */
-		if (mas_dense_sib(mas))
-			wr_mas->span_nodes = 3;
-
-		wr_mas->sufficient_height = 0;
-		wr_mas->vacant_height = 0;
-		mas_reset(mas);
-		wr_mas->content = mas_start_wr(mas);
-		mas_wr_walk(wr_mas);
-		/* Data on both sides of the 4G seam can be three nodes a level. */
-		if (mas_wr_spans_seam(wr_mas))
-			wr_mas->span_nodes = 3;
-	}
+	/* The store spans: its range and nodes are settled as for any other. */
+	if (spanning)
+		mas_wr_span_setup(wr_mas);
 
 	return spanning;
 }
@@ -6213,7 +6305,7 @@ static inline unsigned char mas_wr_new_end(struct ma_wr_state *wr_mas)
 static noinline enum store_type mas_wr_dense_type(struct ma_wr_state *wr_mas)
 {
 	struct ma_state *mas = wr_mas->mas;
-	enum maple_type leaf = mt_leaf_type(mas->tree, mas->max);
+	enum maple_type leaf = mt_leaf_type(mas->tree);
 	void __rcu **slots = wr_mas->slots;
 	unsigned char count, values = 0, i;
 	bool spanning = false;
@@ -6276,8 +6368,8 @@ static noinline enum store_type mas_wr_dense_type(struct ma_wr_state *wr_mas)
 	}
 
 	/* The ranges after the write: the new entry replaces @count of them. */
-	new_count = ma_dense_cnt_ranges(mas->tree, wr_mas->node, wr_mas->type,
-					mas->max) + 1 - count;
+	new_count = ma_dense_cnt_ranges(mas->tree, wr_mas->node, wr_mas->type) +
+		    1 - count;
 	if (wr_mas->r_min < mas->index)
 		new_count++;
 
@@ -6586,8 +6678,8 @@ static bool push_dense_left(struct maple_copy *cp, struct ma_wr_state *wr_mas,
  * @parent: The parent of the leaf
  *
  * As push_dense_left(), for the last entries of the leaf: the dense leaf starts
- * that much earlier.  The data ends in the dense leaf, so the leaf type of its
- * max sizes what stays behind.
+ * that much earlier.  What stays behind is within the leaf's range, so the
+ * width of that range sizes it.
  */
 static bool push_dense_right(struct maple_copy *cp, struct ma_wr_state *wr_mas,
 		struct ma_state *sib, struct ma_state *parent)
@@ -6607,7 +6699,8 @@ static bool push_dense_right(struct maple_copy *cp, struct ma_wr_state *wr_mas,
 	mas_descend(sib);
 	sib->end = 0;
 	slots = mt_slots[mas_node_type(sib, sib->node)];
-	cap = mt_slots[mt_leaf_type(mas->tree, sib->max)];
+	cap = mt_slots[node_born_type(mt_leaf_type(mas->tree),
+				      mas->max - mas->min)];
 	if (sib->max - mas->min < slots || cp->data <= cap)
 		return false;
 
@@ -6674,8 +6767,132 @@ static bool merge_dense(struct maple_copy *cp, struct ma_wr_state *wr_mas,
 }
 
 /*
+ * data_fits() - Could the data and a sibling's be two nodes?
+ * @sib: The sibling
+ * @mas: The maple state of the node
+ * @cp: The maple copy node
+ *
+ * Two 64-bit nodes rebuilt over more than 4G stay 64-bit.  With a 32-bit node
+ * among them an end can stay 32-bit, or go dense, so the sizing is given the
+ * 32-bit room to try; what it cannot fit in two nodes is not pushed.
+ */
+static bool data_fits(struct ma_state *sib, struct ma_state *mas,
+		struct maple_copy *cp)
+{
+	enum maple_type type = mas_node_type(mas, mas->node);
+	enum maple_type stype = mas_node_type(sib, sib->node);
+	unsigned char new_data;
+	unsigned char space;
+	unsigned char end;
+	u64 span;
+
+	/* Data is not pushed into or out of a dense leaf. */
+	if (ma_is_dense(type) || ma_is_dense(stype))
+		return false;
+
+	if (sib->max < mas->min)
+		span = mas->max - sib->min;
+	else
+		span = sib->max - mas->min;
+
+	if (span > U32_MAX && !node_is_32b(type) && !node_is_32b(stype))
+		type = node_transition_type(type);
+	else
+		type = node_born_type(type, 0);
+
+	end = sib->end;
+	new_data = end + 1 + cp->data;
+	space = 2 * mt_slots[type];
+	if (new_data > space)
+		return false;
+
+	/*
+	 * This is off by one by design.  The extra space is left to reduce
+	 * jitter in operations that add then remove two entries.
+	 *
+	 * end is an index while new space and data are both sizes.  Adding one
+	 * to end to convert the index to a size means that the below
+	 * calculation should be <=, but we want to keep an extra space in nodes
+	 * to reduce jitter.
+	 */
+	if (new_data < space)
+		return true;
+
+	return false;
+}
+
+/*
+ * push_sized() - Size the destinations for the data with a sibling's.
+ * @cp: The maple copy node
+ * @wr_mas: The maple write state
+ * @sib: The sibling
+ *
+ * A push that would take three nodes gains nothing over a split and has no
+ * node for the third: the sizing is undone.
+ *
+ * Return: true if the destinations are two or fewer.
+ */
+static bool push_sized(struct maple_copy *cp, struct ma_wr_state *wr_mas,
+		struct ma_state *sib)
+{
+	unsigned char data = cp->data;
+
+	cp->data += mas_data_count(sib);
+	cp_size(cp, wr_mas, sib);
+	if (cp->d_count <= 2)
+		return true;
+
+	cp->data = data;
+	return false;
+}
+
+/*
+ * push_data_sib() - Push the data into a sibling when two nodes hold it all.
+ * @cp: The maple copy node
+ * @wr_mas: The maple write state
+ * @sib: Set to the sibling pushed into, its end 0 when there is none
+ * @parent: The parent of the node
+ *
+ * The left sibling is tried first.
+ *
+ * Return: true if the destinations are sized with the sibling.
+ */
+static bool push_data_sib(struct maple_copy *cp, struct ma_wr_state *wr_mas,
+		struct ma_state *sib, struct ma_state *parent)
+{
+	struct ma_state *mas = wr_mas->mas;
+
+	if (mte_is_root(mas->node))
+		goto no_push;
+
+	*sib = *parent;
+	if (sib->offset) {
+		sib->offset--;
+		mas_descend(sib);
+		sib->end = mas_data_end(sib);
+		if (data_fits(sib, mas, cp) && push_sized(cp, wr_mas, sib))
+			return true;
+
+		*sib = *parent;
+	}
+
+	if (sib->offset >= sib->end)
+		goto no_push;
+
+	sib->offset++;
+	mas_descend(sib);
+	sib->end = mas_data_end(sib);
+	if (data_fits(sib, mas, cp) && push_sized(cp, wr_mas, sib))
+		return true;
+
+no_push:
+	sib->end = 0;
+	return false;
+}
+
+/*
  * rebalance_data() - Calculate the @cp data, populate @sib if insufficient or
- * if the data can be pushed into a sibling.
+ * if the data can be pushed into a sibling, and size the destinations.
  * @cp: The maple copy node
  * @wr_mas: The left write maple state
  * @sib: The maple state of the sibling.
@@ -6696,33 +6913,37 @@ static inline void rebalance_data(struct maple_copy *cp,
 				goto use_sib;
 
 			if (cp_fits_dense(cp, wr_mas, sib))
-				return;
+				goto size;
 
 			if (push_dense_left(cp, wr_mas, sib, parent) ||
 			    push_dense_right(cp, wr_mas, sib, parent))
 				goto use_sib;
 		}
 
-		push_data_sib(cp, wr_mas->mas, sib, parent);
-		if (sib->end)
-			goto use_sib;
-	} else if (cp->data <= mt_min_slots[wr_mas->type]) {
-		if ((wr_mas->mas->min != 0) ||
-		    (wr_mas->mas->max != mas_tree_max(wr_mas->mas))) {
-			rebalance_sib(parent, sib);
-			goto use_sib;
-		}
+		if (push_data_sib(cp, wr_mas, sib, parent))
+			return;
+
+		goto size;
 	}
 
-	return;
+	if (cp->data <= mt_min_slots[wr_mas->type] &&
+	    (wr_mas->mas->min != 0 ||
+	     wr_mas->mas->max != mas_tree_max(wr_mas->mas))) {
+		rebalance_sib(parent, sib);
+		goto use_sib;
+	}
+
+	goto size;
 
 use_sib:
 	cp->data += mas_data_count(sib);
+size:
+	cp_size(cp, wr_mas, sib);
 }
 
 /*
  * split_data() - Calculate the @cp data, populate @sib if the data can be
- * pushed into a sibling.
+ * pushed into a sibling, and size the destinations.
  * @cp: The maple copy node
  * @wr_mas: The left write maple state
  * @sib: The maple state of the sibling.
@@ -6736,30 +6957,30 @@ static inline void split_data(struct maple_copy *cp,
 		struct ma_state *parent)
 {
 	cp_data_calc(cp, wr_mas, wr_mas);
-	if (cp->data <= mt_slots[wr_mas->type]) {
-		sib->end = 0;
-		return;
-	}
+	sib->end = 0;
+	if (cp->data <= mt_slots[wr_mas->type])
+		goto size;
 
 	if (ma_is_leaf(wr_mas->type)) {
 		/* A leaf that can turn into one dense leaf needs no sibling. */
 		if (cp_fits_dense(cp, wr_mas, sib))
-			return;
+			goto size;
 
 		/* A dense leaf beside it takes what it has room for. */
-		if (push_dense_left(cp, wr_mas, sib, parent))
-			goto use_sib;
-
-		if (push_dense_right(cp, wr_mas, sib, parent))
+		if (push_dense_left(cp, wr_mas, sib, parent) ||
+		    push_dense_right(cp, wr_mas, sib, parent))
 			goto use_sib;
 	}
 
-	push_data_sib(cp, wr_mas->mas, sib, parent);
-	if (!sib->end)
+	if (push_data_sib(cp, wr_mas, sib, parent))
 		return;
 
+	goto size;
+
 use_sib:
-	cp->data = cp->data + mas_data_count(sib);
+	cp->data += mas_data_count(sib);
+size:
+	cp_size(cp, wr_mas, sib);
 }
 
 /*
@@ -6783,8 +7004,6 @@ static void mas_wr_split(struct ma_wr_state *wr_mas)
 			parent.end = mas_data_end(&parent);
 		}
 		split_data(&cp, wr_mas, &sib, &parent);
-		multi_src_setup(&cp, wr_mas, wr_mas, &sib);
-		dst_setup(&cp, mas, wr_mas->type, cp_data_min(mas, &sib));
 		cp_data_write(&cp, mas, cp_data_min(mas, &sib));
 	} while (split_ascend(&cp, wr_mas, &sib, &parent));
 
@@ -6826,8 +7045,6 @@ static void mas_wr_rebalance(struct ma_wr_state *wr_mas)
 			parent.end = mas_data_end(&parent);
 		}
 		rebalance_data(&cp, wr_mas, &sib, &parent);
-		multi_src_setup(&cp, wr_mas, wr_mas, &sib);
-		dst_setup(&cp, mas, wr_mas->type, cp_data_min(mas, &sib));
 		cp_data_write(&cp, mas, cp_data_min(mas, &sib));
 	} while (rebalance_ascend(&cp, wr_mas, &sib, &parent));
 
@@ -6993,112 +7210,8 @@ static __always_inline void mas_prealloc_calc(struct ma_wr_state *wr_mas,
 }
 
 /*
- * mas_wr_span_walk() - Walk both sides of a spanning store in step.
- * @l_wr: The left write state, at the node the write spans
- * @r_wr: The right write state, at the same node with the right index
- *
- * Return: true if a level pairs a 32-bit left node with a 64-bit right node.
- * Only such a level can hold more than two 64-bit nodes of data without both
- * sides being full; a 32-bit right node means every entry fits 32-bit and the
- * data is sized to that.
- */
-static bool mas_wr_span_walk(struct ma_wr_state *l_wr, struct ma_wr_state *r_wr)
-{
-	struct ma_state *l_mas = l_wr->mas;
-	struct ma_state *r_mas = r_wr->mas;
-	bool mixed = false;
-
-	while (true) {
-		mas_wr_walk_descend(l_wr);
-		mas_wr_walk_descend(r_wr);
-		if (node_is_32b(l_wr->type) && !node_is_32b(r_wr->type))
-			mixed = true;
-
-		l_wr->content = mas_slot_locked(l_mas, l_wr->slots, l_mas->offset);
-		r_wr->content = mas_slot_locked(r_mas, r_wr->slots, r_mas->offset);
-		if (ma_is_leaf(l_wr->type))
-			return mixed;
-
-		mas_wr_walk_traverse(l_wr);
-		mas_wr_walk_traverse(r_wr);
-	}
-}
-
-/*
- * mas_wr_span_setup() - Settle the range and path of a spanning store.
- * @wr_mas: The maple write state, stopped at the node the write spans
- *
- * The store takes the node holding last + 1 as its right side, to join a NULL
- * there and to replace a node the write ends on; a NULL also grows over a NULL
- * ending the previous node.  Do the same here so the heights recorded by the
- * walk, and the nodes per level, are those the store will use.  Only a write
- * into the last slot of a full left leaf whose right side starts a full node
- * can 3-way split; a level mixing widths at the 4G seam is treated as if it
- * could.
- */
-static void mas_wr_span_setup(struct ma_wr_state *wr_mas)
-{
-	struct ma_state *mas = wr_mas->mas;
-	struct ma_state l_mas, r_mas;
-	MA_WR_STATE(l_wr, &l_mas, wr_mas->entry);
-	MA_WR_STATE(r_wr, &r_mas, wr_mas->entry);
-	u64 last = mas->last;
-	bool mixed;
-
-	if (mas->last < mas_tree_max(mas))
-		mas->last++;
-
-walk:
-	/* Walk to the right side the store will use for the true heights. */
-	mas_reset(mas);
-	wr_mas->sufficient_height = 0;
-	wr_mas->vacant_height = 0;
-	wr_mas->content = mas_start_wr(mas);
-	mas_wr_walk(wr_mas);
-	l_mas = *mas;
-	r_mas = *mas;
-	r_mas.index = r_mas.last;
-	mixed = mas_wr_span_walk(&l_wr, &r_wr);
-
-	if (!wr_mas->entry) {
-		if (!r_wr.content && r_wr.r_max > last) {
-			last = r_wr.r_max;
-			/*
-			 * The NULL ends the node, so the store's right side is the
-			 * node after it: size from there.
-			 */
-			if (last == r_mas.max && last < mas_tree_max(mas)) {
-				mas->last = last + 1;
-				goto walk;
-			}
-		}
-
-		/* Growing left into the previous node may move the span up. */
-		if (l_wr.content && !l_mas.offset &&
-		    l_mas.index == l_wr.r_min && l_mas.index &&
-		    mas_prev_is_null(&l_mas)) {
-			mas->index = l_mas.index;
-			goto walk;
-		}
-	}
-	mas->last = last;
-
-	/* A dense leaf can hold three range leaves of entries. */
-	if (mixed || ma_is_dense(l_wr.type) || ma_is_dense(r_wr.type))
-		wr_mas->span_nodes = 3;
-	else if (l_mas.offset == l_mas.end &&
-		 l_mas.end == mt_slots[l_wr.type] - 1 &&
-		 !r_mas.offset && r_mas.end == mt_slots[r_wr.type] - 1 &&
-		 l_wr.r_min < mas->index &&
-		 (wr_mas->entry || (l_wr.content && r_wr.content)))
-		wr_mas->span_nodes = 3;
-	else
-		wr_mas->span_nodes = 2;
-}
-
-/*
- * mas_wr_dense_merge() - Is the range of the node and sibling of a splitting
- * node within the limit of a dense leaf?
+ * mas_wr_dense_merge() - Is a sibling of a leaf that is about to split within
+ * the indexes of one dense leaf?
  * @wr_mas: The maple write state, at the leaf
  *
  * Before checking the data more closely (in the merge path), see if the
@@ -12127,7 +12240,7 @@ static void mas_validate_dense(struct ma_state *mas)
 
 	count = ma_dense_count(mas->tree, ma_slots(node, type), 0,
 			       mas->max - mas->min);
-	excess = mt_dense_excess(mas->tree, mas->max, count);
+	excess = mt_dense_excess(mas->tree, count);
 	if (!excess || ma_excess(node, type) != excess) {
 		pr_err("dense " PTR_FMT " excess %u != %u for %u entries\n",
 		       node, ma_excess(node, type), excess, count);

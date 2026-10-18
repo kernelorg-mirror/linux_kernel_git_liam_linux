@@ -62,6 +62,19 @@ atomic_t maple_tree_tests_passed;
 #define mas_is_overflow(x)	((x)->status == ma_overflow)
 #define mas_is_underflow(x)	((x)->status == ma_underflow)
 
+/*
+ * Entries wider than 4G: a node above UINT_MAX is 64-bit only when it spans
+ * more than that, so the shapes tested there keep their width.
+ */
+static inline unsigned long wide(unsigned long x)
+{
+#ifdef CONFIG_64BIT
+	return x << 33;
+#else
+	return x;
+#endif
+}
+
 static int __init mtree_insert_index(struct maple_tree *mt,
 				     unsigned long index, gfp_t gfp)
 {
@@ -154,11 +167,22 @@ static noinline void __init check_load(struct maple_tree *mt,
 	MT_BUG_ON(mt, ret != ptr);
 }
 
+/* Every index of a range up to 1024 wide loads @ptr; a wider one is sampled. */
+static noinline void __init check_loads(struct maple_tree *mt,
+		unsigned long start, unsigned long end, void *ptr)
+{
+	unsigned long step = (end - start) / 1024 + 1;
+	unsigned long i;
+
+	for (i = start; end - i >= step; i += step)
+		check_load(mt, i, ptr);
+	check_load(mt, end, ptr);
+}
+
 static noinline void __init check_store_range(struct maple_tree *mt,
 		unsigned long start, unsigned long end, void *ptr, int expected)
 {
 	int ret = -EINVAL;
-	unsigned long i;
 
 	ret = mtree_test_store_range(mt, start, end, ptr);
 	MT_BUG_ON(mt, ret != expected);
@@ -166,15 +190,13 @@ static noinline void __init check_store_range(struct maple_tree *mt,
 	if (ret)
 		return;
 
-	for (i = start; i <= end; i++)
-		check_load(mt, i, ptr);
+	check_loads(mt, start, end, ptr);
 }
 
 static noinline void __init check_insert_range(struct maple_tree *mt,
 		unsigned long start, unsigned long end, void *ptr, int expected)
 {
 	int ret = -EINVAL;
-	unsigned long i;
 
 	ret = mtree_test_insert_range(mt, start, end, ptr);
 	MT_BUG_ON(mt, ret != expected);
@@ -182,8 +204,7 @@ static noinline void __init check_insert_range(struct maple_tree *mt,
 	if (ret)
 		return;
 
-	for (i = start; i <= end; i++)
-		check_load(mt, i, ptr);
+	check_loads(mt, start, end, ptr);
 }
 
 static noinline void __init check_insert(struct maple_tree *mt,
@@ -1288,22 +1309,26 @@ static noinline void __init check_ranges(struct maple_tree *mt)
 	for (i = 0; i <= 1300; i++) {
 		val = i*10;
 		val2 = (i+1)*10;
-		check_store_range(mt, base + val, base + val2, xa_mk_value(val), 0);
+		check_store_range(mt, base + wide(val), base + wide(val2),
+				  xa_mk_value(val), 0);
 		MT_BUG_ON(mt, mt_height(mt) >= 4);
 	}
 	/*  Cause a 3 child split all the way up the tree. */
 	for (i = 5; i < 215; i += 10) {
-		check_store_range(mt, base + 11450 + i, base + 11450 + i + 1, NULL, 0);
+		check_store_range(mt, base + wide(11450 + i),
+				  base + wide(11450 + i + 1), NULL, 0);
 		mt_validate(mt);
 	}
 	for (i = 5; i < 65; i += 10) {
-		check_store_range(mt, base + 11770 + i, base + 11770 + i + 1, NULL, 0);
+		check_store_range(mt, base + wide(11770 + i),
+				  base + wide(11770 + i + 1), NULL, 0);
 		mt_validate(mt);
 	}
 
 	MT_BUG_ON(mt, mt_height(mt) >= 4);
 	for (i = 5; i < 45; i += 10) {
-		check_store_range(mt, base + 11700 + i, base + 11700 + i + 1, NULL, 0);
+		check_store_range(mt, base + wide(11700 + i),
+				  base + wide(11700 + i + 1), NULL, 0);
 		mt_validate(mt);
 	}
 	if (!MAPLE_32BIT)
