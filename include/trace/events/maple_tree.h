@@ -18,10 +18,10 @@ TRACE_EVENT(ma_op,
 
 	TP_STRUCT__entry(
 			__field(const char *, fn)
-			__field(unsigned long, min)
-			__field(unsigned long, max)
-			__field(unsigned long, index)
-			__field(unsigned long, last)
+			__field(u64, min)
+			__field(u64, max)
+			__field(u64, index)
+			__field(u64, last)
 			__field(void *, node)
 	),
 
@@ -34,13 +34,13 @@ TRACE_EVENT(ma_op,
 			__entry->node		= mas->node;
 	),
 
-	TP_printk("%s\tNode: %p (%lu %lu) range: %lu-%lu",
+	TP_printk("%s\tNode: %p (%llu %llu) range: %llu-%llu",
 		  __entry->fn,
 		  (void *) __entry->node,
-		  (unsigned long) __entry->min,
-		  (unsigned long) __entry->max,
-		  (unsigned long) __entry->index,
-		  (unsigned long) __entry->last
+		  (unsigned long long) __entry->min,
+		  (unsigned long long) __entry->max,
+		  (unsigned long long) __entry->index,
+		  (unsigned long long) __entry->last
 	)
 )
 TRACE_EVENT(ma_read,
@@ -51,10 +51,10 @@ TRACE_EVENT(ma_read,
 
 	TP_STRUCT__entry(
 			__field(const char *, fn)
-			__field(unsigned long, min)
-			__field(unsigned long, max)
-			__field(unsigned long, index)
-			__field(unsigned long, last)
+			__field(u64, min)
+			__field(u64, max)
+			__field(u64, index)
+			__field(u64, last)
 			__field(void *, node)
 	),
 
@@ -67,30 +67,30 @@ TRACE_EVENT(ma_read,
 			__entry->node		= mas->node;
 	),
 
-	TP_printk("%s\tNode: %p (%lu %lu) range: %lu-%lu",
+	TP_printk("%s\tNode: %p (%llu %llu) range: %llu-%llu",
 		  __entry->fn,
 		  (void *) __entry->node,
-		  (unsigned long) __entry->min,
-		  (unsigned long) __entry->max,
-		  (unsigned long) __entry->index,
-		  (unsigned long) __entry->last
+		  (unsigned long long) __entry->min,
+		  (unsigned long long) __entry->max,
+		  (unsigned long long) __entry->index,
+		  (unsigned long long) __entry->last
 	)
 )
 
 TRACE_EVENT(ma_write,
 
-	TP_PROTO(const char *fn, struct ma_state *mas, unsigned long piv,
+	TP_PROTO(const char *fn, struct ma_state *mas, u64 piv,
 		 void *val),
 
 	TP_ARGS(fn, mas, piv, val),
 
 	TP_STRUCT__entry(
 			__field(const char *, fn)
-			__field(unsigned long, min)
-			__field(unsigned long, max)
-			__field(unsigned long, index)
-			__field(unsigned long, last)
-			__field(unsigned long, piv)
+			__field(u64, min)
+			__field(u64, max)
+			__field(u64, index)
+			__field(u64, last)
+			__field(u64, piv)
 			__field(void *, val)
 			__field(void *, node)
 	),
@@ -106,14 +106,14 @@ TRACE_EVENT(ma_write,
 			__entry->node		= mas->node;
 	),
 
-	TP_printk("%s\tNode %p (%lu %lu) range:%lu-%lu piv (%lu) val %p",
+	TP_printk("%s\tNode %p (%llu %llu) range:%llu-%llu piv (%llu) val %p",
 		  __entry->fn,
 		  (void *) __entry->node,
-		  (unsigned long) __entry->min,
-		  (unsigned long) __entry->max,
-		  (unsigned long) __entry->index,
-		  (unsigned long) __entry->last,
-		  (unsigned long) __entry->piv,
+		  (unsigned long long) __entry->min,
+		  (unsigned long long) __entry->max,
+		  (unsigned long long) __entry->index,
+		  (unsigned long long) __entry->last,
+		  (unsigned long long) __entry->piv,
 		  (void *) __entry->val
 	)
 )
