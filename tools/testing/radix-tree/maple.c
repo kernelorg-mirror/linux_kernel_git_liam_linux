@@ -36401,6 +36401,66 @@ static void check_born32_above(struct maple_tree *mt, unsigned int flags)
 	mtree_destroy(mt);
 }
 
+/* One entry below the 4G seam and one across it. */
+static void store_seam_pair(struct maple_tree *mt, unsigned int flags)
+{
+	u64 hi = (u64)U32_MAX + 1;
+
+	mt_init_flags(mt, flags);
+	MT_BUG_ON(mt, mtree_store_range_u64(mt, 10, 20, xa_mk_value(1),
+					    GFP_KERNEL));
+	MT_BUG_ON(mt, mtree_store_range_u64(mt, hi - 2, hi + 5, xa_mk_value(2),
+					    GFP_KERNEL));
+}
+
+/* The unsigned long walk warns on 32-bit, where it goes past ULONG_MAX. */
+#ifdef CONFIG_64BIT
+#define SEAM_WARNINGS	0
+#else
+#define SEAM_WARNINGS	1
+#endif
+
+/* Through the unsigned long API, an entry across the 4G seam ends the walk. */
+static void check_born32_find(struct maple_tree *mt, unsigned int flags)
+{
+	unsigned long index = 0;
+	unsigned int n = 0;
+	void *entry;
+
+	store_seam_pair(mt, flags);
+	mt_warnings = 0;
+	mt_warn_expected = true;
+	mt_for_each(mt, entry, index, ULONG_MAX) {
+		if (++n > 2)
+			break;
+	}
+	mt_warn_expected = false;
+	MT_BUG_ON(mt, n != 2);
+	MT_BUG_ON(mt, mt_warnings != SEAM_WARNINGS);
+	mtree_destroy(mt);
+}
+
+static void check_born32_find_marked(struct maple_tree *mt, unsigned int flags)
+{
+	unsigned long index = 0;
+	unsigned int n = 0;
+	void *entry;
+
+	store_seam_pair(mt, flags);
+	mtree_set_mark_u64(mt, 10, MT_MARK_0);
+	mtree_set_mark_u64(mt, (u64)U32_MAX - 1, MT_MARK_0);
+	mt_warnings = 0;
+	mt_warn_expected = true;
+	mt_for_each_marked(mt, entry, index, ULONG_MAX, MT_MARK_0) {
+		if (++n > 2)
+			break;
+	}
+	mt_warn_expected = false;
+	MT_BUG_ON(mt, n != 2);
+	MT_BUG_ON(mt, mt_warnings != SEAM_WARNINGS);
+	mtree_destroy(mt);
+}
+
 /* The widest entry in the leaf holding @index, 0 if none; @lo is its start. */
 static u64 leaf_widest(struct maple_tree *mt, u64 index, u64 *lo)
 {
@@ -37131,6 +37191,9 @@ static void check_born32(struct maple_tree *mt)
 		check_born32_rebalance(mt, flags[i], 0);
 		check_born32_walk(mt, flags[i]);
 		check_born32_above(mt, flags[i]);
+		check_born32_find(mt, flags[i]);
+		if (flags[i] & MT_FLAGS_MARKS)
+			check_born32_find_marked(mt, flags[i]);
 		check_born32_seam_three(mt, flags[i]);
 		if (flags[i] & MT_FLAGS_ALLOC_RANGE)
 			check_born32_seam_rest(mt, flags[i]);
