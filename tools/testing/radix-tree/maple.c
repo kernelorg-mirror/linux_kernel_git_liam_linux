@@ -37186,6 +37186,206 @@ static void check_born32_seam_min(struct maple_tree *mt, unsigned int flags)
 	mtree_destroy(mt);
 }
 
+/*
+ * The rule at every node but the root: 32-bit when its range is within 4G,
+ * unless it holds no more than the 32-bit minimum, when it is 64-bit and
+ * sufficient by the 64-bit one.
+ */
+static void check_span_rule(struct maple_tree *mt)
+{
+	MA_STATE(mas, mt, 0, 0);
+
+	mas_dfs_preorder(&mas);
+	while (!mas_is_none(&mas)) {
+		enum maple_type type = mas_node_type(&mas, mas.node);
+		bool within = mas.max - mas.min <= U32_MAX;
+
+		if (!ma_is_dense(type) && !mte_is_root(mas.node)) {
+			if (node_is_32b(type))
+				MT_BUG_ON(mt, !within);
+			else
+				MT_BUG_ON(mt, within &&
+					  mas_data_end(&mas) + 1 >
+					  mt_min_slots[node_born_type(type, 0)]);
+		}
+		mas_dfs_preorder(&mas);
+	}
+}
+
+/*
+ * Nodes above 4G are 32-bit when their range is within it: all but the ones
+ * reaching 0 or U64_MAX, which hold the NULLs there, the root, and a node
+ * under the 32-bit minimum.
+ */
+static void check_span_width(struct maple_tree *mt, unsigned int flags)
+{
+	u64 hi = (u64)U32_MAX + 1;
+	unsigned int n32, n64;
+	bool root32;
+
+	mt_init_flags(mt, flags);
+	/* Pairs: no dense leaf. */
+	check_dfs_fill_range(mt, hi, 1000, 1);
+	MT_BUG_ON(mt, mt_height(mt) < 3);
+	count_node_widths(mt, &n32, &n64, &root32);
+	MT_BUG_ON(mt, root32);
+	MT_BUG_ON(mt, n32 <= n64);
+	check_span_rule(mt);
+	MT_BUG_ON(mt, node_is_32b(leaf_type_at(mt, hi)));
+	MT_BUG_ON(mt, !node_is_32b(leaf_type_at(mt, hi + 1000)));
+	MT_BUG_ON(mt, node_is_32b(leaf_type_at(mt, hi + 2001)));
+	mt_validate(mt);
+	mtree_destroy(mt);
+}
+
+/*
+ * The right-most leaf, full, takes an entry over a gap of more than 4G: the
+ * split keeps the entries within 4G of its start in a 32-bit leaf and the gap
+ * in a 64-bit one, which takes the 64-bit minimum and one more from them.
+ * Where that leaves too few for the 32-bit minimum, as the 32-bit build's
+ * wider leaves do, the data is halved into 64-bit leaves instead.
+ */
+static void check_span_gap(struct maple_tree *mt, unsigned int flags)
+{
+	u64 hi = (u64)U32_MAX + 1, gap = hi + ((u64)1 << 33), next, min;
+	unsigned int count;
+	enum maple_type type;
+	unsigned long nodes;
+	bool wide;
+	MA_STATE(mas, mt, 0, 0);
+
+	mt_init_flags(mt, flags);
+	/* Pairs above 4G until the right-most leaf of a tree is full. */
+	for (next = hi; ; next += 2) {
+		bool full;
+
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, next, next + 1,
+						    xa_mk_value(next),
+						    GFP_KERNEL));
+		mas_lock(&mas);
+		mas_set_range(&mas, next, next);
+		MT_BUG_ON(mt, !mas_walk(&mas));
+		type = mas_node_type(&mas, mas.node);
+		full = mas_data_end(&mas) == mt_slots[type] - 1;
+		min = mas.min;
+		mas_unlock(&mas);
+		if (full && mt_height(mt) > 1)
+			break;
+	}
+	MT_BUG_ON(mt, node_is_32b(type));
+	count = mt_slots[type] + 2 - (mt_min_slots[type] + 1);
+	wide = count > mt_min_slots[node_born_type(type, 0)];
+	if (!wide)
+		count = (mt_slots[type] + 3) / 2;
+	/* The leaf before it full too: nothing is pushed, the split lays out. */
+	fill_leaf(mt, min - 1, 2);
+
+	nodes = check_dfs_count(mt);
+	MT_BUG_ON(mt, mtree_store_range_u64(mt, gap, gap + 1, xa_mk_value(gap),
+					    GFP_KERNEL));
+	mt_validate(mt);
+	check_span_rule(mt);
+	MT_BUG_ON(mt, check_dfs_count(mt) != nodes + 1);
+	mas_lock(&mas);
+	mas_set_range(&mas, min, min);
+	MT_BUG_ON(mt, !mas_walk(&mas));
+	MT_BUG_ON(mt, node_is_32b(mas_node_type(&mas, mas.node)) != wide);
+	MT_BUG_ON(mt, mas_data_end(&mas) + 1 != count);
+	mas_set_range(&mas, next + 2, next + 2);
+	MT_BUG_ON(mt, mas_walk(&mas) != NULL);
+	MT_BUG_ON(mt, node_is_32b(mas_node_type(&mas, mas.node)));
+	MT_BUG_ON(mt, mas.last != gap - 1);
+	mas_unlock(&mas);
+	MT_BUG_ON(mt, mtree_load_u64(mt, gap) != xa_mk_value(gap));
+	mtree_destroy(mt);
+}
+
+/*
+ * A full 32-bit leaf with a full leaf on its left and a 64-bit leaf reaching
+ * over 4G on its right, the two holding more than two 64-bit leaves do: one
+ * more entry pushes right, a 32-bit node of all a 32-bit leaf can take and a
+ * 64-bit one of the rest.  The dense sizing's three-leaf layout once claimed
+ * the data and the push was undone for a split.
+ */
+static void check_span_push(struct maple_tree *mt, unsigned int flags)
+{
+	u64 hi = (u64)U32_MAX + 1, index, left, lo, last;
+	unsigned int cap32, cap64, count, want;
+	unsigned long nodes;
+	MA_STATE(mas, mt, 0, 0);
+
+	mt_init_flags(mt, flags);
+	check_dfs_fill_range(mt, 0, 60, 3);
+	fill_leaf(mt, 243, 4);
+	MT_BUG_ON(mt, mt_height(mt) != 2);
+	MT_BUG_ON(mt, mtree_store_range_u64(mt, hi, hi, xa_mk_value(hi),
+					    GFP_KERNEL));
+	MT_BUG_ON(mt, mt_height(mt) != 2);
+
+	mas_lock(&mas);
+	mas_set_range(&mas, hi, hi);
+	MT_BUG_ON(mt, mas_walk(&mas) != xa_mk_value(hi));
+	MT_BUG_ON(mt, node_is_32b(mas_node_type(&mas, mas.node)));
+	cap64 = mt_slots[mas_node_type(&mas, mas.node)];
+	count = mas_data_end(&mas) + 1;
+	index = mas.min - 1;
+	mas_set_range(&mas, index, index);
+	MT_BUG_ON(mt, !mas_walk(&mas));
+	MT_BUG_ON(mt, !node_is_32b(mas_node_type(&mas, mas.node)));
+	cap32 = mt_slots[mas_node_type(&mas, mas.node)];
+	left = mas.min - 1;
+	mas_unlock(&mas);
+
+	/* The full 32-bit leaf and one more, with this much in the 64-bit leaf. */
+	want = 2 * cap64 - cap32 + 1;
+	if (want > cap64 - 3)
+		return;
+
+	if (count > want) {
+		mas_lock(&mas);
+		mas_set_range(&mas, hi, hi);
+		MT_BUG_ON(mt, !mas_walk(&mas));
+		lo = mas.min;
+		last = mas_safe_pivot(&mas, mas_mn(&mas),
+				      mas_node_type(&mas, mas.node),
+				      count - want);
+		mas_unlock(&mas);
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, lo, last, NULL,
+						    GFP_KERNEL));
+		mas_lock(&mas);
+		mas_set_range(&mas, hi, hi);
+		MT_BUG_ON(mt, !mas_walk(&mas));
+		count = mas_data_end(&mas) + 1;
+		mas_unlock(&mas);
+	}
+	MT_BUG_ON(mt, count > want);
+	for (lo = hi + 1; count < want; lo++, count++)
+		MT_BUG_ON(mt, mtree_store_range_u64(mt, lo, lo, xa_mk_value(lo),
+						    GFP_KERNEL));
+	fill_leaf(mt, index, 2);
+	fill_leaf(mt, left, 2);
+
+	nodes = check_dfs_count(mt);
+	MT_BUG_ON(mt, !leaf_wide_entry(mt, index, 2, &lo));
+	MT_BUG_ON(mt, mtree_store_range_u64(mt, lo, lo, xa_mk_value(0xbad),
+					    GFP_KERNEL));
+	mt_validate(mt);
+	check_span_rule(mt);
+	MT_BUG_ON(mt, check_dfs_count(mt) != nodes);
+	mas_lock(&mas);
+	mas_set_range(&mas, lo, lo);
+	MT_BUG_ON(mt, mas_walk(&mas) != xa_mk_value(0xbad));
+	MT_BUG_ON(mt, !node_is_32b(mas_node_type(&mas, mas.node)));
+	MT_BUG_ON(mt, mas_data_end(&mas) + 1 != cap32 - 1);
+	mas_set_range(&mas, hi, hi);
+	MT_BUG_ON(mt, mas_walk(&mas) != xa_mk_value(hi));
+	MT_BUG_ON(mt, node_is_32b(mas_node_type(&mas, mas.node)));
+	/* The 32-bit node took one less than its slots; two came to this one. */
+	MT_BUG_ON(mt, mas_data_end(&mas) + 1 != want + 2);
+	mas_unlock(&mas);
+	mtree_destroy(mt);
+}
+
 static void check_born32(struct maple_tree *mt)
 {
 	static const unsigned int flags[] = {
@@ -37226,6 +37426,9 @@ static void check_born32(struct maple_tree *mt)
 			check_born32_gaps(mt, flags[i]);
 		if (flags[i] & MT_FLAGS_MARKS)
 			check_born32_marks(mt, flags[i]);
+		check_span_width(mt, flags[i]);
+		check_span_gap(mt, flags[i]);
+		check_span_push(mt, flags[i]);
 	}
 }
 
