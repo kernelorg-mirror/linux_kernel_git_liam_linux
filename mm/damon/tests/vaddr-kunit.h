@@ -21,7 +21,8 @@ static int __link_vmas(struct maple_tree *mt, struct vm_area_struct *vmas,
 
 	mas_lock(&mas);
 	for (i = 0; i < nr_vmas; i++) {
-		mas_set_range(&mas, vmas[i].vm_start, vmas[i].vm_end - 1);
+		mas_set_range(&mas, vmas[i].vm_start >> MM_MT_SHIFT,
+			      (vmas[i].vm_end - 1) >> MM_MT_SHIFT);
 		if (mas_store_gfp(&mas, &vmas[i], GFP_KERNEL))
 			goto failed;
 	}
@@ -63,14 +64,14 @@ static void damon_test_three_regions_in_vmas(struct kunit *test)
 {
 	static struct mm_struct mm;
 	struct damon_addr_range regions[3] = {0};
-	/* 10-20-25, 200-210-220, 300-305, 307-330 */
+	/* 10-20-25, 200-210-220, 300-305, 307-330, in pages */
 	static struct vm_area_struct vmas[] = {
-		(struct vm_area_struct) {.vm_start = 10, .vm_end = 20},
-		(struct vm_area_struct) {.vm_start = 20, .vm_end = 25},
-		(struct vm_area_struct) {.vm_start = 200, .vm_end = 210},
-		(struct vm_area_struct) {.vm_start = 210, .vm_end = 220},
-		(struct vm_area_struct) {.vm_start = 300, .vm_end = 305},
-		(struct vm_area_struct) {.vm_start = 307, .vm_end = 330},
+		{.vm_start = 10 * PAGE_SIZE, .vm_end = 20 * PAGE_SIZE},
+		{.vm_start = 20 * PAGE_SIZE, .vm_end = 25 * PAGE_SIZE},
+		{.vm_start = 200 * PAGE_SIZE, .vm_end = 210 * PAGE_SIZE},
+		{.vm_start = 210 * PAGE_SIZE, .vm_end = 220 * PAGE_SIZE},
+		{.vm_start = 300 * PAGE_SIZE, .vm_end = 305 * PAGE_SIZE},
+		{.vm_start = 307 * PAGE_SIZE, .vm_end = 330 * PAGE_SIZE},
 	};
 
 	mt_init_flags(&mm.mm_mt, MT_FLAGS_ALLOC_RANGE | MT_FLAGS_USE_RCU);
@@ -79,12 +80,12 @@ static void damon_test_three_regions_in_vmas(struct kunit *test)
 
 	__damon_va_three_regions(&mm, regions);
 
-	KUNIT_EXPECT_EQ(test, 10ul, regions[0].start);
-	KUNIT_EXPECT_EQ(test, 25ul, regions[0].end);
-	KUNIT_EXPECT_EQ(test, 200ul, regions[1].start);
-	KUNIT_EXPECT_EQ(test, 220ul, regions[1].end);
-	KUNIT_EXPECT_EQ(test, 300ul, regions[2].start);
-	KUNIT_EXPECT_EQ(test, 330ul, regions[2].end);
+	KUNIT_EXPECT_EQ(test, 10 * PAGE_SIZE, regions[0].start);
+	KUNIT_EXPECT_EQ(test, 25 * PAGE_SIZE, regions[0].end);
+	KUNIT_EXPECT_EQ(test, 200 * PAGE_SIZE, regions[1].start);
+	KUNIT_EXPECT_EQ(test, 220 * PAGE_SIZE, regions[1].end);
+	KUNIT_EXPECT_EQ(test, 300 * PAGE_SIZE, regions[2].start);
+	KUNIT_EXPECT_EQ(test, 330 * PAGE_SIZE, regions[2].end);
 }
 
 static struct damon_region *__nth_region_of(struct damon_target *t, int idx)

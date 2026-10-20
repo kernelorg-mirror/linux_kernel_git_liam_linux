@@ -1498,6 +1498,18 @@ static inline void __mm_flags_set_mask_bits_word(struct mm_struct *mm,
 
 #define MM_MT_FLAGS	(MT_FLAGS_ALLOC_RANGE | MT_FLAGS_LOCK_EXTERN | \
 			 MT_FLAGS_USE_RCU)
+
+/*
+ * mm_mt is indexed by page, so more of its nodes fit their range in 32-bit
+ * pivots.  A no-MMU mapping can start inside a page and is indexed by its
+ * address.
+ */
+#ifdef CONFIG_MMU
+#define MM_MT_SHIFT	PAGE_SHIFT
+#else
+#define MM_MT_SHIFT	0
+#endif
+
 extern struct mm_struct init_mm;
 
 #define MM_STRUCT_FLEXIBLE_ARRAY_INIT				\
@@ -1588,7 +1600,7 @@ struct vma_iterator {
 	struct vma_iterator name = {					\
 		.mas = {						\
 			.tree = &(__mm)->mm_mt,				\
-			.index = __addr,				\
+			.index = (__addr) >> MM_MT_SHIFT,		\
 			.node = NULL,					\
 			.status = ma_start,				\
 		},							\
@@ -1597,7 +1609,7 @@ struct vma_iterator {
 static inline void vma_iter_init(struct vma_iterator *vmi,
 		struct mm_struct *mm, unsigned long addr)
 {
-	mas_init(&vmi->mas, &mm->mm_mt, addr);
+	mas_init(&vmi->mas, &mm->mm_mt, addr >> MM_MT_SHIFT);
 }
 
 #ifdef CONFIG_SCHED_MM_CID

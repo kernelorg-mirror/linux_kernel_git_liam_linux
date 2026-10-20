@@ -321,7 +321,8 @@ err_unstable:
 struct vm_area_struct *lock_vma_under_rcu(struct mm_struct *mm,
 					  unsigned long address)
 {
-	MA_STATE(mas, &mm->mm_mt, address, address);
+	unsigned long index = address >> MM_MT_SHIFT;
+	MA_STATE(mas, &mm->mm_mt, index, index);
 	struct vm_area_struct *vma;
 
 	if (!IS_ENABLED(CONFIG_MMU))
@@ -340,7 +341,7 @@ retry:
 		if (PTR_ERR(vma) == -EAGAIN) {
 			count_vm_vma_lock_event(VMA_LOCK_MISS);
 			/* The area was replaced with another one */
-			mas_set(&mas, address);
+			mas_set(&mas, index);
 			goto retry;
 		}
 

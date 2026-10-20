@@ -2496,7 +2496,8 @@ static void vms_abort_munmap_vmas(struct vma_munmap_struct *vms,
 	 * not symmetrical and state data has been lost.  Resort to the old
 	 * failure method of leaving a gap where the MAP_FIXED mapping failed.
 	 */
-	mas_set_range(mas, vms->start, vms->end - 1);
+	mas_set_range(mas, vms->start >> MM_MT_SHIFT,
+		      (vms->end - 1) >> MM_MT_SHIFT);
 	mas_store_gfp(mas, NULL, GFP_KERNEL|__GFP_NOFAIL);
 	/* Clean up the insertion of the unfortunate gap */
 	vms_complete_munmap_vmas(vms, mas_detach);

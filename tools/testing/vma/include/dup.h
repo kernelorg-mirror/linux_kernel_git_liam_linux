@@ -412,6 +412,12 @@ enum {
 	READ_IMPLIES_EXEC =	0x0400000,
 };
 
+#ifdef CONFIG_MMU
+#define MM_MT_SHIFT	PAGE_SHIFT
+#else
+#define MM_MT_SHIFT	0
+#endif
+
 struct vma_iterator {
 	struct ma_state mas;
 };
@@ -420,7 +426,7 @@ struct vma_iterator {
 	struct vma_iterator name = {					\
 		.mas = {						\
 			.tree = &(__mm)->mm_mt,				\
-			.index = __addr,				\
+			.index = (__addr) >> MM_MT_SHIFT,		\
 			.node = NULL,					\
 			.status = ma_start,				\
 		},							\
@@ -1272,13 +1278,14 @@ static inline void mapping_allow_writable(struct address_space *mapping)
 static inline
 struct vm_area_struct *vma_find(struct vma_iterator *vmi, unsigned long max)
 {
-	return mas_find(&vmi->mas, max - 1);
+	return mas_find(&vmi->mas, (max - 1) >> MM_MT_SHIFT);
 }
 
 static inline int vma_iter_clear_gfp(struct vma_iterator *vmi,
 			unsigned long start, unsigned long end, gfp_t gfp)
 {
-	__mas_set_range(&vmi->mas, start, end - 1);
+	__mas_set_range(&vmi->mas, start >> MM_MT_SHIFT,
+			(end - 1) >> MM_MT_SHIFT);
 	mas_store_gfp(&vmi->mas, NULL, gfp);
 	if (unlikely(mas_is_err(&vmi->mas)))
 		return -ENOMEM;
@@ -1404,7 +1411,7 @@ static inline int compat_vma_mmap(struct file *file, struct vm_area_struct *vma)
 static inline void vma_iter_init(struct vma_iterator *vmi,
 		struct mm_struct *mm, unsigned long addr)
 {
-	mas_init(&vmi->mas, &mm->mm_mt, addr);
+	mas_init(&vmi->mas, &mm->mm_mt, addr >> MM_MT_SHIFT);
 }
 
 static inline void mmap_assert_locked(struct mm_struct *);
@@ -1412,16 +1419,16 @@ static inline struct vm_area_struct *find_vma_intersection(struct mm_struct *mm,
 						unsigned long start_addr,
 						unsigned long end_addr)
 {
-	unsigned long index = start_addr;
+	unsigned long index = start_addr >> MM_MT_SHIFT;
 
 	mmap_assert_locked(mm);
-	return mt_find(&mm->mm_mt, &index, end_addr - 1);
+	return mt_find(&mm->mm_mt, &index, (end_addr - 1) >> MM_MT_SHIFT);
 }
 
 static inline
 struct vm_area_struct *vma_lookup(struct mm_struct *mm, unsigned long addr)
 {
-	return mtree_load(&mm->mm_mt, addr);
+	return mtree_load(&mm->mm_mt, addr >> MM_MT_SHIFT);
 }
 
 static inline struct vm_area_struct *vma_prev(struct vma_iterator *vmi)
@@ -1431,7 +1438,7 @@ static inline struct vm_area_struct *vma_prev(struct vma_iterator *vmi)
 
 static inline void vma_iter_set(struct vma_iterator *vmi, unsigned long addr)
 {
-	mas_set(&vmi->mas, addr);
+	mas_set(&vmi->mas, addr >> MM_MT_SHIFT);
 }
 
 static inline bool vma_is_anonymous(const struct vm_area_struct *vma)

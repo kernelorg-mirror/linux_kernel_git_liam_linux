@@ -1804,7 +1804,7 @@ unsigned long vma_mmu_pagesize(struct vm_area_struct *vma);
 static inline
 struct vm_area_struct *vma_find(struct vma_iterator *vmi, unsigned long max)
 {
-	return mas_find(&vmi->mas, max - 1);
+	return mas_find(&vmi->mas, (max - 1) >> MM_MT_SHIFT);
 }
 
 static inline struct vm_area_struct *vma_next(struct vma_iterator *vmi)
@@ -1831,7 +1831,8 @@ static inline struct vm_area_struct *vma_prev(struct vma_iterator *vmi)
 static inline int vma_iter_clear_gfp(struct vma_iterator *vmi,
 			unsigned long start, unsigned long end, gfp_t gfp)
 {
-	__mas_set_range(&vmi->mas, start, end - 1);
+	__mas_set_range(&vmi->mas, start >> MM_MT_SHIFT,
+			(end - 1) >> MM_MT_SHIFT);
 	mas_store_gfp(&vmi->mas, NULL, gfp);
 	if (unlikely(mas_is_err(&vmi->mas)))
 		return -ENOMEM;
@@ -1848,8 +1849,8 @@ static inline void vma_iter_free(struct vma_iterator *vmi)
 static inline int vma_iter_bulk_store(struct vma_iterator *vmi,
 				      struct vm_area_struct *vma)
 {
-	vmi->mas.index = vma->vm_start;
-	vmi->mas.last = vma->vm_end - 1;
+	vmi->mas.index = vma->vm_start >> MM_MT_SHIFT;
+	vmi->mas.last = (vma->vm_end - 1) >> MM_MT_SHIFT;
 	mas_store(&vmi->mas, vma);
 	if (unlikely(mas_is_err(&vmi->mas)))
 		return -ENOMEM;
@@ -1865,7 +1866,7 @@ static inline void vma_iter_invalidate(struct vma_iterator *vmi)
 
 static inline void vma_iter_set(struct vma_iterator *vmi, unsigned long addr)
 {
-	mas_set(&vmi->mas, addr);
+	mas_set(&vmi->mas, addr >> MM_MT_SHIFT);
 }
 
 #define for_each_vma(__vmi, __vma)					\
@@ -4514,7 +4515,7 @@ struct vm_area_struct *find_vma_intersection(struct mm_struct *mm,
 static inline
 struct vm_area_struct *vma_lookup(struct mm_struct *mm, unsigned long addr)
 {
-	return mtree_load(&mm->mm_mt, addr);
+	return mtree_load(&mm->mm_mt, addr >> MM_MT_SHIFT);
 }
 
 static inline unsigned long stack_guard_start_gap(const struct vm_area_struct *vma)

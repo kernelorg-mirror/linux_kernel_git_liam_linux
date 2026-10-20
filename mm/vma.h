@@ -176,8 +176,8 @@ struct unmap_desc {
 	unsigned long pg_end;         /* The last pagetable address to free (ceiling) */
 	unsigned long vma_start;      /* The min vma address */
 	unsigned long vma_end;        /* The max vma address */
-	unsigned long tree_end;       /* Maximum for the vma tree search */
-	unsigned long tree_reset;     /* Where to reset the vma tree walk */
+	unsigned long tree_end;       /* Tree index ending the vma search */
+	unsigned long tree_reset;     /* Tree index to reset the walk to */
 	bool mm_wr_locked;            /* If the mmap write lock is held */
 };
 
@@ -195,7 +195,7 @@ static inline void unmap_all_init(struct unmap_desc *unmap,
 	unmap->vma_start = 0;
 	unmap->vma_end = ULONG_MAX;
 	unmap->tree_end = ULONG_MAX;
-	unmap->tree_reset = vma->vm_end;
+	unmap->tree_reset = vma->vm_end >> MM_MT_SHIFT;
 	unmap->mm_wr_locked = false;
 }
 
@@ -212,10 +212,10 @@ static inline void unmap_all_init(struct unmap_desc *unmap,
 static inline void unmap_pgtable_init(struct unmap_desc *unmap,
 				      struct vma_iterator *vmi)
 {
-	vma_iter_set(vmi, unmap->tree_reset);
+	mas_set(&vmi->mas, unmap->tree_reset);
 	unmap->vma_start = FIRST_USER_ADDRESS;
 	unmap->vma_end = USER_PGTABLES_CEILING;
-	unmap->tree_end = USER_PGTABLES_CEILING;
+	unmap->tree_end = USER_PGTABLES_CEILING >> MM_MT_SHIFT;
 }
 
 #define UNMAP_STATE(name, _vmi, _vma, _vma_start, _vma_end, _prev, _next)      \
@@ -228,10 +228,10 @@ static inline void unmap_pgtable_init(struct unmap_desc *unmap,
 			USER_PGTABLES_CEILING,                                 \
 		.vma_start = _vma_start,                                       \
 		.vma_end = _vma_end,                                           \
-		.tree_end = _next ?                                            \
+		.tree_end = (_next ?                                           \
 			((struct vm_area_struct *)_next)->vm_start :           \
-			USER_PGTABLES_CEILING,                                 \
-		.tree_reset = _vma->vm_end,                                    \
+			USER_PGTABLES_CEILING) >> MM_MT_SHIFT,                 \
+		.tree_reset = _vma->vm_end >> MM_MT_SHIFT,                     \
 		.mm_wr_locked = true,                                          \
 	}
 
@@ -394,12 +394,14 @@ static inline int vma_iter_store_gfp(struct vma_iterator *vmi,
 			struct vm_area_struct *vma, gfp_t gfp)
 
 {
+	unsigned long index = vma->vm_start >> MM_MT_SHIFT;
+
 	if (vmi->mas.status != ma_start &&
-	    ((mas_index_ulong(&vmi->mas) > vma->vm_start) ||
-	     (mas_last_ulong(&vmi->mas) < vma->vm_start)))
+	    ((mas_index_ulong(&vmi->mas) > index) ||
+	     (mas_last_ulong(&vmi->mas) < index)))
 		vma_iter_invalidate(vmi);
 
-	__mas_set_range(&vmi->mas, vma->vm_start, vma->vm_end - 1);
+	__mas_set_range(&vmi->mas, index, (vma->vm_end - 1) >> MM_MT_SHIFT);
 	mas_store_gfp(&vmi->mas, vma, gfp);
 	if (unlikely(mas_is_err(&vmi->mas)))
 		return -ENOMEM;
@@ -615,7 +617,7 @@ static inline pgprot_t vma_pgprot_modify(pgprot_t oldprot, vma_flags_t vma_flags
 static inline struct vm_area_struct *vma_prev_limit(struct vma_iterator *vmi,
 						    unsigned long min)
 {
-	return mas_prev(&vmi->mas, min);
+	return mas_prev(&vmi->mas, min >> MM_MT_SHIFT);
 }
 
 /*
@@ -658,7 +660,8 @@ static inline bool is_data_mapping_vma_flags(const vma_flags_t *vma_flags)
 static inline void vma_iter_config(struct vma_iterator *vmi,
 		unsigned long index, unsigned long last)
 {
-	__mas_set_range(&vmi->mas, index, last - 1);
+	__mas_set_range(&vmi->mas, index >> MM_MT_SHIFT,
+			(last - 1) >> MM_MT_SHIFT);
 }
 
 static inline void vma_iter_reset(struct vma_iterator *vmi)
@@ -669,25 +672,33 @@ static inline void vma_iter_reset(struct vma_iterator *vmi)
 static inline
 struct vm_area_struct *vma_iter_prev_range_limit(struct vma_iterator *vmi, unsigned long min)
 {
-	return mas_prev_range(&vmi->mas, min);
+	return mas_prev_range(&vmi->mas, min >> MM_MT_SHIFT);
 }
 
 static inline
 struct vm_area_struct *vma_iter_next_range_limit(struct vma_iterator *vmi, unsigned long max)
 {
-	return mas_next_range(&vmi->mas, max);
+	return mas_next_range(&vmi->mas, max >> MM_MT_SHIFT);
 }
 
+/*
+ * The limits and size are in bytes: the gap found lies in whole pages between
+ * @min and @max and covers at least @size.
+ */
 static inline int vma_iter_area_lowest(struct vma_iterator *vmi, unsigned long min,
 				       unsigned long max, unsigned long size)
 {
-	return mas_empty_area(&vmi->mas, min, max - 1, size);
+	return mas_empty_area(&vmi->mas, PAGE_ALIGN(min) >> MM_MT_SHIFT,
+			      (max >> MM_MT_SHIFT) - 1,
+			      PAGE_ALIGN(size) >> MM_MT_SHIFT);
 }
 
 static inline int vma_iter_area_highest(struct vma_iterator *vmi, unsigned long min,
 					unsigned long max, unsigned long size)
 {
-	return mas_empty_area_rev(&vmi->mas, min, max - 1, size);
+	return mas_empty_area_rev(&vmi->mas, PAGE_ALIGN(min) >> MM_MT_SHIFT,
+				  (max >> MM_MT_SHIFT) - 1,
+				  PAGE_ALIGN(size) >> MM_MT_SHIFT);
 }
 
 /*
@@ -713,31 +724,33 @@ static inline struct vm_area_struct *vma_iter_load(struct vma_iterator *vmi)
 static inline void vma_iter_store_overwrite(struct vma_iterator *vmi,
 					    struct vm_area_struct *vma)
 {
+	unsigned long index = vma->vm_start >> MM_MT_SHIFT;
+
 	vma_assert_attached(vma);
 
 #if defined(CONFIG_DEBUG_VM_MAPLE_TREE)
 	if (MAS_WARN_ON(&vmi->mas, vmi->mas.status != ma_start &&
-			mas_index_ulong(&vmi->mas) > vma->vm_start)) {
+			mas_index_ulong(&vmi->mas) > index)) {
 		pr_warn("%lx > %lx\n store vma %lx-%lx\n into slot %lx-%lx\n",
-			mas_index_ulong(&vmi->mas), vma->vm_start,
+			mas_index_ulong(&vmi->mas), index,
 			vma->vm_start, vma->vm_end, mas_index_ulong(&vmi->mas),
 			mas_last_ulong(&vmi->mas));
 	}
 	if (MAS_WARN_ON(&vmi->mas, vmi->mas.status != ma_start &&
-			mas_last_ulong(&vmi->mas) <  vma->vm_start)) {
+			mas_last_ulong(&vmi->mas) <  index)) {
 		pr_warn("%lx < %lx\nstore vma %lx-%lx\ninto slot %lx-%lx\n",
-		       mas_last_ulong(&vmi->mas), vma->vm_start,
+		       mas_last_ulong(&vmi->mas), index,
 		       vma->vm_start, vma->vm_end, mas_index_ulong(&vmi->mas),
 		       mas_last_ulong(&vmi->mas));
 	}
 #endif
 
 	if (vmi->mas.status != ma_start &&
-	    ((mas_index_ulong(&vmi->mas) > vma->vm_start) ||
-	     (mas_last_ulong(&vmi->mas) < vma->vm_start)))
+	    ((mas_index_ulong(&vmi->mas) > index) ||
+	     (mas_last_ulong(&vmi->mas) < index)))
 		vma_iter_invalidate(vmi);
 
-	__mas_set_range(&vmi->mas, vma->vm_start, vma->vm_end - 1);
+	__mas_set_range(&vmi->mas, index, (vma->vm_end - 1) >> MM_MT_SHIFT);
 	mas_store_prealloc(&vmi->mas, vma);
 }
 
@@ -750,12 +763,12 @@ static inline void vma_iter_store_new(struct vma_iterator *vmi,
 
 static inline unsigned long vma_iter_addr(struct vma_iterator *vmi)
 {
-	return mas_index_ulong(&vmi->mas);
+	return mas_index_ulong(&vmi->mas) << MM_MT_SHIFT;
 }
 
 static inline unsigned long vma_iter_end(struct vma_iterator *vmi)
 {
-	return mas_last_ulong(&vmi->mas) + 1;
+	return (mas_last_ulong(&vmi->mas) + 1) << MM_MT_SHIFT;
 }
 
 static inline

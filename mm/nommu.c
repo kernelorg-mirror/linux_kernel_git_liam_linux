@@ -626,10 +626,10 @@ struct vm_area_struct *find_vma_intersection(struct mm_struct *mm,
 					     unsigned long start_addr,
 					     unsigned long end_addr)
 {
-	unsigned long index = start_addr;
+	unsigned long index = start_addr >> MM_MT_SHIFT;
 
 	mmap_assert_locked(mm);
-	return mt_find(&mm->mm_mt, &index, end_addr - 1);
+	return mt_find(&mm->mm_mt, &index, (end_addr - 1) >> MM_MT_SHIFT);
 }
 EXPORT_SYMBOL(find_vma_intersection);
 
