@@ -34,7 +34,12 @@ LONG_BIT := 32
 endif
 
 ifndef LONG_BIT
-LONG_BIT := $(shell getconf LONG_BIT)
+LONG_BIT := $(shell $(CC) $(CFLAGS) -dM -E - </dev/null | \
+		awk '/__SIZEOF_LONG__/ { print $$3 * 8 }')
+endif
+
+ifeq ($(filter 32 64,$(LONG_BIT)),)
+$(error cannot determine the word size; set LONG_BIT=32 or LONG_BIT=64)
 endif
 
 %.o: ../shared/%.c
