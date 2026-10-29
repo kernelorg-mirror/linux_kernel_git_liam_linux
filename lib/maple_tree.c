@@ -66,6 +66,8 @@
 
 #define TP_FCT tracepoint_string(__func__)
 
+static_assert(sizeof(struct maple_node) == 256);
+
 /*
  * Kernel pointer hashing renders much of the maple tree dump useless as tagged
  * pointers get hashed to arbitrary values.
